@@ -294,13 +294,13 @@ def diagnose_stock(symbol: str):
     return res
 
 @app.get("/api/financial/analyze")
-def get_financial_analysis(symbol: str):
+def get_financial_analysis(symbol: str, force_refresh: bool = False):
     """获取标的上市公司深度财报、杜邦拆解与排雷报告"""
     resolved = data_engine.resolve_symbol(symbol)
     name = resolved["name"] if resolved else symbol
     sym = resolved["symbol"] if resolved else symbol
     from core.financial_engine import financial_engine
-    return financial_engine.analyze(sym, name)
+    return financial_engine.analyze(sym, name, force_refresh=force_refresh)
 
 @app.get("/api/stock/kline")
 def get_stock_kline(symbol: str, count: int = 150):

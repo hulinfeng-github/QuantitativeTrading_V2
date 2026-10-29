@@ -66,7 +66,7 @@ class FinancialAnalysisEngine:
         except Exception as e:
             print(f"保存财报缓存异常: {e}")
 
-    def fetch_raw_financials(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def fetch_raw_financials(self, symbol: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         """
         拉取东方财富官方主要财务指标与杜邦拆解最新数据
         """
@@ -83,9 +83,9 @@ class FinancialAnalysisEngine:
         sec_prefix = "SH" if code_clean.startswith(("6", "5")) else "SZ"
         em_code = f"{sec_prefix}{code_clean}"
 
-        # 检查缓存
+        # 检查缓存 (支持 force_refresh 强制绕过缓存拉取最新财报)
         now = time.time()
-        if em_code in self._cache and (now - self._cache[em_code][0]) < self._cache_ttl:
+        if not force_refresh and em_code in self._cache and (now - self._cache[em_code][0]) < self._cache_ttl:
             return self._cache[em_code][1]
 
         result = {
@@ -123,12 +123,12 @@ class FinancialAnalysisEngine:
 
         return None
 
-    def analyze(self, symbol: str, name: str = "") -> Dict[str, Any]:
+    def analyze(self, symbol: str, name: str = "", force_refresh: bool = False) -> Dict[str, Any]:
         """
         对指定标的进行全维度财报与经营质地深度量化分析
         """
         sym = data_engine.format_symbol(symbol)
-        raw = self.fetch_raw_financials(sym)
+        raw = self.fetch_raw_financials(sym, force_refresh=force_refresh)
 
         # ETF 特殊处理
         if raw and raw.get("is_etf"):
