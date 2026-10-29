@@ -186,14 +186,14 @@ class QuantScheduler2:
         for tx in tail_exits:
             notification_manager.send_signal(tx)
 
-    def run_market_scan_async(self, limit: int = 100):
+    def run_market_scan_async(self, limit: int = 100, notify: bool = True):
         """异步执行全市场主板智能精选"""
         if self.scan_status["is_scanning"]:
             return
-        t = threading.Thread(target=self._scan_market_worker, args=(limit,), daemon=True)
+        t = threading.Thread(target=self._scan_market_worker, args=(limit, notify), daemon=True)
         t.start()
 
-    def _scan_market_worker(self, limit: int = 100):
+    def _scan_market_worker(self, limit: int = 100, notify: bool = True):
         self.scan_status["is_scanning"] = True
         self.scan_status["progress"] = 0
         self.scan_status["message"] = "正在拉取A股主板标的池..."
@@ -239,6 +239,77 @@ class QuantScheduler2:
         self.scan_status["is_scanning"] = False
         self.scan_status["message"] = f"扫描完成，筛选出 {len(candidates)} 只优质标的"
         self.scan_status["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 触发收盘多因子智能选股与风控推送 (钉钉 / 微信)
+        if notify:
+            self._notify_market_scan_results(candidates)
+
+    def _notify_market_scan_results(self, candidates: List[Dict[str, Any]]):
+        """将收盘后多因子主板精选标的（含深度财报体检）格式化并推送至钉钉/微信"""
+        now = datetime.now()
+        date_str = now.strftime('%Y-%m-%d')
+        from core.sentiment_radar import sentiment_radar
+        macro = sentiment_radar.analyze_market_regime()
+
+        # 筛选符合多因子高确定性条件的标的 (BUY 信号 或 综合评分 >= 65)
+        top_picks = [c for c in candidates if c.get("signal_type") == "BUY" or c.get("score", 0) >= 65][:6]
+
+        if not top_picks:
+            msg = (
+                f"### 💎 A股收盘多因子智能选股雷达 ({date_str})\n\n"
+                f"> **大盘宏观定调**：{macro['regime']} (情绪温度计: {macro['temp_score']}分 · {macro['cycle_phase']})\n"
+                f"> **建议风险敞口**：{int(macro['target_exposure']*100)}% | 指导: {macro['action_guide']}\n\n"
+                f"🛡️ **量化风控选股结论**：\n"
+                f"- 今日全市场扫描评估，未发现满足『偏度修正 RSRS 超标 + CYQ 主力筹码集中起爆 + 财报排雷无瑕疵』的高确定性主板买入标的。\n"
+                f"- 在当前大盘弱势压制环境下，系统根据自适应风控纪律已自动调高安全防守边际，严格杜绝假突破诱多与逆势接飞刀。\n"
+                f"- **操盘指导**：保持空仓或轻仓防守观望，耐心等待大盘情绪回暖与右侧多因子共振买点确立。"
+            )
+            title = f"💎 收盘多因子选股: 今日严控风控·空仓观望 ({date_str})"
+            notification_manager.send_markdown(title, msg)
+            return
+
+        lines = [
+            f"### 💎 A股收盘多因子智能精选标的 ({date_str})\n",
+            f"> 宏观大盘: **{macro['regime']}** (建议敞口: {int(macro['target_exposure']*100)}%) | 策略核心: **RSRS 2.0 + Alpha158 + CYQ筹码 + 财报排雷**\n",
+            f"| 标的名称 | 代码 | 最新现价 | 综合评分 | 修正RSRS | 主力控盘状态 | 财报画像/排雷 | 建议止损 / 止盈 |",
+            f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+        ]
+
+        for c in top_picks:
+            levels = c.get("trade_levels", {})
+            fin = c.get("financial", {})
+            rf = fin.get("red_flags", {})
+            fin_persona = fin.get('persona', '主板标的')
+            fin_tag = f"{fin_persona} · {rf.get('risk_level', '安全')}"
+            stop_str = f"{levels.get('initial_stop', '-')}"
+            target_str = f"{levels.get('target_price', '-')}"
+
+            lines.append(
+                f"| **{c.get('name')}** | `{c.get('symbol')}` | **{c.get('price'):.2f}** | "
+                f"⭐ **{c.get('score', 0):.1f}** | `{c.get('rsrs_norm', 0):.2f}` | "
+                f"{c.get('control_status', '-')} | {fin_tag} | "
+                f"`{stop_str}` / `{target_str}` |"
+            )
+
+        lines.append("\n#### 🔬 核心量化逻辑与深度财报体检亮点：")
+        for idx, c in enumerate(top_picks[:3], 1):
+            fin = c.get("financial", {})
+            dp = fin.get("dupont", {})
+            gw = fin.get("growth", {})
+            f_score = fin.get("piotroski_f_score", {}).get("score", "-")
+            fin_highlights = f"杜邦ROE {dp.get('roe', '-')}% | 扣非增速 {gw.get('deduct_profit_yoy', '-')}% | 皮氏F-Score {f_score}/9分"
+            reasons_str = "；".join(c.get("reasons", [])[:2])
+            lines.append(f"{idx}. **{c.get('name')}** (`{c.get('symbol')}`): {reasons_str} (📊 财报: {fin_highlights})")
+
+        lines.append(
+            "\n💡 **次日实操交易指引**：\n"
+            "- 以上标的为多因子共振+财报排雷筛选之高景气/起爆标的，次日可结合早盘集合竞价表现择机介入。\n"
+            "- 严格遵守建议止损保护位，单笔仓位建议控制在 20%~25% 以内，杜绝单一重仓盲赌。\n"
+            "- *注：策略严格限定沪深主板高流动性标的，已自动剔除创业板/科创板/ST风险股票。*"
+        )
+
+        title = f"💎 收盘多因子主板精选: {top_picks[0].get('name')}等{len(top_picks)}只 ({date_str})"
+        notification_manager.send_markdown(title, "\n".join(lines))
 
     def run_tail230_scan_and_notify(self):
         """尾盘 14:32 触发『2.30 突袭战法』主板精选标的扫描与推送"""
@@ -413,13 +484,19 @@ class QuantScheduler2:
             replace_existing=True
         )
 
-        # 5. 盘后 15:30 全市场智能选股
+        # 5. 盘后 15:30 全市场智能选股与通知推送
+        scan_time = cfg.get("market_close_scan_time", "15:30")
+        try:
+            scan_hour, scan_minute = [int(x) for x in scan_time.split(":")]
+        except Exception:
+            scan_hour, scan_minute = 15, 30
+
         self.scheduler.add_job(
-            lambda: self.run_market_scan_async(limit=150),
+            lambda: self.run_market_scan_async(limit=150, notify=True),
             "cron",
             day_of_week="mon-fri",
-            hour=15,
-            minute=30,
+            hour=scan_hour,
+            minute=scan_minute,
             id="post_market_scan",
             replace_existing=True
         )

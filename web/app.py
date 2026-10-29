@@ -343,8 +343,8 @@ def get_stock_kline(symbol: str, count: int = 150):
     }
 
 @app.post("/api/scan/start")
-def start_scan(limit: int = 100):
-    quant_scheduler2.run_market_scan_async(limit=limit)
+def start_scan(limit: int = 100, notify: bool = False):
+    quant_scheduler2.run_market_scan_async(limit=limit, notify=notify)
     return {"success": True, "message": "全市场主板智能选股已在后台启动"}
 
 @app.get("/api/scan/results")
