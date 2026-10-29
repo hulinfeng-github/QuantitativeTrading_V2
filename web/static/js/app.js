@@ -127,12 +127,21 @@ function renderScreenerCards(candidates) {
                        c.control_status === "主力吸筹蓄势" ? `<span class="pill pill-purple">🛡️ 密集蓄势</span>` :
                        `<span class="pill pill-cyan">📈 多头共振</span>`;
 
+    // 财报深度指标
+    const fin = c.financial || {};
+    const dupont = fin.dupont || {};
+    const growth = fin.growth || {};
+    const redFlags = fin.red_flags || {};
+    const isSafe = redFlags.is_safe !== false;
+    const persona = fin.persona || "";
+
     html += `
       <div class="stock-card" onclick="openStockDiagnose('${c.symbol}')">
         <div class="stock-header">
           <div class="stock-name-box">
             <h3>${c.name} ${statusPill}</h3>
             <span>${c.symbol} · 主板精选</span>
+            ${persona ? `<div><span class="pill pill-purple" style="font-size: 10px; margin-top: 4px; display: inline-block;">${persona}</span></div>` : ''}
           </div>
           <div class="score-badge">
             ⭐ 评分: ${c.score}分
@@ -162,13 +171,40 @@ function renderScreenerCards(candidates) {
           </div>
         </div>
 
+        <!-- 深度财报体检速览 -->
+        <div class="fin-mini-strip">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+            <span style="font-weight: 600; color: var(--c-cyan);">📊 经营与财报体检</span>
+            <span class="${isSafe ? 'pill pill-safe' : 'pill pill-danger'}">${redFlags.risk_level || '安全'} (排雷: ${redFlags.radar_score || 100}分)</span>
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; text-align: center;">
+            <div>
+              <div style="font-size: 10px; color: var(--text-dim);">杜邦 ROE</div>
+              <div style="font-weight: 700; color: #fff;">${dupont.roe !== undefined ? dupont.roe.toFixed(1) + '%' : '-'}</div>
+            </div>
+            <div>
+              <div style="font-size: 10px; color: var(--text-dim);">扣非净利增速</div>
+              <div style="font-weight: 700;" class="${growth.deduct_profit_yoy >= 0 ? 'text-up' : 'text-down'}">${growth.deduct_profit_yoy !== undefined ? (growth.deduct_profit_yoy > 0 ? '+' : '') + growth.deduct_profit_yoy.toFixed(1) + '%' : '-'}</div>
+            </div>
+            <div>
+              <div style="font-size: 10px; color: var(--text-dim);">皮氏 F-Score</div>
+              <div style="font-weight: 700; color: var(--c-gold);">${fin.piotroski_f_score ? fin.piotroski_f_score.score + '/9分' : '-'}</div>
+            </div>
+          </div>
+          ${redFlags.triggered_risks && redFlags.triggered_risks.length > 0 ? `
+            <div style="margin-top: 5px; color: #f87171; font-size: 10px; background: rgba(239,68,68,0.1); padding: 2px 6px; border-radius: 3px;">
+              ⚠️ 触雷: ${redFlags.triggered_risks.slice(0, 2).join("；")}
+            </div>
+          ` : ''}
+        </div>
+
         <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 8px;">
           建议止损: <span class="text-down">${levels.initial_stop || '-'}元 (-${levels.stop_pct || 0}%)</span> | 
           目标止盈: <span class="text-up">${levels.target_price || '-'}元 (+${levels.target_pct || 0}%)</span>
         </div>
 
         <ul class="reason-list">
-          ${(c.reasons || []).slice(0, 2).map(r => `<li>${r}</li>`).join("")}
+          ${(c.reasons || []).slice(0, 3).map(r => `<li>${r}</li>`).join("")}
         </ul>
       </div>
     `;
@@ -398,6 +434,136 @@ function renderDiagnoseSummary(data) {
   const levels = data.trade_levels || {};
   const chip = data.chip_info || {};
   const advice = data.position_advice || {};
+  const fin = data.financial || {};
+  const dupont = fin.dupont || {};
+  const growth = fin.growth || {};
+  const fScore = fin.piotroski_f_score || {};
+  const redFlags = fin.red_flags || {};
+  const inds = redFlags.indicators || {};
+  const isSafe = redFlags.is_safe !== false;
+
+  let finHtml = "";
+  if (fin.symbol) {
+    finHtml = `
+      <div class="fin-report-card">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 10px; margin-bottom: 12px; flex-wrap: wrap; gap: 8px;">
+          <div>
+            <h3 style="font-size: 15px; color: var(--c-cyan); display: inline-flex; align-items: center; gap: 6px;">
+              📊 上市公司基本面经营与财报深度诊断
+            </h3>
+            <span style="font-size: 12px; color: var(--text-dim); margin-left: 8px;">
+              最新报告期: <strong>${fin.report_date || '最新季度'}</strong>
+            </span>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span class="pill pill-purple" style="font-size: 12px; padding: 4px 10px;">${fin.persona || '主板标的'}</span>
+            <span class="${isSafe ? 'pill pill-safe' : 'pill pill-danger'}" style="font-size: 12px; padding: 4px 10px;">
+              排雷状态: ${redFlags.risk_level || '安全'} (${redFlags.radar_score || 100}分)
+            </span>
+          </div>
+        </div>
+
+        <!-- 杜邦 3 因子核心分解 -->
+        <div style="margin-bottom: 14px;">
+          <div style="font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 8px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px;">
+            <span>🔬 杜邦分析 3 因子核心分解 (DuPont Analysis)</span>
+            <span class="text-gold" style="font-size: 11px;">核心动力: ${dupont.primary_driver || '-'}</span>
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px;">
+            <div class="fin-dupont-box">
+              <div style="font-size: 11px; color: var(--text-dim);">净资产收益率 (ROE)</div>
+              <div style="font-size: 18px; font-weight: 700; color: var(--c-cyan); margin: 4px 0;">${dupont.roe !== undefined ? dupont.roe.toFixed(2) + '%' : '-'}</div>
+              <div style="font-size: 10px; color: var(--text-muted);">杜邦评分: ${dupont.dupont_score || '-'}分</div>
+            </div>
+            <div class="fin-dupont-box">
+              <div style="font-size: 11px; color: var(--text-dim);">销售净利率 (Net Margin)</div>
+              <div style="font-size: 18px; font-weight: 700; color: #fff; margin: 4px 0;">${dupont.net_profit_margin !== undefined ? dupont.net_profit_margin.toFixed(2) + '%' : '-'}</div>
+              <div style="font-size: 10px; color: var(--text-muted);">产品定价权与护城河</div>
+            </div>
+            <div class="fin-dupont-box">
+              <div style="font-size: 11px; color: var(--text-dim);">总资产周转率 (Turnover)</div>
+              <div style="font-size: 18px; font-weight: 700; color: #fff; margin: 4px 0;">${dupont.asset_turnover !== undefined ? dupont.asset_turnover.toFixed(2) + ' 次' : '-'}</div>
+              <div style="font-size: 10px; color: var(--text-muted);">资金营运与周转效率</div>
+            </div>
+            <div class="fin-dupont-box">
+              <div style="font-size: 11px; color: var(--text-dim);">权益乘数 (Leverage)</div>
+              <div style="font-size: 18px; font-weight: 700; color: #fff; margin: 4px 0;">${dupont.equity_multiplier !== undefined ? dupont.equity_multiplier.toFixed(2) + ' 倍' : '-'}</div>
+              <div style="font-size: 10px; color: var(--text-muted);">资产负债率: ${inds.debt_to_assets_pct !== undefined ? inds.debt_to_assets_pct.toFixed(1) + '%' : '-'}</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 经营成长与皮氏 F-Score 双栏网格 -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-bottom: 14px;">
+          <!-- 成长与现金流质量 -->
+          <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 12px;">
+            <div style="font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 8px;">📈 经营成长性与盈利含金量</div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 12px;">
+              <div>营业收入增速: <strong class="${growth.revenue_yoy >= 0 ? 'text-up' : 'text-down'}">${growth.revenue_yoy !== undefined ? (growth.revenue_yoy > 0 ? '+' : '') + growth.revenue_yoy.toFixed(1) + '%' : '-'}</strong></div>
+              <div>归母净利增速: <strong class="${growth.net_profit_yoy >= 0 ? 'text-up' : 'text-down'}">${growth.net_profit_yoy !== undefined ? (growth.net_profit_yoy > 0 ? '+' : '') + growth.net_profit_yoy.toFixed(1) + '%' : '-'}</strong></div>
+              <div>扣非净利增速: <strong class="${growth.deduct_profit_yoy >= 0 ? 'text-up' : 'text-down'}">${growth.deduct_profit_yoy !== undefined ? (growth.deduct_profit_yoy > 0 ? '+' : '') + growth.deduct_profit_yoy.toFixed(1) + '%' : '-'}</strong></div>
+              <div>综合销售毛利率: <strong style="color: #fff;">${growth.gross_margin !== undefined ? growth.gross_margin.toFixed(1) + '%' : '-'}</strong></div>
+              <div style="grid-column: span 2; margin-top: 4px;">
+                现金/净利匹配度: <strong class="${inds.cash_to_net_profit_ratio >= 1.0 ? 'text-cyan' : inds.cash_to_net_profit_ratio >= 0.7 ? 'text-gold' : 'text-down'}">${inds.cash_to_net_profit_ratio !== undefined ? inds.cash_to_net_profit_ratio.toFixed(2) + ' 倍' : '-'}</strong>
+                <span style="font-size: 10px; color: var(--text-dim); margin-left: 4px;">(经营净现金流 / 归母净利润，>1.0为良性)</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 皮氏 9 维 F-Score 评分 -->
+          <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">🏆 皮氏 Piotroski 9 维 F-Score</span>
+              <span class="pill pill-gold">${fScore.score !== undefined ? fScore.score : 0} / 9 分 (${fScore.level || '正常'})</span>
+            </div>
+            <div style="font-size: 11px; color: var(--text-muted); line-height: 1.6;">
+              ${(fScore.details || []).map(d => `<span class="fin-radar-tag" style="background: rgba(56, 189, 248, 0.1); color: var(--c-cyan);">✓ ${d}</span>`).join("")}
+            </div>
+          </div>
+        </div>
+
+        <!-- 财务排雷六维雷达指标 -->
+        <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 12px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--text-muted);">🛡️ 六维财务排雷指标与雷达监控</span>
+            <span style="font-size: 11px; color: var(--text-dim);">健康得分: <strong class="${redFlags.radar_score >= 80 ? 'text-cyan' : 'text-down'}">${redFlags.radar_score !== undefined ? redFlags.radar_score : 100} 分</strong></span>
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; font-size: 11px;">
+            <div style="background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 4px;">
+              <span style="color: var(--text-dim);">商誉/净资产:</span> <strong>${inds.goodwill_to_equity_pct !== undefined ? inds.goodwill_to_equity_pct.toFixed(1) + '%' : '0.0%'}</strong>
+              <div style="font-size: 10px; color: var(--text-dim);">安全阈值 <25%</div>
+            </div>
+            <div style="background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 4px;">
+              <span style="color: var(--text-dim);">应收/总营收:</span> <strong>${inds.receivables_to_revenue_pct !== undefined ? inds.receivables_to_revenue_pct.toFixed(1) + '%' : '-'}</strong>
+              <div style="font-size: 10px; color: var(--text-dim);">安全阈值 <60%</div>
+            </div>
+            <div style="background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 4px;">
+              <span style="color: var(--text-dim);">存货/总资产:</span> <strong>${inds.inventory_to_assets_pct !== undefined ? inds.inventory_to_assets_pct.toFixed(1) + '%' : '-'}</strong>
+              <div style="font-size: 10px; color: var(--text-dim);">安全阈值 <30%</div>
+            </div>
+            <div style="background: rgba(255,255,255,0.02); padding: 6px 8px; border-radius: 4px;">
+              <span style="color: var(--text-dim);">资产负债率:</span> <strong>${inds.debt_to_assets_pct !== undefined ? inds.debt_to_assets_pct.toFixed(1) + '%' : '-'}</strong>
+              <div style="font-size: 10px; color: var(--text-dim);">安全阈值 <70%</div>
+            </div>
+          </div>
+
+          ${redFlags.triggered_risks && redFlags.triggered_risks.length > 0 ? `
+            <div style="margin-top: 10px; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 4px; padding: 8px 12px;">
+              <div style="font-size: 12px; font-weight: 700; color: #fca5a5; margin-bottom: 4px;">🚨 触发财务预警项清单:</div>
+              <ul style="margin-left: 18px; font-size: 11px; color: #fecaca; line-height: 1.5;">
+                ${redFlags.triggered_risks.map(r => `<li>${r}</li>`).join("")}
+              </ul>
+            </div>
+          ` : `
+            <div style="margin-top: 10px; color: #34d399; font-size: 11px; display: flex; align-items: center; gap: 4px;">
+              <span>✅</span> 经全维度财务分析与财报核查，该标的资产负债表与现金流极为稳健，无重大排雷风险。
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
 
   box.innerHTML = `
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
@@ -430,6 +596,9 @@ function renderDiagnoseSummary(data) {
         </div>
       </div>
     </div>
+
+    <!-- 插入深度财报诊断看板 -->
+    ${finHtml}
 
     <div style="margin-top: 14px; font-size: 12px; color: var(--text-muted);">
       <strong>量化研判逻辑:</strong> ${data.reasons.join("； ")}

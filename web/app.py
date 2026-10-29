@@ -293,6 +293,15 @@ def diagnose_stock(symbol: str):
     res["position_advice"] = eq_advice
     return res
 
+@app.get("/api/financial/analyze")
+def get_financial_analysis(symbol: str):
+    """获取标的上市公司深度财报、杜邦拆解与排雷报告"""
+    resolved = data_engine.resolve_symbol(symbol)
+    name = resolved["name"] if resolved else symbol
+    sym = resolved["symbol"] if resolved else symbol
+    from core.financial_engine import financial_engine
+    return financial_engine.analyze(sym, name)
+
 @app.get("/api/stock/kline")
 def get_stock_kline(symbol: str, count: int = 150):
     """获取K线序列（附带MA均线、MACD与主力筹码）供图表绘制"""

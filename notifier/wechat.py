@@ -125,6 +125,18 @@ class WeChatNotifier:
             lines.append(f"**多因子评分**: {score}分 | RSRS: {signal.get('rsrs_norm', 0.0)}")
             lines.append(f"**主力筹码**: {signal.get('control_status', '平稳')} (主力成本: {signal.get('main_cost', price):.2f}元)")
 
+        fin = signal.get("financial")
+        if fin:
+            dp = fin.get("dupont", {})
+            gw = fin.get("growth", {})
+            rf = fin.get("red_flags", {})
+            lines.append(
+                f"**📊 财报深度体检**: **{fin.get('fundamental_score')}分** | {fin.get('persona')}\n"
+                f"- 杜邦拆解: ROE {dp.get('roe')}% (净利率 {dp.get('net_margin')}% × 周转 {dp.get('asset_turnover')})\n"
+                f"- 核心景气: 扣非YoY **{gw.get('deduct_profit_yoy', 0):+.1f}%** | 营收YoY {gw.get('revenue_yoy', 0):+.1f}%\n"
+                f"- 财务排雷: {rf.get('risk_summary')}"
+            )
+
         if sig_type == "FORCE_EXIT":
             cost = signal.get("holding_cost", 0.0)
             shares = signal.get("holding_shares", 0)

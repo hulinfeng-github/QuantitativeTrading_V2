@@ -37,7 +37,7 @@ class MultiFactorStrategy:
         self.trailing_pct = cfg.get("trailing_stop_pct", 0.06)
 
     def analyze(self, symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
-        """全量计算指标与策略因果研判（单股最新K线）"""
+        """全量计算指标与策略因果研判（单股最新K线，集成技术面与基本面深度财报）"""
         if df is None or len(df) < 30:
             return None
 
@@ -45,7 +45,29 @@ class MultiFactorStrategy:
         df_feat = calculate_alpha_features(df)
         df_all = calculate_rsrs_skew(df_feat, n=self.rsrs_n, m=self.rsrs_m, use_skew=self.use_skew)
 
-        return self.analyze_bar(symbol, name, df_all, idx=-1)
+        res = self.analyze_bar(symbol, name, df_all, idx=-1)
+        if res:
+            try:
+                from core.financial_engine import financial_engine
+                fin = financial_engine.analyze(symbol, name)
+                res["financial"] = fin
+                if fin and fin.get("red_flags", {}).get("has_major_risk"):
+                    # 财务排雷一票否决/严惩：降低策略总分并标明警示
+                    res["score"] = min(res["score"], 58.0)
+                    if res["signal_type"] == "BUY":
+                        res["signal_type"] = "WATCH"
+                        res["signal_desc"] = "财务排雷预警·暂缓开仓"
+                    res["reasons"].insert(0, f"🚨【基本面避雷】{fin['red_flags']['risk_summary']}")
+                elif fin and fin.get("fundamental_score", 0) >= 80:
+                    dp = fin.get("dupont", {})
+                    gw = fin.get("growth", {})
+                    res["reasons"].append(
+                        f"📊 基本面优异({fin.get('fundamental_score')}分·{fin.get('persona')}): "
+                        f"ROE {dp.get('roe', 0)}%, 扣非增速 {gw.get('deduct_profit_yoy', 0):+.1f}%"
+                    )
+            except Exception as e:
+                pass
+        return res
 
     def analyze_bar(
         self,

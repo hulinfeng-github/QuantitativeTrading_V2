@@ -16,6 +16,7 @@ storage/tail_trades_230.json
 storage/test_tail_trades.json
 storage/review_history.json
 storage/optimization_log.json
+storage/financial_cache.json
 
 # IDE & OS
 .vscode/

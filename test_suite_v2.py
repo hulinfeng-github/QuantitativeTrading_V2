@@ -251,8 +251,43 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         self.assertTrue(0 <= bt_win["win_rate"] <= 100)
         print(f"  -> 2.30 战法测算成功: 全周期胜率={bt_win['win_rate']}%, 增强胜率={bt_win['enhanced_win_rate']}%, 盈亏比={bt_win['profit_loss_ratio']}:1, 样本笔数={bt_win['total_trades']}")
 
+    def test_12_financial_analysis_engine(self):
+        """测试上市公司深度经营财报分析、杜邦拆解与六维排雷引擎"""
+        print("\n[测试 12] 验证上市公司财报深度分析、杜邦 3 因子与排雷引擎...")
+        from core.financial_engine import financial_engine
+
+        # 1. 验证 ETF 天然免疫过滤
+        etf_res = financial_engine.analyze("512890", "红利低波ETF")
+        self.assertTrue(etf_res.get("is_etf", False))
+        self.assertTrue(etf_res["red_flags"]["is_safe"])
+        print("  -> ETF 基金自动免疫识别通过")
+
+        # 2. 验证真实主板上市公司财报深度解析与杜邦拆解 (以贵州茅台为例)
+        stock_res = financial_engine.analyze("600519", "贵州茅台")
+        self.assertEqual(stock_res["symbol"], "sh600519")
+        self.assertIn("dupont", stock_res)
+        self.assertIn("piotroski_f_score", stock_res)
+        self.assertIn("red_flags", stock_res)
+        self.assertIn("persona", stock_res)
+
+        # 杜邦指标非负有效性
+        dupont = stock_res["dupont"]
+        self.assertTrue(dupont["roe"] > 0)
+        self.assertTrue(dupont["net_profit_margin"] > 0)
+        self.assertTrue(dupont["equity_multiplier"] >= 1.0)
+
+        # 皮氏 F-Score 有效性
+        f_score = stock_res["piotroski_f_score"]
+        self.assertTrue(0 <= f_score["score"] <= 9)
+
+        # 排雷雷达有效性
+        rf = stock_res["red_flags"]
+        self.assertTrue(0 <= rf["radar_score"] <= 100)
+        print(f"  -> 财报体检验证成功: {stock_res['name']} ROE={dupont['roe']}%, 净利率={dupont['net_profit_margin']}%, F-Score={f_score['score']}/9, 画像={stock_res['persona']}")
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("      QuantitativeTrading 2.0 全链路自动化单元与回归测试套件")
     print("=" * 70)
     unittest.main(verbosity=2)
+

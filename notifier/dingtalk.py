@@ -112,6 +112,18 @@ class DingTalkNotifier:
             lines.append(f"- **多因子评分**: **{score} 分** | RSRS 2.0: {signal.get('rsrs_norm', 0.0)}")
             lines.append(f"- **主力筹码**: {signal.get('control_status', '平稳')} (主力成本: {signal.get('main_cost', price):.2f}元)")
 
+        fin = signal.get("financial")
+        if fin:
+            dp = fin.get("dupont", {})
+            gw = fin.get("growth", {})
+            rf = fin.get("red_flags", {})
+            lines.append(
+                f"- **📊 财报深度体检**: **{fin.get('fundamental_score')}分** | {fin.get('persona')}\n"
+                f"  - 杜邦拆解: ROE {dp.get('roe')}% (净利率 {dp.get('net_margin')}% × 周转 {dp.get('asset_turnover')}) · {dp.get('driver_type')}\n"
+                f"  - 核心景气: 扣非YoY **{gw.get('deduct_profit_yoy', 0):+.1f}%** | 营收YoY {gw.get('revenue_yoy', 0):+.1f}% | 毛利率 {gw.get('gross_margin')}%\n"
+                f"  - 财务排雷: {rf.get('risk_summary')}"
+            )
+
         lines.append("---")
 
         # 1. 强制平仓/硬止损警报 (FORCE_EXIT)
