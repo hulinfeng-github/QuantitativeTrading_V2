@@ -467,6 +467,47 @@
         </div>
       </div>
 
+      <!-- 新手小白打板实战必读操盘指南 -->
+      <div class="card" style="background: rgba(245, 158, 11, 0.05); border-color: rgba(245, 158, 11, 0.3); margin-bottom: 20px; padding: 18px 22px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; cursor: pointer;" onclick="toggleBeginnerGuide()">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="font-size: 20px;">📖</span>
+            <div>
+              <h4 style="font-size: 15px; color: var(--c-gold); margin: 0; display: flex; align-items: center; gap: 8px;">
+                <span>新手小白打板实战保姆级指南：在什么点？具体怎么操作？</span>
+                <span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; font-size: 11px;">新手必读实战口诀</span>
+              </h4>
+              <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">
+                抓首板突破 · 扫板打确认 · 次日 09:30~09:45 冲高止盈不恋战 · 破位 -3% 坚决斩仓留青山
+              </div>
+            </div>
+          </div>
+          <button id="btnToggleGuide" class="btn btn-secondary btn-sm" style="font-size: 12px;">▼ 收起 / 展开指南</button>
+        </div>
+
+        <div id="beginnerGuideBody" style="display: block; margin-top: 16px; border-top: 1px dashed rgba(245, 158, 11, 0.25); padding-top: 14px;">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; font-size: 13px;">
+            <div style="background: rgba(15, 23, 42, 0.6); padding: 14px; border-radius: 8px; border-left: 3px solid var(--c-cyan);">
+              <h5 style="color: var(--c-cyan); margin: 0 0 8px 0; font-size: 14px;">🎯 一、 应该在什么点买？具体怎么操作？</h5>
+              <ul style="padding-left: 18px; margin: 0; line-height: 1.7; color: var(--text-muted);">
+                <li><strong style="color: #fff;">扫板买点 (主选)</strong>：股价分时脉冲至 <strong>+9.5% ~ +9.8%</strong>、卖一涨停价剩余挂单即将被大资金扫光一瞬间，交易软件选【限价买入】，输入涨停价直接下单扫板。</li>
+                <li><strong style="color: #fff;">排板买点 (次选)</strong>：封死后以涨停价挂单排队。<strong>【撤单关键】</strong>若盘中封单大幅减少至 5000 手以下或万手砸盘即将开板，<strong>必须立刻点击【撤单】</strong>，严禁开板下杀无脑接飞刀！</li>
+                <li><strong style="color: #fff;">仓位纪律</strong>：建议单笔控制在总资金 <strong>10% ~ 15%</strong>，小白严禁满仓一把梭！</li>
+              </ul>
+            </div>
+
+            <div style="background: rgba(15, 23, 42, 0.6); padding: 14px; border-radius: 8px; border-left: 3px solid #f87171;">
+              <h5 style="color: #f87171; margin: 0 0 8px 0; font-size: 14px;">🚀 二、 次日 (T+1) 应该在什么点卖？(三大剧本实战对策)</h5>
+              <ul style="padding-left: 18px; margin: 0; line-height: 1.7; color: var(--text-muted);">
+                <li><strong style="color: #fff;">剧本 A · 正常早盘冲高止盈 (最常见利润来源)</strong>：次日早盘 <strong>09:30 ~ 09:45</strong> 惯性脉冲上攻触及 <strong>+3.0% ~ +5.0%</strong> 目标或分时跌破黄线滞涨时，<strong>不要贪心，立即以市价全部卖出止盈</strong>，锁定利润！</li>
+                <li><strong style="color: #fff;">剧本 B · 大高开秒板连板 (享受主升加速)</strong>：若 09:25 集合竞价大幅高开 <strong>>+4%</strong> 或开盘 3 分钟内秒封死涨停，<strong>持股不动</strong>；若中途开板 1 分钟未回封，立即市价全额卖出！</li>
+                <li><strong style="color: #fff;">剧本 C · 低开低走破位止损 (风控底线)</strong>：若大幅低开 <strong><-2%</strong> 或跌破防守止损线 <strong>-3.0%</strong>，<strong>绝不心存侥幸！绝不补仓！立即以市价挂单止损离场</strong>！</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 核心战绩与胜率 KPI 指标看板 -->
       <div class="macro-strip" style="margin-bottom: 20px;">
         <div class="macro-card">

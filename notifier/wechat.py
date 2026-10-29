@@ -111,6 +111,9 @@ class WeChatNotifier:
         elif sig_type == "TAIL_EOD_EXIT":
             icon = "🚨"
             title = f"{icon} 2.30战法次日尾盘坚决清仓: {name}"
+        elif sig_type == "LIMIT_UP":
+            icon = "⚡"
+            title = f"{icon} 游资打板信号: {name} ({signal.get('board_type', '主板涨停')})"
         else:
             icon = "🎯"
             title = f"{icon} 量化信号: {name} {desc}"
@@ -261,6 +264,33 @@ class WeChatNotifier:
                 f"**昨日买入成本**: {fmt_p(buy_p)} 元 (买入日期: {buy_d})",
                 f"**单笔结算盈亏**: **{pnl_pct:+.2f}%** (今早最高冲至 +{peak_pct:+.2f}%)",
                 f"**纪律**: 2.30战法遵循一夜持股极速兑现机制，次日坚决落袋，严禁深套变长线！"
+            ])
+
+        # 7. 游资打板新手小白保姆级指南 (LIMIT_UP)
+        elif sig_type == "LIMIT_UP":
+            seal_p = float(signal.get("seal_price") or price)
+            target_p = float(levels.get("target_price") or round(seal_p * 1.045, 2))
+            stop_p = float(levels.get("stop_loss") or round(seal_p * 0.97, 2))
+            b_type = signal.get("board_type", "首板突破")
+            ladder = signal.get("ladder_count", 1)
+            h_score = signal.get("hardness_score", 80.0)
+            st_ratio = signal.get("seal_turnover_ratio", 15.0)
+
+            sweep_point = round(seal_p * 0.995, 2)
+            lines.extend([
+                f"**板型结构**: **{b_type}** ({ladder}板) | 硬度得分: **{h_score}分** | 封成比: **{st_ratio}%**",
+                f"**今日封板买入价**: **{fmt_p(seal_p)} 元** (以今日涨停价申报)",
+                f"**新手仓位纪律**: **总资金 10% ~ 15% (严禁满仓一把梭，轻仓试错)**",
+                "",
+                "**【新手小白保姆级具体实操指南】**",
+                f"1. **应该在什么点买**：",
+                f"   - **【扫板买点】**：股价脉冲至 **{sweep_point:.2f}元 (+9.5%~+9.8%)**、卖一涨停价剩余挂单即将被大资金扫光一瞬间，交易软件选【限价买入】，输入涨停价 **{fmt_p(seal_p)}元** 点击买入；",
+                f"   - **【排板买点】**：封死涨停后以 **{fmt_p(seal_p)}元** 挂单排队。**【防守撤单】**若封单迅速减少或万手砸盘即将开板，**立即点击【撤单】**！",
+                "",
+                f"2. **次日 (T+1) 应该在什么点卖 (三大剧本)**：",
+                f"   - **【剧本 A · 正常冲高止盈】**：早盘 **09:30~09:45** 冲高至 **+{target_p:.2f}元 (+3%~+5%)** 或跌破分时均线滞涨时，**立即市价全额卖出**锁定利润！",
+                f"   - **【剧本 B · 大高开秒板连板】**：09:25 高开 **+4%以上** 或秒板，**持股不动**；中途开板1分钟未回封立即市价卖出！",
+                f"   - **【剧本 C · 低开低走破位止损】**：低开超 -2% 或盘中跌破 **{fmt_p(stop_p)}元 (-3.0%)**，**绝不扛单，立即市价挂单止损卖出**！"
             ])
 
         if reasons:

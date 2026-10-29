@@ -1363,7 +1363,26 @@ async function loadLimitUpRadar() {
             </ul>
           </div>
 
+          <!-- 新手小白保姆级实操点位与步骤指引 -->
+          <div style="margin-top: 12px; background: rgba(15, 23, 42, 0.55); padding: 10px 12px; border-radius: 6px; border-left: 3px solid var(--c-gold); font-size: 12px;">
+            <div style="font-weight: 600; color: var(--c-gold); margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
+              <span>📖 新手小白打板与次日操盘步骤</span>
+              <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #fbbf24; font-size: 10px;">保姆级点位</span>
+            </div>
+            <div style="color: var(--text-muted); line-height: 1.6;">
+              <div>🟢 <strong style="color: #fff;">在什么点买</strong>：股价脉冲至 <strong>${(c.price * 0.995).toFixed(2)}元 (+9.5%~+9.8%)</strong> 卖一被扫光瞬间以涨停价 <strong>${c.price.toFixed(2)}元</strong> 限价申报买入；若封死排队中途封单骤减或大单砸盘，<strong>必须立刻【撤单】</strong>！单笔仓位严格控制在 <strong>10%~15%</strong>。</div>
+              <div style="margin-top: 4px;">🔴 <strong style="color: #fff;">次日什么点卖 (三大剧本)</strong>：
+                <br>&nbsp;&nbsp;• <strong>冲高止盈</strong>：早盘 09:30~09:45 冲高至 <strong>+${(c.price * 1.045).toFixed(2)}元 (+3%~+5%)</strong> 立即市价全额卖出锁定利润！
+                <br>&nbsp;&nbsp;• <strong>秒板连板</strong>：竞价高开 >+4% 或秒板持股不动；中途开板1分钟未回封立即市价全出！
+                <br>&nbsp;&nbsp;• <strong>破位止损</strong>：大幅低开或盘中跌破 <strong>${(c.price * 0.975).toFixed(2)}元 (-2.5%)</strong>，坚决市价挂单止损，绝不扛单！
+              </div>
+            </div>
+          </div>
+
           <div style="margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-secondary btn-sm" onclick="pushLimitUpSignal('${c.symbol}', '${c.name}', ${c.price}, '${c.board_type}', ${c.hardness_score})">
+              📢 推送保姆级指令
+            </button>
             <button class="btn btn-secondary btn-sm" onclick="quickAddWatchlist('${c.symbol}', '${c.name}', ${c.price})">
               + 加入自选
             </button>
@@ -1482,6 +1501,42 @@ async function triggerManualSettlement() {
 // 6. 导出 / 下载 CSV 电子表格
 function exportLimitUpCsv() {
   window.open("/api/limitup/csv", "_blank");
+}
+
+// 7. 折叠 / 展开新手小白操盘指南
+function toggleBeginnerGuide() {
+  const body = document.getElementById("beginnerGuideBody");
+  const btn = document.getElementById("btnToggleGuide");
+  if (!body) return;
+  if (body.style.display === "none") {
+    body.style.display = "block";
+    if (btn) btn.textContent = "▲ 收起操盘指南";
+  } else {
+    body.style.display = "none";
+    if (btn) btn.textContent = "▼ 展开操盘指南";
+  }
+}
+
+// 8. 推送单只标的新手小白保姆级操盘指令到钉钉/微信
+async function pushLimitUpSignal(symbol, name, price, boardType, score) {
+  try {
+    const res = await fetch("/api/limitup/notify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: symbol,
+        name: name,
+        price: price,
+        seal_price: price,
+        board_type: boardType,
+        hardness_score: score
+      })
+    });
+    if (!res.ok) throw new Error("推送接口网络异常");
+    alert(`🎉 已成功向钉钉/微信推送【${name} (${symbol})】保姆级打板实战操盘指令卡片！\n请查看手机端通知。`);
+  } catch (e) {
+    alert("推送失败: " + e);
+  }
 }
 
 

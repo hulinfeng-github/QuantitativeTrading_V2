@@ -98,6 +98,9 @@ class DingTalkNotifier:
         elif sig_type == "TAIL_EOD_EXIT":
             icon = "🚨"
             title = f"{icon} 2.30战法次日尾盘坚决清仓: {name}"
+        elif sig_type == "LIMIT_UP":
+            icon = "⚡"
+            title = f"{icon} 游资龙虎打板信号: {name} ({signal.get('board_type', '主板涨停')})"
         else:
             icon = "🔔"
             title = f"{icon} 量化信号: {name} ({desc})"
@@ -271,6 +274,34 @@ class DingTalkNotifier:
                 f"- **昨日买入成本**: {fmt_p(buy_p)} 元 (买入日期: {buy_d})",
                 f"- **单笔结算盈亏**: **{pnl_pct:+.2f}%** (今早最高冲至 +{peak_pct:+.2f}%)",
                 f"- **量化风控纪律**: **2.30战法遵循一夜持股极速兑现机制，次日坚决落袋，严禁深套变长线！**"
+            ])
+
+        # 7. 游资龙虎打板专属新手小白保姆级操盘指南 (LIMIT_UP)
+        elif sig_type == "LIMIT_UP":
+            seal_p = float(signal.get("seal_price") or price)
+            target_p = float(levels.get("target_price") or round(seal_p * 1.045, 2))
+            stop_p = float(levels.get("stop_loss") or round(seal_p * 0.97, 2))
+            b_type = signal.get("board_type", "首板突破")
+            ladder = signal.get("ladder_count", 1)
+            h_score = signal.get("hardness_score", 80.0)
+            st_ratio = signal.get("seal_turnover_ratio", 15.0)
+
+            sweep_point = round(seal_p * 0.995, 2)
+            lines.extend([
+                f"- **🎯 板型结构**: **{b_type}** (当前连板数: **{ladder}板**)",
+                f"- **封板硬度评估**: **{h_score} 分** | 封成比: **{st_ratio}%** | 炸板次数: **{signal.get('open_count', 0)}次**",
+                f"- **今日建议封板买入价**: **{fmt_p(seal_p)} 元** (以今日涨停价申报)",
+                f"- **新手仓位纪律**: **建议单笔总资金 10% ~ 15% (新手严禁满仓，轻仓试错)**",
+                "",
+                "#### 📖 【新手小白保姆级具体实操指南】",
+                "**一、 应该在什么点买？具体怎么操作？**",
+                f"1. **【扫板买点 (主选)】**：当个股快速脉冲至 **{sweep_point:.2f}元 (+9.5%~+9.8%)**、盘口卖一涨停价剩余挂单即将被大资金扫光的一瞬间，立即在交易软件中选择【限价买入】，价格直接输入今日涨停价 **{fmt_p(seal_p)}元**，点击买入；",
+                f"2. **【排板买点 (次选)】**：若股票已封死涨停，直接输入 **{fmt_p(seal_p)}元** 挂单排队。**【防守关键撤单指令】**：如果盘中封单迅速减少或万手大单持续砸盘即将开板，**必须立即点击【撤单】**，严禁在开板下杀过程中无脑接飞刀！",
+                "",
+                "**二、 次日 (T+1) 应该在什么点卖？具体怎么操作？(三大剧本实战对策)**",
+                f"1. **【剧本 A · 正常早盘冲高止盈 (最常见核心利润来源)】**：次日早盘 **09:30 ~ 09:45** 惯性脉冲上攻触及 **+{target_p:.2f}元 (+3.0%~+5.0%)** 目标区间或分时跌破黄线滞涨时，**不要贪心，立即以市价全部卖出止盈**，锁定隔日利润！",
+                f"2. **【剧本 B · 超预期大高开/秒板连板 (享受主升加速)】**：若次日 09:25 集合竞价大幅高开 **+4.0% 以上** 或开盘 3 分钟内直接秒封涨停板，**持股不动**，享受二连板/三连板龙头溢价；若封板后开板且 1 分钟内未能迅速回封，立即市价全额卖出！",
+                f"3. **【剧本 C · 不及预期/大幅低开破位 (绝不扛单严格止损)】**：若次日大幅低开低于 -2.0%，或盘中跌破防守止损线 **{fmt_p(stop_p)}元 (-3.0%)**，**绝不心存侥幸！绝不补仓！立即以市价挂单止损卖出**，防止深套吃大面！"
             ])
 
         if reasons:

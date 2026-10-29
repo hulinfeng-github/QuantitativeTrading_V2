@@ -318,9 +318,25 @@ class LimitUpEngine:
         seal_turnover_ratio = round(float(np.clip(25.0 - ladder_count * 2.0, 5.0, 35.0)), 1)
         open_count = 0 if ladder_count > 2 else 1
         hardness_score = round(float(np.clip(hardness_score, 45.0, 98.0)), 1)
-
         target_p = round(close * 1.045, 2)
         stop_p = round(close * 0.975, 2)
+        sweep_point = round(close * 0.995, 2)
+        beginner_guide = {
+            "buy_sweep_point": sweep_point,
+            "buy_sweep_desc": f"当价格冲至 {sweep_point} 元 (+9.5%~+9.8%)、卖一涨停价剩余挂单即将被大资金扫光一瞬间，交易软件选【限价买入】，输入涨停价 {close:.2f} 元直接下单扫板",
+            "buy_queue_point": close,
+            "buy_queue_desc": f"封死后以涨停价 {close:.2f} 元挂单排队。若盘中封单大幅衰减至5000手以下或大卖单砸盘，立刻点击【撤单】避险",
+            "suggested_position": "总资金 10% ~ 15% (严禁满仓，高波动试错仓位)",
+            "next_target_price": target_p,
+            "next_target_pct": 4.5,
+            "next_stop_loss": stop_p,
+            "next_stop_pct": -2.5,
+            "exit_scenarios": {
+                "scenario_a_profit": f"【冲高止盈 (核心主选)】次日早盘 09:30~09:45 冲高触及 +{target_p:.2f} 元 (+3.0%~+5.0%) 或分时跌破黄线滞涨时，不要贪心，立即以市价全部卖出锁定利润！",
+                "scenario_b_ladder": "【大高开秒板 (连板加速)】若 09:25 集合竞价大幅高开 >+4.0% 或开盘3分钟内秒封死涨停，持股不动享受连板；若中途开板1分钟未回封，立即市价全额卖出！",
+                "scenario_c_stop": f"【破位止损 (风控底线)】若次日大幅低开 <-2.0% 或跌破防守止损线 {stop_p:.2f} 元 (-2.5%~-3.0%)，绝不扛单补仓，立即市价挂单止损离场！"
+            }
+        }
 
         return {
             "symbol": symbol,
@@ -336,12 +352,44 @@ class LimitUpEngine:
             "open_count": open_count,
             "turnover_amount": turnover,
             "reasons": reasons,
+            "beginner_guide": beginner_guide,
             "trade_levels": {
                 "entry_price": close,
                 "target_price": target_p,
                 "stop_loss": stop_p
             }
         }
+
+    def send_limit_up_signal(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        向钉钉与微信推送极度详细的新手小白打板实操指令卡片（在什么点买、如何撤单防守、次日三大剧本具体怎么卖）
+        """
+        from notifier.manager import notification_manager
+        sym = candidate.get("symbol")
+        name = candidate.get("name")
+        price = float(candidate.get("price") or candidate.get("seal_price") or 0.0)
+
+        signal_payload = {
+            "symbol": sym,
+            "name": name,
+            "signal_type": "LIMIT_UP",
+            "signal_desc": f"游资打板量化推荐({candidate.get('board_type', '首板突破')})",
+            "price": price,
+            "seal_price": price,
+            "board_type": candidate.get("board_type", "首板突破"),
+            "ladder_count": candidate.get("ladder_count", 1),
+            "hardness_score": candidate.get("hardness_score", 85.0),
+            "seal_turnover_ratio": candidate.get("seal_turnover_ratio", 15.0),
+            "open_count": candidate.get("open_count", 0),
+            "trade_levels": candidate.get("trade_levels", {
+                "entry_price": price,
+                "target_price": round(price * 1.045, 2),
+                "stop_loss": round(price * 0.975, 2)
+            }),
+            "reasons": candidate.get("reasons", [])
+        }
+        res = notification_manager.send_signal(signal_payload, force=True)
+        return {"success": True, "res": res, "signal": signal_payload}
 
     def scan_today_candidates(self, limit: int = 15) -> List[Dict[str, Any]]:
         """

@@ -529,3 +529,10 @@ def download_limitup_csv():
         filename="A股打板量化实战流水账本.csv"
     )
 
+@app.post("/api/limitup/notify")
+def send_limitup_notification(data: Dict[str, Any] = Body(...)):
+    """向钉钉和微信推送单只股票详细的新手小白打板操盘指导卡片"""
+    from core.limit_up_engine import limit_up_engine
+    res = limit_up_engine.send_limit_up_signal(data)
+    return res
+
