@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A股智能量化投研与实战交易系统 2.0</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <!-- 引入 Apache ECharts 5 库 -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+  <!-- 顶部导航栏 -->
+  <header class="navbar">
+    <div class="nav-brand">
+      <div class="logo-badge">⚡</div>
+      <div class="brand-text">
+        <h1>A股智能量化交易系统 2.0</h1>
+        <span>偏度修正 RSRS · Qlib Alpha 因子 · CYQ 2.0 高精筹码 · 大盘自适应风控</span>
+      </div>
+    </div>
+    <div class="nav-status">
+      <div class="sentiment-badge">
+        <span class="pulse-dot"></span>
+        <span id="macroRegimeText">大盘环境评估中...</span>
+      </div>
+      <button id="btnStartScan" class="btn btn-primary" onclick="triggerScan()">
+        🚀 立即全市场主板智能选股
+      </button>
+    </div>
+  </header>
+
+  <!-- 主交互容器 -->
+  <main class="main-container">
+    <!-- 宏观大盘雷达看板 -->
+    <section class="macro-strip">
+      <div class="macro-card">
+        <div class="macro-title">上证指数 (大盘生命线)</div>
+        <div id="macroIndexPrice" class="macro-val">--</div>
+        <div class="macro-sub">多空定调通道</div>
+      </div>
+      <div class="macro-card">
+        <div class="macro-title">市场情绪温度计</div>
+        <div id="macroSentimentScore" class="macro-val">-- 分</div>
+        <div class="macro-sub">0~100 四维情绪周期</div>
+      </div>
+      <div class="macro-card">
+        <div class="macro-title">建议总风险敞口</div>
+        <div id="macroExposure" class="macro-val">--%</div>
+        <div class="macro-sub">组合仓位自适应控制</div>
+      </div>
+      <div class="macro-card" style="grid-column: span 1;">
+        <div class="macro-title">宏观操盘指导</div>
+        <div id="macroActionGuide" style="font-size: 13px; font-weight: 600; color: #fff; margin-top: 4px; line-height: 1.5;">--</div>
+      </div>
+    </section>
+
+    <!-- 标签导航栏 -->
+    <div class="tabs-header">
+      <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="screener">💎 今日多因子波段选股雷达</button>
+        <button class="tab-btn" data-tab="watchlist">📋 盘中自选与持仓实时监控</button>
+        <button class="tab-btn" data-tab="t0">🎯 A股T+1日内做T助手</button>
+        <button class="tab-btn" data-tab="tail230">⚡ 尾盘 2:30 突袭战法</button>
+        <button class="tab-btn" data-tab="diagnose">🔍 单股深度诊断与专业K线</button>
+        <button class="tab-btn" data-tab="backtest">📈 组合因果回测对比 (vs 沪深300)</button>
+        <button class="tab-btn" data-tab="review">📊 每日收盘复盘与参数自进化</button>
+        <button class="tab-btn" data-tab="settings">⚙️ 策略与推送配置</button>
+      </nav>
+      <div id="scanNotice" style="font-size: 12px; color: var(--text-dim);"></div>
+    </div>
+
+    <!-- 1. 选股雷达面板 -->
+    <section id="pane-screener" class="tab-pane" style="display: block;">
+      <div class="card" style="background: rgba(56, 189, 248, 0.04); border-color: rgba(56, 189, 248, 0.2); margin-bottom: 20px;">
+        <h3 style="font-size: 14px; color: var(--c-cyan); margin-bottom: 4px;">🎯 2.0 策略核心机制（融合 GitHub 顶级 A 股量化算法）</h3>
+        <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
+          融合<strong>偏度修正 RSRS 机构模型</strong>（残差偏度过滤假突破）、<strong>Qlib Alpha158 动量与量价相关性</strong>、以及<strong>高精度 CYQ 主力筹码集中度</strong>（获利盘>70%、90%集中度<12%的突破起爆点）；严格聚焦沪深主板高流动性标的，辅以 ATR 动态止盈止损。
+        </p>
+      </div>
+      <div id="screenerContainer" class="screener-grid">
+        <!-- 动态填充选股卡片 -->
+      </div>
+    </section>
+
+    <!-- 2. 盘中自选股实时监控面板 -->
+    <section id="pane-watchlist" class="tab-pane" style="display: none;">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📋 核心持仓与观察池</div>
+          <button class="btn btn-primary btn-sm" onclick="showAddWatchlistModal()">+ 添加自选股</button>
+        </div>
+        <div class="data-table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>标的名称 / 代码</th>
+                <th>最新现价</th>
+                <th>今日涨跌幅</th>
+                <th>持仓成本</th>
+                <th>持股数</th>
+                <th>持仓盈亏比例</th>
+                <th>持仓浮动盈亏</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="watchlistTbody">
+              <!-- 动态填充 -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. A股 T+1 日内做T助手 -->
+    <section id="pane-t0" class="tab-pane" style="display: none;">
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+          <div>
+            <div class="card-title">🎯 A股 T+1 底仓日内做T助手 (分时VWAP + 动态布林带)</div>
+            <p style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">
+              顺应多头只做正T（负偏离低吸高抛），空头只做倒T；单日单向唯一锁定，冲高回落自动对冲止盈。
+            </p>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="resetT0Today()">🔄 重置今日做T状态</button>
+        </div>
+      </div>
+      <div id="t0CardsContainer" class="screener-grid">
+        <!-- 动态填充做T卡片 -->
+      </div>
+    </section>
+
+    <!-- 4. 单股深度量化诊断与专业K线图 -->
+    <section id="pane-diagnose" class="tab-pane" style="display: none;">
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="display: flex; gap: 10px; max-width: 600px;">
+          <input id="diagnoseInput" class="form-input" placeholder="输入股票代码或名称 (如 601138, 工业富联, 600519)..." value="sh601138">
+          <button class="btn btn-primary" onclick="runDiagnose()" style="white-space: nowrap;">🔍 深度量化诊断</button>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div id="diagnoseSummaryBox">
+          <!-- 诊断摘要与评分 -->
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📊 专业量化日K线 (含 MA5/20/60 均线通道与成交量)</div>
+        </div>
+        <div id="klineChart" class="chart-container"></div>
+      </div>
+    </section>
+
+    <!-- 5. 组合与单标的因果回测对比 (vs 沪深300) -->
+    <section id="pane-backtest" class="tab-pane" style="display: none;">
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-size: 13px; color: var(--text-muted);">回测标的:</label>
+            <input id="backtestSymbol" class="form-input" style="width: 140px;" value="sh601138">
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="font-size: 13px; color: var(--text-muted);">回测天数:</label>
+            <input id="backtestDays" class="form-input" type="number" style="width: 100px;" value="600">
+          </div>
+          <button id="btnRunBacktest" class="btn btn-primary" onclick="triggerBacktest()">⚡ 运行严格防过拟合因果回测</button>
+        </div>
+      </div>
+
+      <!-- 回测指标网格 -->
+      <div class="macro-strip" style="margin-bottom: 16px;">
+        <div class="macro-card">
+          <div class="macro-title">策略累计总收益</div>
+          <div id="btTotalReturn" class="macro-val">--%</div>
+          <div class="macro-sub">年化复合 (CAGR): <span id="btCAGR">--%</span></div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">沪深300同期基准收益</div>
+          <div id="btBenchmark" class="macro-val">--%</div>
+          <div class="macro-sub">超额 Alpha: <strong id="btAlpha">--%</strong></div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">最大回撤 (Max Drawdown)</div>
+          <div id="btMaxDD" class="macro-val">--%</div>
+          <div class="macro-sub">夏普比率: <strong id="btSharpe">--</strong></div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">胜率与盈亏比</div>
+          <div id="btWinRate" class="macro-val">--%</div>
+          <div class="macro-sub">盈亏比: <strong id="btPLRatio">--</strong> | 样本外: <span id="btOOS">--%</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📈 2.0 策略净值走势 vs 沪深300同期基准走势对比</div>
+        </div>
+        <div id="backtestChart" class="chart-container"></div>
+      </div>
+    </section>
+
+    <!-- 6. 每日收盘复盘与参数自进化 -->
+    <section id="pane-review" class="tab-pane" style="display: none;">
+      <div class="card" style="margin-bottom: 16px;">
+        <div class="card-header">
+          <div class="card-title">📊 每日收盘全景量化复盘</div>
+          <button id="btnRunReview" class="btn btn-primary btn-sm" onclick="triggerReviewNow()">📊 立即执行今日收盘复盘与参数自进化</button>
+        </div>
+        <div id="reviewReportContent" style="white-space: pre-wrap; font-size: 13px; line-height: 1.8; color: var(--text-muted); font-family: var(--font-sans); background: rgba(0,0,0,0.25); padding: 20px; border-radius: var(--radius-sm);">
+          正在加载最新收盘复盘报告...
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🧬 策略参数闭环自我演进流水 (Self-Tuning Logs)</div>
+        </div>
+        <div class="data-table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>演进时间</th>
+                <th>大盘环境</th>
+                <th>近期实盘胜率</th>
+                <th>参数微调动作</th>
+                <th>演进理由</th>
+              </tr>
+            </thead>
+            <tbody id="optLogTbody">
+              <!-- 动态填充 -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 7. 策略与推送配置 -->
+    <section id="pane-settings" class="tab-pane" style="display: none;">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">⚙️ 2.0 策略模型与风控参数设置</div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
+          <div class="form-group">
+            <label class="form-label">RSRS 机构买入阈值 (默认 0.70)</label>
+            <input id="cfgRsrsBuy" class="form-input" type="number" step="0.05">
+          </div>
+          <div class="form-group">
+            <label class="form-label">RSRS 卖出清仓阈值 (默认 -0.70)</label>
+            <input id="cfgRsrsSell" class="form-input" type="number" step="0.05">
+          </div>
+          <div class="form-group">
+            <label class="form-label">ATR 自适应止损倍数 (默认 2.0)</label>
+            <input id="cfgAtrStop" class="form-input" type="number" step="0.1">
+          </div>
+          <div class="form-group">
+            <label class="form-label">最高点动态移动回撤止盈 (%)</label>
+            <input id="cfgTrailing" class="form-input" type="number" step="0.5">
+          </div>
+          <div class="form-group">
+            <label class="form-label">做T均线负偏离低吸阈值 (%)</label>
+            <input id="cfgT0Buy" class="form-input" type="number" step="0.1">
+          </div>
+          <div class="form-group">
+            <label class="form-label">做T均线正偏离高抛阈值 (%)</label>
+            <input id="cfgT0Sell" class="form-input" type="number" step="0.1">
+          </div>
+          <div class="form-group" style="display: flex; align-items: center; gap: 8px; margin-top: 25px;">
+            <label style="cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 13px;">
+              <input type="checkbox" id="cfgT0TrendFilter"> 启用 MA20 趋势顺势过滤 (关闭后允许深套标的日内超跌做正T)
+            </label>
+          </div>
+        </div>
+
+        <div class="card-header" style="margin-top: 24px;">
+          <div class="card-title">📱 微信与钉钉消息推送配置</div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px;">
+          <!-- 钉钉配置 -->
+          <div style="background: rgba(0,0,0,0.2); padding: 16px; border-radius: var(--radius-sm);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+              <strong>钉钉群机器人</strong>
+              <label><input type="checkbox" id="cfgDingEnabled"> 启用推送</label>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Webhook 地址</label>
+              <input id="cfgDingWebhook" class="form-input" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">加签 Secret (推荐填入)</label>
+              <input id="cfgDingSecret" class="form-input" placeholder="SEC...">
+            </div>
+          </div>
+
+          <!-- 微信配置 -->
+          <div style="background: rgba(0,0,0,0.2); padding: 16px; border-radius: var(--radius-sm);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+              <strong>微信推送通道</strong>
+              <label><input type="checkbox" id="cfgWxEnabled"> 启用推送</label>
+            </div>
+            <div class="form-group">
+              <label class="form-label">推送通道服务商</label>
+              <select id="cfgWxProvider" class="form-input">
+                <option value="pushplus">PushPlus (微信公众平台服务号弹窗，最推荐)</option>
+                <option value="serverchan">Server酱 (方糖 Turbo 版)</option>
+                <option value="wecom">企业微信群机器人</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Token / SendKey / Webhook</label>
+              <input id="cfgWxToken" class="form-input" placeholder="填入 PushPlus Token 或 Server酱 SendKey...">
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top: 24px; display: flex; gap: 12px;">
+          <button class="btn btn-primary" onclick="saveSettings()">💾 保存并热重载配置</button>
+          <button class="btn btn-secondary" onclick="testNotification()">🔔 发送测试推送到微信/钉钉</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 8. 尾盘 2:30 突袭战法独立专区 -->
+    <section id="pane-tail230" class="tab-pane" style="display: none;">
+      <!-- 战法理念卡片 -->
+      <div class="card" style="background: linear-gradient(135deg, rgba(245, 158, 11, 0.08), rgba(99, 102, 241, 0.08)); border-color: rgba(245, 158, 11, 0.3); margin-bottom: 20px;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px;">
+          <div>
+            <h3 style="font-size: 16px; color: var(--c-gold); display: flex; align-items: center; gap: 8px;">
+              ⚡ A股主板尾盘 2:30 突袭战法 (Tail Hunter 2.30)
+              <span id="tailWindowBadge" class="badge" style="font-size: 11px; background: rgba(245, 158, 11, 0.2); color: #fbbf24;">窗口检测中...</span>
+            </h3>
+            <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6; margin-top: 6px;">
+              <strong>算法灵感来自 GitHub 顶级 A 股实战开源库</strong>（<code>songxiaoyan/stock-picker</code> 8步选股法 与 <code>hyan1985/stock-predict</code> 尾盘分时量价模型）：<br>
+              A 股在 14:30 之后全天多空搏杀基本定型，假突破概率最低。模型在 <strong>14:30 - 14:50 黄金抢筹窗口</strong>，筛选主板 <strong>涨幅在 +2.0%~+5.5% 黄金区间、量比 ≥ 1.25、站稳 MA5/MA20、分时持续运行在 VWAP 均价上方</strong> 的突破标的；结合 <strong>T+1 一夜持股法</strong>，次日早盘 9:30-9:45 冲高即兑现溢价（目标 +2.5%），坚决防守止损（-1.8%），快进快出，回避全天市场系统性风险！
+            </p>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <select id="tailBacktestDays" class="form-input" style="width: 140px; font-size: 12px; padding: 6px 10px;">
+              <option value="60">回测近 60 天</option>
+              <option value="120" selected>回测近 120 天</option>
+              <option value="250">回测近 250 天(年)</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="recalculateTail230()">
+              🔄 独立重新测算胜率
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 独立胜率与四大核心指标看板 -->
+      <div class="macro-strip" style="margin-bottom: 24px;">
+        <div class="macro-card">
+          <div class="macro-title">🎯 2.30 战法全周期实战胜率</div>
+          <div id="tailWinRate" class="macro-val text-up" style="font-size: 26px;">--%</div>
+          <div id="tailTradesCount" class="macro-sub">已完成 0 笔历史实战因果回测</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">🛡️ 叠加宏观大盘滤网增强胜率</div>
+          <div id="tailEnhancedWinRate" class="macro-val" style="font-size: 26px; color: var(--c-cyan);">--%</div>
+          <div class="macro-sub">多头/平衡市胜率 (弱市空仓防守)</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">⚖️ 策略综合盈亏比 (P/L Ratio)</div>
+          <div id="tailPLRatio" class="macro-val" style="font-size: 26px; color: var(--c-gold);">--:1</div>
+          <div id="tailAvgWinLoss" class="macro-sub">平均盈 +0.0% / 平均亏 -0.0%</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">🌅 次日早盘平均最高冲高溢价</div>
+          <div id="tailMorningPrem" class="macro-val" style="font-size: 26px; color: #a78bfa;">+--%</div>
+          <div class="macro-sub">次日 9:30-9:45 冲高止盈窗口空间</div>
+        </div>
+      </div>
+
+      <!-- 今日 2.30 战法主板精选候选池 -->
+      <div class="card" style="margin-bottom: 24px;">
+        <div class="card-header">
+          <div class="card-title">⚡ 今日 2.30 尾盘主板精选标的</div>
+          <button class="btn btn-secondary btn-sm" onclick="loadTailCandidates(true)">🔄 刷新候选池</button>
+        </div>
+        <div id="tailCandidatesContainer" class="screener-grid">
+          <!-- 动态加载候选卡片 -->
+        </div>
+      </div>
+
+      <!-- 📋 次日卖出监控池 (T+1 极速离场监控看板) -->
+      <div class="card" style="margin-bottom: 24px; border-color: rgba(99, 102, 241, 0.3);">
+        <div class="card-header">
+          <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
+            <span>📋 2.30 战法次日卖出监控池 (T+1 极速离场引擎)</span>
+            <span id="tailHoldingBadge" class="badge" style="font-size: 11px; background: rgba(99, 102, 241, 0.2); color: #818cf8;">实时监控中</span>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadTailTrades()">🔄 刷新卖出监控</button>
+        </div>
+        <div class="data-table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>标的名称 / 代码</th>
+                <th>买入日期 / 时间</th>
+                <th>尾盘买入价</th>
+                <th>冲高止盈线 (+2.5%)</th>
+                <th>防守止损线 (-1.8%)</th>
+                <th>当前状态</th>
+                <th>离场价格 / 最终结算</th>
+                <th>离场原因与指引</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tailHoldingsTableBody">
+              <!-- 动态加载次日监控持仓 -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 历史实战/因果回测交易明细记录 -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📜 2.30 战法独立历史因果回测明细 (近 30 笔交易)</div>
+          <span style="font-size: 12px; color: var(--text-muted);">严格扣除印花税/双边佣金/真实滑点 摩擦费用</span>
+        </div>
+        <div class="data-table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>标的名称 / 代码</th>
+                <th>买入日期 (14:30)</th>
+                <th>尾盘买入价</th>
+                <th>次日早盘冲高</th>
+                <th>平仓离场价</th>
+                <th>单笔净收益率</th>
+                <th>大盘环境</th>
+                <th>离场原因</th>
+                <th>实战胜负</th>
+              </tr>
+            </thead>
+            <tbody id="tailTradesTableBody">
+              <tr><td colspan="9" style="text-align:center; color: var(--text-dim); padding: 20px;">正在加载 2.30 战法历史因果回测战绩...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 添加自选股弹窗 -->
+  <div id="addWatchModal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="card-header">
+        <div class="card-title">+ 添加标的至自选与持仓监控池</div>
+        <button class="btn btn-secondary btn-sm" onclick="hideAddWatchlistModal()">✕</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label">股票代码或名称 (仅支持沪深主板，如 600519 或 贵州茅台)</label>
+        <input id="addCode" class="form-input" placeholder="代码/名称">
+      </div>
+      <div class="form-group">
+        <label class="form-label">持仓买入成本 (元，若仅为观察自选可填 0)</label>
+        <input id="addCost" class="form-input" type="number" step="0.01" value="0">
+      </div>
+      <div class="form-group">
+        <label class="form-label">当前持仓股数 (股，若仅观察可填 0)</label>
+        <input id="addShares" class="form-input" type="number" step="100" value="0">
+      </div>
+      <div class="form-group">
+        <label class="form-label">备注标签 (如 核心白马、算力龙头)</label>
+        <input id="addNotes" class="form-input" placeholder="个性化备忘">
+      </div>
+      <div style="margin-top: 20px; display: flex; justify-content: flex-end; gap: 10px;">
+        <button class="btn btn-secondary" onclick="hideAddWatchlistModal()">取消</button>
+        <button class="btn btn-primary" onclick="submitAddWatchlist()">确认添加</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

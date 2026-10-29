@@ -1,0 +1,24 @@
+# Python Bytecode & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Storage Data & Personal Privacy Protection (严格杜绝密钥与个人持仓泄露)
+storage/user_config.json
+storage/watchlist.json
+storage/signals_history.json
+storage/t0_trades.json
+storage/tail_trades_230.json
+storage/test_tail_trades.json
+storage/review_history.json
+storage/optimization_log.json
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

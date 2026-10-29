@@ -1,0 +1,90 @@
+[
+  {
+    "symbol": "sh512890",
+    "code": "512890",
+    "name": "红利低波ETF",
+    "holding_cost": 1.21,
+    "entry_price": 1.21,
+    "holding_shares": 4200,
+    "shares": 4200,
+    "t0_enabled": true,
+    "notes": "红利低波核心底仓"
+  },
+  {
+    "symbol": "sh561980",
+    "code": "561980",
+    "name": "半导体设备ETF",
+    "holding_cost": 0.828,
+    "entry_price": 0.828,
+    "holding_shares": 15400,
+    "shares": 15400,
+    "t0_enabled": true,
+    "notes": "半导体设备ETF"
+  },
+  {
+    "symbol": "sz002156",
+    "code": "002156",
+    "name": "通富微电",
+    "holding_cost": 76.263,
+    "entry_price": 76.263,
+    "holding_shares": 100,
+    "shares": 100,
+    "t0_enabled": true,
+    "notes": "先进封装芯片"
+  },
+  {
+    "symbol": "sh603993",
+    "code": "603993",
+    "name": "洛阳钼业",
+    "holding_cost": 18.582,
+    "entry_price": 18.582,
+    "holding_shares": 800,
+    "shares": 800,
+    "t0_enabled": true,
+    "notes": "有色金属资源"
+  },
+  {
+    "symbol": "sz002594",
+    "code": "002594",
+    "name": "比亚迪",
+    "holding_cost": 0.0,
+    "entry_price": 0.0,
+    "holding_shares": 0,
+    "shares": 0,
+    "t0_enabled": false,
+    "notes": "新能源车龙头(观察)"
+  },
+  {
+    "symbol": "sh600667",
+    "code": "600667",
+    "name": "太极实业",
+    "holding_cost": 0.0,
+    "entry_price": 0.0,
+    "holding_shares": 0,
+    "shares": 0,
+    "t0_enabled": true,
+    "notes": "半导体洁净工程(观察)"
+  },
+  {
+    "symbol": "sh513130",
+    "code": "513130",
+    "name": "恒生科技ETF华泰柏瑞",
+    "holding_cost": 0.0,
+    "entry_price": 0.0,
+    "holding_shares": 0,
+    "shares": 0,
+    "t0_enabled": true,
+    "notes": "恒生科技ETF(观察)"
+  },
+  {
+    "symbol": "sz002842",
+    "code": "002842",
+    "name": "翔鹭钨业",
+    "holding_cost": 56.653,
+    "entry_price": 56.653,
+    "holding_shares": 1400,
+    "shares": 1400,
+    "t0_enabled": true,
+    "notes": "稀有金属小金属"
+  }
+]
