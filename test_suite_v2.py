@@ -285,6 +285,55 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         self.assertTrue(0 <= rf["radar_score"] <= 100)
         print(f"  -> 财报体检验证成功: {stock_res['name']} ROE={dupont['roe']}%, 净利率={dupont['net_profit_margin']}%, F-Score={f_score['score']}/9, 画像={stock_res['persona']}")
 
+    def test_13_limit_up_engine(self):
+        """测试游资龙虎打板量化识别、封板硬度评估、实战流水账本自动维护与胜率统计"""
+        print("\n[测试 13] 验证游资龙虎打板引擎与自动流水台账自进化...")
+        from core.limit_up_engine import limit_up_engine
+        from config import LIMIT_UP_CSV_FILE
+
+        # 1. 构造涨停 K 线，测试板型识别与硬度评分
+        mock_zt_df = self.mock_df.copy()
+        last_close = mock_zt_df.iloc[-2]['close']
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('close')] = round(last_close * 1.10, 2)
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('high')] = round(last_close * 1.10, 2)
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('open')] = round(last_close * 1.02, 2)
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('volume')] = mock_zt_df['volume'].mean() * 2.2
+
+        eval_res = limit_up_engine.evaluate_limit_up_bar("sh600501", "航天晨光", mock_zt_df)
+        self.assertIsNotNone(eval_res)
+        self.assertIn("board_type", eval_res)
+        self.assertIn("hardness_score", eval_res)
+        self.assertIn("seal_turnover_ratio", eval_res)
+        self.assertIn("trade_levels", eval_res)
+        self.assertTrue(eval_res["hardness_score"] >= 60.0)
+        print(f"  -> 涨停量化研判通过: 板型=[{eval_res['board_type']}], 封板硬度={eval_res['hardness_score']}分, 封成比={eval_res['seal_turnover_ratio']}%")
+
+        # 2. 验证台账录入与 CSV 文件生成 (带 UTF-8 BOM)
+        added = limit_up_engine.record_board_hitting_trades([eval_res], top_n=1)
+        self.assertTrue(LIMIT_UP_CSV_FILE.exists())
+        # 验证文件以 UTF-8 BOM 开头 (0xEF, 0xBB, 0xBF)
+        with open(LIMIT_UP_CSV_FILE, "rb") as f:
+            header_bytes = f.read(3)
+            self.assertEqual(header_bytes, b'\xef\xbb\xbf')
+        print(f"  -> 打板流水账本自动维护通过: 已导出带 UTF-8 BOM 的 Excel/WPS 兼容 CSV 文件 ({LIMIT_UP_CSV_FILE.name})")
+
+        # 3. 验证打板量化胜率与归因统计指标
+        stats = limit_up_engine.calculate_model_stats()
+        self.assertIn("total_trades", stats)
+        self.assertIn("open_premium_win_rate", stats)
+        self.assertIn("peak_profit_win_rate", stats)
+        self.assertIn("consecutive_rate", stats)
+        self.assertIn("profit_loss_ratio", stats)
+        self.assertTrue(0 <= stats["open_premium_win_rate"] <= 100)
+        self.assertTrue(0 <= stats["peak_profit_win_rate"] <= 100)
+        self.assertTrue(stats["profit_loss_ratio"] > 0)
+        print(f"  -> 模型胜率统计通过: 高开溢价率={stats['open_premium_win_rate']}%, 最高冲高胜率={stats['peak_profit_win_rate']}%, 连板率={stats['consecutive_rate']}%, 盈亏比={stats['profit_loss_ratio']}:1")
+
+        # 4. 验证复盘 T+1 真实结算调用
+        rev_res = limit_up_engine.review_and_update_trades()
+        self.assertIn("settled_count", rev_res)
+        print(f"  -> 复盘 T+1 自动结算闭环正常: 历史待决核查已执行")
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("      QuantitativeTrading 2.0 全链路自动化单元与回归测试套件")

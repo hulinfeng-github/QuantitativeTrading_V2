@@ -43,8 +43,9 @@ function initTabs() {
       const activePane = document.getElementById(`pane-${targetTab}`);
       if (activePane) activePane.style.display = "block";
 
-      // 切换到 2.30 战法面板时加载数据
+      // 切换到 2.30 战法或打板面板时加载数据
       if (targetTab === "tail230") loadTail230Data();
+      if (targetTab === "limitup") loadLimitUpData();
 
       // 切换到带图表的面板时自适应尺寸
       if (targetTab === "diagnose" && klineChartInstance) klineChartInstance.resize();
@@ -1234,6 +1235,253 @@ async function manualCloseTailTrade(sym, buy_date, defaultPrice) {
   } catch (e) {
     alert("平仓操作失败: " + e);
   }
+}
+
+// ==================== 游资龙虎打板模块前端交互 ====================
+
+let isLuRadarLoading = false;
+let isLuLedgerLoading = false;
+
+async function loadLimitUpData() {
+  await Promise.all([
+    loadLimitUpStats(),
+    loadLimitUpRadar(),
+    loadLimitUpLedger()
+  ]);
+}
+
+function refreshLimitUpData() {
+  loadLimitUpData();
+}
+
+// 1. 加载打板量化统计指标
+async function loadLimitUpStats() {
+  try {
+    const res = await fetch("/api/limitup/stats");
+    if (!res.ok) return;
+    const stats = await res.json();
+
+    document.getElementById("luTotalCount").textContent = `${stats.total_trades || 0} 笔`;
+    document.getElementById("luSettledSub").textContent = `已结算 ${stats.settled_trades || stats.closed_trades || 0} 笔 · 待决 ${stats.pending_trades || 0} 笔`;
+    document.getElementById("luOpenWinRate").textContent = `${stats.open_premium_win_rate || 0}%`;
+    document.getElementById("luPeakWinRate").textContent = `${stats.peak_profit_win_rate || 0}%`;
+    document.getElementById("luConsecutiveRate").textContent = `${stats.consecutive_rate || 0}%`;
+    document.getElementById("luPlRatio").textContent = `${stats.profit_loss_ratio || 1.0}:1`;
+    document.getElementById("luBigLossSub").textContent = `大面率 (跌幅≥4%): ${stats.big_loss_rate || 0}%`;
+
+    document.getElementById("luAvgOpenPnl").textContent = `${stats.avg_open_pnl > 0 ? '+' : ''}${stats.avg_open_pnl || 0}%`;
+    document.getElementById("luAvgPeakPnl").textContent = `${stats.avg_peak_pnl > 0 ? '+' : ''}${stats.avg_peak_pnl || 0}%`;
+    document.getElementById("luAvgClosePnl").innerHTML = formatPct(stats.avg_close_pnl || 0);
+
+    // 板型分布横幅渲染
+    const typeObj = stats.by_board_type || stats.board_types || {};
+    const typeItems = [];
+    for (const [k, v] of Object.entries(typeObj)) {
+      typeItems.push(`<span><strong style="color: #fff;">${k}</strong> (${v.count}笔 · 冲高胜率 <span class="text-up">${v.win_rate}%</span> · 均益 ${v.avg_return > 0 ? '+' : ''}${v.avg_return}%)</span>`);
+    }
+    const typeEl = document.getElementById("luTypeBreakdown");
+    if (typeEl) {
+      typeEl.innerHTML = typeItems.length > 0 ? typeItems.join(" &nbsp;|&nbsp; ") : "样本积累中...";
+    }
+  } catch (e) {
+    console.error("加载打板统计异常:", e);
+  }
+}
+
+// 2. 加载今日主板涨停板雷达
+async function loadLimitUpRadar() {
+  if (isLuRadarLoading) return;
+  isLuRadarLoading = true;
+  const container = document.getElementById("limitupRadarContainer");
+  if (!container) return;
+
+  container.innerHTML = `
+    <div style="grid-column: 1/-1; text-align: center; padding: 30px; color: var(--text-dim);">
+      <div style="font-size: 24px; margin-bottom: 8px;">⚡</div>
+      <div>正在全市场扫描主板涨停板与封板硬度数据...</div>
+    </div>
+  `;
+
+  try {
+    const res = await fetch("/api/limitup/radar?limit=20");
+    if (!res.ok) throw new Error("获取涨停雷达失败");
+    const list = await res.json();
+
+    if (!list || list.length === 0) {
+      container.innerHTML = `
+        <div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-dim); background: var(--bg-card); border-radius: var(--radius-md); border: 1px dashed var(--border-subtle);">
+          <div style="font-size: 28px; margin-bottom: 8px;">🛡️</div>
+          <div style="font-weight: 600; color: var(--text-muted); margin-bottom: 4px;">今日暂无符合严格涨停封死标准的主板标的</div>
+          <div style="font-size: 12px;">模型严格要求涨幅≥9.8%且触达涨停线，已自动过滤科创板/创业板/ST股。</div>
+        </div>
+      `;
+      return;
+    }
+
+    container.innerHTML = list.map(c => {
+      const reasonsHtml = (c.reasons || []).map(r => `<li>${r}</li>`).join("");
+      const hardnessColor = c.hardness_score >= 85 ? "var(--c-red)" : c.hardness_score >= 75 ? "var(--c-gold)" : "var(--c-cyan)";
+
+      return `
+        <div class="stock-card" style="border-top: 3px solid ${hardnessColor};">
+          <div class="stock-header">
+            <div>
+              <div class="stock-name" style="display: flex; align-items: center; gap: 6px;">
+                <span>${c.name}</span>
+                <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 10px;">${c.board_type}</span>
+              </div>
+              <div class="stock-symbol">${c.symbol} · 连板数: ${c.ladder_count}</div>
+            </div>
+            <div style="text-align: right;">
+              <div class="stock-price">${c.price.toFixed(2)} 元</div>
+              <div class="stock-change text-up">涨停封板</div>
+            </div>
+          </div>
+
+          <div class="stock-meta-row" style="margin-top: 12px;">
+            <div class="meta-item">
+              <span class="meta-label">封板硬度得分</span>
+              <span class="meta-val" style="color: ${hardnessColor}; font-size: 16px;">${c.hardness_score} 分</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">封成比</span>
+              <span class="meta-val text-gold">${c.seal_turnover_ratio}%</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">封板时间</span>
+              <span class="meta-val text-cyan">${c.seal_time || '早盘'}</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">成交额</span>
+              <span class="meta-val">${(c.turnover_amount / 100000000.0).toFixed(2)} 亿元</span>
+            </div>
+          </div>
+
+          <div style="margin-top: 12px; font-size: 12px; color: var(--text-muted);">
+            <ul style="padding-left: 16px; margin: 0; line-height: 1.5;">
+              ${reasonsHtml}
+            </ul>
+          </div>
+
+          <div style="margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-secondary btn-sm" onclick="quickAddWatchlist('${c.symbol}', '${c.name}', ${c.price})">
+              + 加入自选
+            </button>
+            <button class="btn btn-primary btn-sm" onclick="showDiagnoseTab('${c.symbol}')">
+              🔍 深度K线诊断
+            </button>
+          </div>
+        </div>
+      `;
+    }).join("");
+  } catch (e) {
+    console.error("加载打板雷达失败:", e);
+  } finally {
+    isLuRadarLoading = false;
+  }
+}
+
+// 3. 加载打板实战流水账本表格
+async function loadLimitUpLedger() {
+  if (isLuLedgerLoading) return;
+  isLuLedgerLoading = true;
+  const tbody = document.getElementById("limitupLedgerTableBody");
+  if (!tbody) return;
+
+  try {
+    const res = await fetch("/api/limitup/ledger?limit=100");
+    if (!res.ok) throw new Error("获取打板账本失败");
+    const trades = await res.json();
+
+    if (!trades || trades.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="14" style="text-align:center; color: var(--text-dim); padding: 25px;">暂无打板流水记录（每日收盘全自动维护录入）</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = trades.map(t => {
+      let statusBadge = `<span class="badge" style="background: rgba(99, 102, 241, 0.2); color: #818cf8;">⏳ 持仓待结算</span>`;
+      if (t.status === "WIN") {
+        statusBadge = `<span class="badge badge-up">🎉 胜·溢价兑现</span>`;
+      } else if (t.status === "LOSS") {
+        statusBadge = `<span class="badge badge-down">🛑 负·破位止损</span>`;
+      } else if (t.status === "FLAT") {
+        statusBadge = `<span class="badge" style="background: rgba(148, 163, 184, 0.2); color: #94a3b8;">⚖️ 平·微利对冲</span>`;
+      }
+
+      const openPnlStr = t.next_open_pnl != null ? `${t.next_open_pnl > 0 ? '+' : ''}${t.next_open_pnl}%` : "--";
+      const openPnlCls = t.next_open_pnl != null ? (t.next_open_pnl > 0 ? "text-up" : (t.next_open_pnl < 0 ? "text-down" : "")) : "";
+
+      const peakPnlStr = t.next_high_pnl != null ? `+${t.next_high_pnl}%` : "--";
+      const peakPnlCls = t.next_high_pnl != null ? (t.next_high_pnl >= 2.0 ? "text-up" : "") : "";
+
+      const closePnlStr = t.next_close_pnl != null ? `${t.next_close_pnl > 0 ? '+' : ''}${t.next_close_pnl}%` : "--";
+      const closePnlCls = t.next_close_pnl != null ? (t.next_close_pnl > 0 ? "text-up" : (t.next_close_pnl < 0 ? "text-down" : "")) : "";
+
+      const consecutiveStr = t.is_consecutive ? `<span class="text-up" style="font-weight:700;">🚀 连板成功</span>` : `<span style="color:var(--text-dim);">否</span>`;
+      const reasonsStr = (t.reasons || []).slice(0, 2).join("；") || "-";
+
+      return `
+        <tr>
+          <td>${t.date}</td>
+          <td>
+            <strong>${t.name}</strong><br>
+            <span style="font-size: 11px; color: var(--text-muted);">${t.symbol}</span>
+          </td>
+          <td><span class="badge" style="background: rgba(239, 68, 68, 0.15); color: #f87171;">${t.board_type || '首板'}</span></td>
+          <td><strong>${t.ladder_count || 1}</strong> 板</td>
+          <td><strong>${Number(t.seal_price || 0).toFixed(2)}</strong> 元</td>
+          <td style="font-size: 11px; color: var(--text-dim);">${t.seal_time || '-'}</td>
+          <td><strong style="color: var(--c-gold);">${t.hardness_score || 0}</strong> 分</td>
+          <td>${t.seal_turnover_ratio || 0}%</td>
+          <td class="${openPnlCls}"><strong>${openPnlStr}</strong></td>
+          <td class="${peakPnlCls}"><strong>${peakPnlStr}</strong></td>
+          <td class="${closePnlCls}"><strong>${closePnlStr}</strong></td>
+          <td>${consecutiveStr}</td>
+          <td>${statusBadge}</td>
+          <td style="font-size: 12px; max-width: 280px; color: var(--text-muted);">${reasonsStr}</td>
+        </tr>
+      `;
+    }).join("");
+  } catch (e) {
+    console.error("加载打板流水表格失败:", e);
+  } finally {
+    isLuLedgerLoading = false;
+  }
+}
+
+// 4. 一键录入前3只精选打板标的至账本
+async function autoRecordTopLimitUp() {
+  try {
+    const res = await fetch("/api/limitup/record", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ top_n: 3 })
+    });
+    if (!res.ok) throw new Error("录入失败");
+    const json = await res.json();
+    alert(`🎉 已成功将 ${json.added_count} 只今日精选涨停标的录入流水账本！表格已同步刷新。`);
+    await loadLimitUpData();
+  } catch (e) {
+    alert("一键录入异常: " + e);
+  }
+}
+
+// 5. 立即执行 T+1 真实复盘结算
+async function triggerManualSettlement() {
+  try {
+    const res = await fetch("/api/limitup/refresh", { method: "POST" });
+    if (!res.ok) throw new Error("结算失败");
+    const json = await res.json();
+    alert(`✅ T+1 真实行情结算完成！已更新台账数据，CSV 表格已自动同步重构。`);
+    await loadLimitUpData();
+  } catch (e) {
+    alert("结算失败: " + e);
+  }
+}
+
+// 6. 导出 / 下载 CSV 电子表格
+function exportLimitUpCsv() {
+  window.open("/api/limitup/csv", "_blank");
 }
 
 

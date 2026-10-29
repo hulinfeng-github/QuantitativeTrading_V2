@@ -61,6 +61,7 @@
         <button class="tab-btn" data-tab="watchlist">📋 盘中自选与持仓实时监控</button>
         <button class="tab-btn" data-tab="t0">🎯 A股T+1日内做T助手</button>
         <button class="tab-btn" data-tab="tail230">⚡ 尾盘 2:30 突袭战法</button>
+        <button class="tab-btn" data-tab="limitup">⚡ 游资龙虎打板</button>
         <button class="tab-btn" data-tab="diagnose">🔍 单股深度诊断与专业K线</button>
         <button class="tab-btn" data-tab="backtest">📈 组合因果回测对比 (vs 沪深300)</button>
         <button class="tab-btn" data-tab="review">📊 每日收盘复盘与参数自进化</button>
@@ -438,6 +439,129 @@
             </thead>
             <tbody id="tailTradesTableBody">
               <tr><td colspan="9" style="text-align:center; color: var(--text-dim); padding: 20px;">正在加载 2.30 战法历史因果回测战绩...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ⚡ 游资龙虎打板与自动台账面板 -->
+    <section id="pane-limitup" class="tab-pane" style="display: none;">
+      <!-- 策略战法导读横幅 -->
+      <div class="card" style="background: rgba(239, 68, 68, 0.05); border-color: rgba(239, 68, 68, 0.25); margin-bottom: 20px;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 10px;">
+          <div>
+            <h3 style="font-size: 15px; color: #f87171; margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
+              <span>⚡ 游资龙虎打板量化与自动流水账本引擎 (LimitUp 2.0)</span>
+              <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 11px;">自动维护 · 每日结算</span>
+            </h3>
+            <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6; max-width: 900px; margin: 0;">
+              结合 GitHub 顶级 A 股游资实战战法与量化研报：锁定主板<strong>首板突破、1进2接力、2进3空间板、弱转强反包</strong>；量化分时<strong>封板时间、封成比、炸板回封次数与封板硬度得分 (0~100)</strong>。<br>
+              <strong>复盘自动维护</strong>：每日收盘全自动归档并导出实战流水账本至 <code>storage/limit_up_ledger.csv</code> (UTF-8 with BOM，Excel/WPS秒开)；次日收盘自动 T+1 真实回访结算，单独追踪高开溢价率、冲高胜率、连板晋级率与盈亏比！
+            </p>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-secondary btn-sm" onclick="exportLimitUpCsv()">📥 导出/下载 CSV 表格</button>
+            <button class="btn btn-primary btn-sm" onclick="refreshLimitUpData()">🔄 刷新打板雷达与账本</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 核心战绩与胜率 KPI 指标看板 -->
+      <div class="macro-strip" style="margin-bottom: 20px;">
+        <div class="macro-card">
+          <div class="macro-title">打板样本总量</div>
+          <div id="luTotalCount" class="macro-val">--</div>
+          <div id="luSettledSub" class="macro-sub">已结算 -- 笔 · 待决 -- 笔</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">次日高开溢价胜率</div>
+          <div id="luOpenWinRate" class="macro-val text-gold">--%</div>
+          <div class="macro-sub">开盘竞价直接红盘概率</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">盘中冲高止盈胜率</div>
+          <div id="luPeakWinRate" class="macro-val text-up">--%</div>
+          <div class="macro-sub">次日最高冲高 ≥ +2.0% 概率</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">连板晋级成功率</div>
+          <div id="luConsecutiveRate" class="macro-val text-cyan">--%</div>
+          <div class="macro-sub">成功实现二连板/三连板进阶</div>
+        </div>
+        <div class="macro-card">
+          <div class="macro-title">风控盈亏比 / 大面率</div>
+          <div id="luPlRatio" class="macro-val">--:1</div>
+          <div id="luBigLossSub" class="macro-sub text-down">大面率 (跌幅≥4%): --%</div>
+        </div>
+      </div>
+
+      <!-- 板型细分统计与次日收益分布横幅 -->
+      <div class="card" style="margin-bottom: 20px; padding: 14px 20px; background: rgba(15, 23, 42, 0.4);">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
+          <div style="display: flex; align-items: center; gap: 20px; font-size: 13px;">
+            <span style="font-weight: 600; color: #fff;">📊 板型冲高胜率细分:</span>
+            <span id="luTypeBreakdown" style="color: var(--text-muted);">正在加载板型分布...</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 15px; font-size: 12px; color: var(--text-dim);">
+            <span>次日开盘均值: <strong id="luAvgOpenPnl" class="text-gold">--%</strong></span>
+            <span>盘中冲高均值: <strong id="luAvgPeakPnl" class="text-up">--%</strong></span>
+            <span>收盘收益均值: <strong id="luAvgClosePnl">--%</strong></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 今日全市场涨停板雷达 -->
+      <div class="card" style="margin-bottom: 24px;">
+        <div class="card-header">
+          <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
+            <span>⚡ 今日主板涨停板雷达 (分时封板硬度评估)</span>
+            <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 11px;">主板精选</span>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-secondary btn-sm" onclick="autoRecordTopLimitUp()">⚡ 一键录入前3只至实战账本</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadLimitUpRadar()">🔄 刷新涨停雷达</button>
+          </div>
+        </div>
+        <div id="limitupRadarContainer" class="screener-grid">
+          <!-- 动态加载涨停卡片 -->
+        </div>
+      </div>
+
+      <!-- 自动维护的打板实战流水账本 (单独追踪记录) -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
+            <span>📜 游资打板实战流水账本 (自动维护·单独记录成功率及收益)</span>
+            <span class="badge" style="background: rgba(16, 185, 129, 0.2); color: #34d399; font-size: 11px;">storage/limit_up_ledger.csv 同步更新</span>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-primary btn-sm" onclick="triggerManualSettlement()">🛠️ 立即执行 T+1 真实复盘结算</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadLimitUpLedger()">🔄 刷新账本明细</button>
+          </div>
+        </div>
+        <div class="data-table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>打板日期</th>
+                <th>标的名称 / 代码</th>
+                <th>板型结构</th>
+                <th>连板数</th>
+                <th>封板价格</th>
+                <th>首次封板时间</th>
+                <th>封板硬度</th>
+                <th>封成比</th>
+                <th>次日高开溢价</th>
+                <th>次日冲高溢价</th>
+                <th>次日收盘收益</th>
+                <th>连板晋级</th>
+                <th>结算状态</th>
+                <th>打板量化归因</th>
+              </tr>
+            </thead>
+            <tbody id="limitupLedgerTableBody">
+              <tr><td colspan="14" style="text-align:center; color: var(--text-dim); padding: 25px;">正在加载打板实战流水账本...</td></tr>
             </tbody>
           </table>
         </div>

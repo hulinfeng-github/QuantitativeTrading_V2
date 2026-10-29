@@ -42,20 +42,32 @@ class ReviewEngineV2:
         # 3. 历史信号胜率核查
         signal_tracking = self._track_recent_signals(days_window=10)
 
-        # 4. 执行参数自迭代调优
+        # 4. 游资龙虎打板交易自动结算与战绩统计
+        limit_up_review_res = {}
+        limit_up_stats = {}
+        try:
+            from core.limit_up_engine import limit_up_engine
+            limit_up_review_res = limit_up_engine.review_and_update_trades(today_str)
+            limit_up_stats = limit_up_engine.calculate_model_stats()
+        except Exception as e:
+            print(f"游资打板复盘结算异常: {e}")
+
+        # 5. 执行参数自迭代调优
         optimization_result = self._self_optimize_parameters(
             market_regime=market_analysis.get("regime", "震荡"),
             win_rate=signal_tracking.get("win_rate", 55.0),
             apply_changes=auto_optimize
         )
 
-        # 5. 组装 Markdown 复盘报告
+        # 6. 组装 Markdown 复盘报告
         report_md = self._build_markdown_report(
             date_str=today_str,
             market=market_analysis,
             watchlist=watchlist_review,
             tracking=signal_tracking,
-            optimization=optimization_result
+            optimization=optimization_result,
+            limit_up_stats=limit_up_stats,
+            limit_up_review=limit_up_review_res
         )
 
         review_data = {
@@ -64,6 +76,7 @@ class ReviewEngineV2:
             "market": market_analysis,
             "watchlist": watchlist_review,
             "tracking": signal_tracking,
+            "limit_up": limit_up_stats,
             "optimization": optimization_result,
             "report_md": report_md
         }
@@ -233,7 +246,9 @@ class ReviewEngineV2:
         market: Dict[str, Any],
         watchlist: List[Dict[str, Any]],
         tracking: Dict[str, Any],
-        optimization: Dict[str, Any]
+        optimization: Dict[str, Any],
+        limit_up_stats: Optional[Dict[str, Any]] = None,
+        limit_up_review: Optional[Dict[str, Any]] = None
     ) -> str:
         """生成专业级 Markdown 复盘长文（支持手机端直接阅读，无需打开Web）"""
         md = []
@@ -309,13 +324,41 @@ class ReviewEngineV2:
             md.append("- 今日做T数据加载正常。")
         md.append("")
 
-        # 4. 历史策略推荐信号回访
-        md.append("### 四、 历史策略推荐信号前向胜率")
+        # 4. 游资龙虎打板模型复盘与隔日溢价战绩
+        md.append("### 四、 ⚡ 游资龙虎打板模型复盘与隔日溢价战绩")
+        if limit_up_stats and limit_up_stats.get("total_trades", 0) > 0:
+            st = limit_up_stats
+            md.append(f"- **模型累计打板样本**: **{st.get('total_trades')}** 笔 | **已结算评估**: **{st.get('settled_trades')}** 笔 | **待结算(持仓中)**: **{st.get('pending_trades')}** 笔")
+            md.append(f"- **开盘竞价高开胜率**: **{st.get('open_premium_win_rate')}%** (次日竞价溢价概率)")
+            md.append(f"- **盘中最高冲高胜率**: **{st.get('peak_profit_win_rate')}%** (次日最高冲高 >= +2.0% 止盈概率)")
+            md.append(f"- **连板晋级接力率**: **{st.get('consecutive_rate')}%** (成功实现二连板/三连板进阶)")
+            md.append(f"- **核心收益指标**: 次日开盘均值 **{st.get('avg_open_pnl'):+.2f}%** | 冲高均值 **{st.get('avg_peak_pnl'):+.2f}%** | 收盘均值 **{st.get('avg_close_pnl'):+.2f}%**")
+            md.append(f"- **风控胜负手**: 盈亏比 **{st.get('profit_loss_ratio')}:1** | 大面率(跌幅>=-5%) **{st.get('big_loss_rate')}%**")
+            
+            # 板型细分
+            by_type = st.get("by_board_type", {})
+            if by_type:
+                type_summaries = []
+                for b_name, b_val in by_type.items():
+                    type_summaries.append(f"{b_name}(样本{b_val.get('count')}笔·冲高胜率{b_val.get('win_rate')}%)")
+                md.append(f"- **板型胜率阵列**: {' · '.join(type_summaries)}")
+
+            # 今日结算简况
+            if limit_up_review and limit_up_review.get("settled_count", 0) > 0:
+                md.append(f"- **今日收盘自动结算**: 成功结算并回填 **{limit_up_review.get('settled_count')}** 笔待决订单，台账同步刷新")
+            
+            md.append(f"- **实战流水账本**: 存储于 `storage/limit_up_ledger.csv` (UTF-8 with BOM，Excel/WPS即点即开)")
+        else:
+            md.append("- 游资龙虎打板模块运行正常，待触发符合封板硬度标准标的后自动归档维护。")
+        md.append("")
+
+        # 5. 历史策略推荐信号回访
+        md.append("### 五、 历史策略推荐信号前向胜率")
         md.append(f"- 近期信号样本: **{tracking.get('total_signals')}** 笔 | 胜率: **{tracking.get('win_rate')}%** | 平均前向收益: **{tracking.get('avg_return'):+.2f}%**")
         md.append("")
 
-        # 5. 策略参数自我进化演进 (Self-Tuning)
-        md.append("### 五、 策略参数自我进化演进 (Self-Tuning)")
+        # 6. 策略参数自我进化演进 (Self-Tuning)
+        md.append("### 六、 策略参数自我进化演进 (Self-Tuning)")
         md.append(f"- **RSRS 机构买入阈值**: {optimization.get('old_rsrs_buy')} -> **{optimization.get('new_rsrs_buy')}**")
         md.append(f"- **ATR 防守止损倍数**: {optimization.get('old_atr_stop')} -> **{optimization.get('new_atr_stop')}**")
         md.append(f"- **闭环演进理由**: {'; '.join(optimization.get('reasons', []))}")

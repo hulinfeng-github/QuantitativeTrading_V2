@@ -480,3 +480,52 @@ def close_tail230_trade(data: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=404, detail="未找到对应的 2.30 战法持仓记录")
     return {"success": True, "trade": t}
 
+# ==================== 游资龙虎打板量化与自动台账 API ====================
+
+@app.get("/api/limitup/radar")
+def get_limitup_radar(limit: int = Query(default=20, ge=1, le=50)):
+    """获取今日全市场主板涨停板雷达与硬度评分"""
+    from core.limit_up_engine import limit_up_engine
+    return limit_up_engine.scan_today_candidates(limit=limit)
+
+@app.get("/api/limitup/stats")
+def get_limitup_stats():
+    """获取打板量化模型的全量胜率、连板率、隔日溢价与板型细分统计"""
+    from core.limit_up_engine import limit_up_engine
+    return limit_up_engine.calculate_model_stats()
+
+@app.get("/api/limitup/ledger")
+def get_limitup_ledger(limit: int = Query(default=100, ge=1, le=500)):
+    """获取打板交易流水账本明细"""
+    from core.limit_up_engine import limit_up_engine
+    return limit_up_engine.get_all_trades(limit=limit)
+
+@app.post("/api/limitup/refresh")
+def refresh_limitup_settlement():
+    """手动触发打板流水账本 T+1 真实行情结算与 CSV 重新导出"""
+    from core.limit_up_engine import limit_up_engine
+    res = limit_up_engine.review_and_update_trades()
+    return {"success": True, "message": "打板账本 T+1 结算与表格更新完成", "stats": res}
+
+@app.post("/api/limitup/record")
+def record_limitup_trades(data: Dict[str, Any] = Body(default={})):
+    """将今日精选打板候选股票一键录入实战跟踪账本"""
+    from core.limit_up_engine import limit_up_engine
+    top_n = int(data.get("top_n", 3))
+    candidates = limit_up_engine.scan_today_candidates(limit=10)
+    added = limit_up_engine.record_board_hitting_trades(candidates, top_n=top_n)
+    return {"success": True, "added_count": len(added), "added": added}
+
+@app.get("/api/limitup/csv")
+def download_limitup_csv():
+    """下载或查看带有 UTF-8 BOM 的打板实战流水表格 (Excel / WPS 即点即开)"""
+    from config import LIMIT_UP_CSV_FILE
+    from core.limit_up_engine import limit_up_engine
+    if not LIMIT_UP_CSV_FILE.exists():
+        limit_up_engine.export_csv()
+    return FileResponse(
+        str(LIMIT_UP_CSV_FILE),
+        media_type="text/csv",
+        filename="A股打板量化实战流水账本.csv"
+    )
+
