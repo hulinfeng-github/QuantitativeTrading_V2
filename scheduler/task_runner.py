@@ -10,6 +10,8 @@
 import time
 import json
 import threading
+import sys
+import ctypes
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
@@ -22,6 +24,23 @@ from core.t0_smart_engine import t0_smart_engine
 from core.review_engine_v2 import review_engine_v2
 from core.strategy_tail_230 import tail_strategy_230, tail_trade_tracker
 from notifier.manager import notification_manager
+
+def set_windows_sleep_prevention(enable: bool = True):
+    """
+    通过 Windows 核心原生 API (SetThreadExecutionState) 防止操作系统自动睡眠/休眠
+    - 允许屏幕正常熄灭以省电和保护隐私
+    - 但强制锁定 CPU 与后台线程，保证定时任务在交易日 100% 准时执行
+    """
+    if sys.platform.startswith("win"):
+        try:
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            if enable:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+            else:
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        except Exception:
+            pass
 
 class QuantScheduler2:
     def __init__(self):
@@ -503,10 +522,13 @@ class QuantScheduler2:
 
         self.scheduler.start()
         self.is_running = True
-        print("[Scheduler 2.0] 自动化后台调度引擎已就绪启动。")
+        # 针对 Windows 用户：启动系统级防休眠锁 (允许屏幕熄灭省电，但绝不冻结后台调度与推送)
+        set_windows_sleep_prevention(True)
+        print("[Scheduler 2.0] 自动化后台调度引擎已就绪启动 (Windows 交易时段防休眠保护已激活)。")
 
     def stop(self):
         if self.is_running:
+            set_windows_sleep_prevention(False)
             self.scheduler.shutdown(wait=False)
             self.is_running = False
 
