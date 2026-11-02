@@ -560,8 +560,82 @@ class TailTradeTracker:
                     self._save()
                 return
 
+    def reconcile_and_clean_expired_positions(self, current_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """
+        开机自检与断档恢复：
+        自动核查所有处于未平仓状态的 2.30 战法头寸。
+        若其真实的 T+1 交易日已经过去（因用户在 T+1 日未开机运行），
+        系统自动调取该标的在 T+1 日的真实历史日K线完成回溯平仓结算，
+        彻底杜绝遗留僵尸单、消除胜率统计断层，并防止在后续交易日发出虚假的“次日早盘”报警！
+        """
+        now = current_dt or datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        reconciled = []
+
+        active_positions = [t for t in self._trades if t.get("status") in ["HOLDING", "ALERTED_TIMED"]]
+        for pos in active_positions:
+            sym = pos.get("symbol")
+            buy_date = str(pos.get("buy_date", ""))[:10]
+            if not sym or not buy_date or buy_date >= today_str:
+                continue
+
+            buy_p = float(pos.get("buy_price", 0.0))
+            target_p = float(pos.get("target_sell_price", buy_p * 1.025))
+            stop_p = float(pos.get("stop_loss_price", buy_p * 0.982))
+
+            # 获取该标的历史K线寻找真正的 T+1 交易日
+            df = data_engine.get_daily_kline(sym, count=30)
+            if df is None or len(df) == 0:
+                continue
+
+            df['date_str'] = df['date'].astype(str).str[:10]
+            after_bars = df[df['date_str'] > buy_date]
+            if len(after_bars) == 0:
+                # 尚未经历任何后续交易日 (如周末或刚买入)
+                continue
+
+            t1_bar = after_bars.iloc[0]
+            t1_date = str(t1_bar['date_str'])
+
+            # 如果首个后续交易日就是今天，说明今天是正统的 T+1 日，保留给今日盘中巡检
+            if t1_date == today_str:
+                continue
+
+            # 如果首个后续交易日早于今天，说明 T+1 日在停机期间已过，执行离线自动回溯补结
+            t1_open = float(t1_bar['open'])
+            t1_high = float(t1_bar['high'])
+            t1_low = float(t1_bar['low'])
+            t1_close = float(t1_bar['close'])
+
+            if t1_open >= target_p or t1_high >= target_p:
+                status = "CLOSED_PROFIT"
+                exit_price = max(t1_open, target_p)
+                reason = f"系统离线自动回溯补结: T+1日({t1_date})最高冲至{t1_high:.2f}元触发止盈"
+            elif t1_low <= stop_p:
+                status = "CLOSED_STOP"
+                exit_price = min(t1_open, stop_p)
+                reason = f"系统离线自动回溯补结: T+1日({t1_date})最低跌至{t1_low:.2f}元触发止损"
+            else:
+                status = "CLOSED_EOD"
+                exit_price = t1_close
+                reason = f"系统离线自动回溯补结: T+1日({t1_date})尾盘收盘平仓离场"
+
+            pos["status"] = status
+            pos["exit_date"] = t1_date
+            pos["exit_time"] = "15:00:00"
+            pos["exit_price"] = round(exit_price, 2)
+            pos["exit_reason"] = reason
+            pos["return_pct"] = round((exit_price - buy_p) / buy_p * 100.0, 2) if buy_p > 0 else 0.0
+            reconciled.append(pos)
+
+        if reconciled:
+            self._save()
+
+        return reconciled
+
     def check_morning_plan(self, quotes: Optional[Dict[str, Any]] = None, current_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """早盘 09:28 集合竞价汇总生成操盘作战计划"""
+        self.reconcile_and_clean_expired_positions(current_dt)
         now = current_dt or datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         t1_positions = [p for p in self.get_active_positions() if p.get("buy_date") < today_str]
@@ -599,6 +673,7 @@ class TailTradeTracker:
         """
         次日早盘及盘中实时研判：检查 2.30 战法昨日买入标的的卖出与平仓信号
         """
+        self.reconcile_and_clean_expired_positions(current_dt)
         now = current_dt or datetime.now()
         today_str = now.strftime("%Y-%m-%d")
         cur_hm = now.strftime("%H:%M")

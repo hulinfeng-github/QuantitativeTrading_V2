@@ -160,20 +160,72 @@ class ReviewEngineV2:
             if rec_p <= 0:
                 continue
 
-            q = data_engine.get_realtime_quotes([sym]).get(sym, {})
-            cur_p = float(q.get("price", rec_p))
-            ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
+            sig_date = str(s.get("date", ""))[:10]
+            trade_levels = s.get("trade_levels", {})
+            target_p = float(trade_levels.get("target_price") or (rec_p * 1.08))
+            stop_p = float(trade_levels.get("initial_stop") or (rec_p * 0.95))
 
-            is_win = ret_pct > 0
+            # 获取该标的历史K线，检查在信号发出后的预期波段周期(如5个交易日)内的因果表现
+            # 杜绝停机断档数周后直接拿当前点位盲目比对历史信号导致胜率失真
+            df = data_engine.get_daily_kline(sym, count=30)
+            cur_p = rec_p
+            ret_pct = 0.0
+            is_win = False
+
+            if df is not None and len(df) >= 2 and sig_date:
+                df['date_str'] = df['date'].astype(str).str[:10]
+                after_bars = df[df['date_str'] > sig_date]
+                if len(after_bars) > 0:
+                    # 检查预期波段持股窗口 (最多取未来 5 个交易日)
+                    window_bars = after_bars.iloc[:5]
+                    hit_target = False
+                    hit_stop = False
+                    for _, bar in window_bars.iterrows():
+                        b_high = float(bar['high'])
+                        b_low = float(bar['low'])
+                        if b_high >= target_p:
+                            hit_target = True
+                            cur_p = target_p
+                            break
+                        elif b_low <= stop_p:
+                            hit_stop = True
+                            cur_p = stop_p
+                            break
+
+                    if hit_target:
+                        ret_pct = round((target_p - rec_p) / rec_p * 100.0, 2)
+                        is_win = True
+                    elif hit_stop:
+                        ret_pct = round((stop_p - rec_p) / rec_p * 100.0, 2)
+                        is_win = False
+                    else:
+                        if len(after_bars) > 5:
+                            cur_p = float(window_bars.iloc[-1]['close'])
+                        else:
+                            q = data_engine.get_realtime_quotes([sym]).get(sym, {})
+                            cur_p = float(q.get("price", window_bars.iloc[-1]['close']))
+                        ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
+                        is_win = ret_pct > 0
+                else:
+                    q = data_engine.get_realtime_quotes([sym]).get(sym, {})
+                    cur_p = float(q.get("price", rec_p))
+                    ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
+                    is_win = ret_pct > 0
+            else:
+                q = data_engine.get_realtime_quotes([sym]).get(sym, {})
+                cur_p = float(q.get("price", rec_p))
+                ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
+                is_win = ret_pct > 0
+
             if is_win:
                 win_count += 1
 
             verified.append({
                 "symbol": sym,
                 "name": s.get("name", sym),
-                "date": s.get("date", ""),
+                "date": sig_date or s.get("date", ""),
                 "rec_price": rec_p,
-                "current_price": cur_p,
+                "current_price": round(cur_p, 2),
                 "return_pct": ret_pct,
                 "is_win": is_win
             })

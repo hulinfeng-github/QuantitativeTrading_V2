@@ -471,7 +471,8 @@ class LimitUpEngine:
     def review_and_update_trades(self, review_date: Optional[str] = None) -> Dict[str, Any]:
         """
         每日收盘复盘时自动调用：
-        自动核查所有待结算的打板交易，获取今日真实行情，结算次日开盘溢价、最高冲高与收盘盈亏，更新并维护表格！
+        自动核查所有待结算的打板交易，精准寻找交易日之后的首个真实 T+1 交易日K线进行结算，
+        彻底杜绝因停机、漏跑导致的胜率与高开溢价统计失真！
         """
         today_str = review_date or datetime.now().strftime("%Y-%m-%d")
         updated_count = 0
@@ -485,13 +486,24 @@ class LimitUpEngine:
                     if buy_price <= 0:
                         continue
 
-                    # 获取历史或实时日K
-                    df = data_engine.get_daily_kline(sym, count=10)
+                    # 获取历史或实时日K (足够覆盖多日停机跨度)
+                    df = data_engine.get_daily_kline(sym, count=40)
                     if df is not None and len(df) >= 2:
-                        today_bar = df.iloc[-1]
-                        next_open = float(today_bar['open'])
-                        next_high = float(today_bar['high'])
-                        next_close = float(today_bar['close'])
+                        df['date_str'] = df['date'].astype(str).str[:10]
+                        trade_date = str(t.get("date", ""))[:10]
+                        # 严格查找 trade_date 之后的交易日
+                        next_bars = df[df['date_str'] > trade_date]
+                        if len(next_bars) == 0:
+                            # 尚无次日K线 (例如周末打板或刚买入还未有下一交易日)
+                            continue
+
+                        # 精准锁定真实的 T+1 日，而非盲目取最新一根K线
+                        t1_bar = next_bars.iloc[0]
+                        t1_date = str(t1_bar['date_str'])
+
+                        next_open = float(t1_bar['open'])
+                        next_high = float(t1_bar['high'])
+                        next_close = float(t1_bar['close'])
 
                         open_pnl = round((next_open - buy_price) / buy_price * 100.0, 2)
                         high_pnl = round((next_high - buy_price) / buy_price * 100.0, 2)
@@ -510,6 +522,7 @@ class LimitUpEngine:
                         else:
                             status = "FLAT"
 
+                        t["settled_date"] = t1_date
                         t["next_open_price"] = next_open
                         t["next_open_pnl"] = open_pnl
                         t["next_high_price"] = next_high

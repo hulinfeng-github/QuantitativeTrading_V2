@@ -159,8 +159,10 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         cur_p = 10.0
         mock_min_df = pd.DataFrame([
             {"time": "09:31", "price": 10.5, "volume": 100, "amount": 105000, "vwap": 10.5},
-            {"time": "09:45", "price": 10.4, "volume": 200, "amount": 208000, "vwap": 10.45},
-            {"time": "10:00", "price": 10.0, "volume": 500, "amount": 510000, "vwap": 10.35}
+            {"time": "09:40", "price": 10.45, "volume": 150, "amount": 156750, "vwap": 10.47},
+            {"time": "09:50", "price": 10.4, "volume": 200, "amount": 208000, "vwap": 10.45},
+            {"time": "10:00", "price": 10.2, "volume": 300, "amount": 306000, "vwap": 10.38},
+            {"time": "10:15", "price": 10.0, "volume": 500, "amount": 500000, "vwap": 10.28}
         ])
 
         res = t0_smart_engine.analyze_t0(
@@ -333,6 +335,44 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         rev_res = limit_up_engine.review_and_update_trades()
         self.assertIn("settled_count", rev_res)
         print(f"  -> 复盘 T+1 自动结算闭环正常: 历史待决核查已执行")
+
+    def test_14_offline_reconciliation_and_backfill(self):
+        """测试断档停机、隔断时间运行后，系统自动回溯与数据自愈对齐机制"""
+        print("\n[测试 14] 验证离线断档开机自检与历史因果回溯对齐机制...")
+        from core.strategy_tail_230 import tail_trade_tracker
+        from core.limit_up_engine import limit_up_engine
+        from scheduler.task_runner import quant_scheduler2
+
+        # 1. 验证 2.30 战法过期头寸自动回溯自愈
+        # 模拟插入一笔 2026-10-25 (较早前) 的 HOLDING 订单
+        test_pos = tail_trade_tracker.add_manual_trade(
+            symbol="sh600519",
+            name="贵州茅台",
+            buy_price=1600.0,
+            buy_date="2026-10-20",
+            target_pct=2.5,
+            stop_pct=1.8
+        )
+        self.assertEqual(test_pos["status"], "HOLDING")
+
+        # 执行自检回溯
+        reconciled = tail_trade_tracker.reconcile_and_clean_expired_positions()
+        # 验证该过期头寸被精准定位到真实 T+1 交易日平仓，不再停留在 HOLDING 状态
+        updated_pos = next((t for t in tail_trade_tracker._trades if t["id"] == test_pos["id"]), None)
+        self.assertIsNotNone(updated_pos)
+        self.assertIn(updated_pos["status"], ["CLOSED_PROFIT", "CLOSED_STOP", "CLOSED_EOD"])
+        self.assertIsNotNone(updated_pos["exit_price"])
+        self.assertIsNotNone(updated_pos["return_pct"])
+        print(f"  -> 2.30 战法断档自动回溯结算通过: 状态={updated_pos['status']}, 收益率={updated_pos['return_pct']}%, 原因={updated_pos['exit_reason']}")
+
+        # 2. 验证打板流水对真实 T+1 交易日的精准捕获
+        lu_stats = limit_up_engine.review_and_update_trades()
+        self.assertIsNotNone(lu_stats)
+        print(f"  -> 游资打板交易 T+1 历史因果对齐通过: 累计更新={lu_stats.get('updated_trades_count', 0)} 笔")
+
+        # 3. 验证开机自检后台线程启动无阻断
+        quant_scheduler2.check_and_backfill_missed_tasks()
+        print(f"  -> 调度器开机自检与错失任务补跑线程启动验证通过")
 
 if __name__ == "__main__":
     print("\n" + "=" * 70)

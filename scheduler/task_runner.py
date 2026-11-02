@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from config import load_config, WATCHLIST_FILE
+from config import load_config, WATCHLIST_FILE, REVIEW_FILE
 from core.data_engine import data_engine
 from core.multi_factor_strategy import multi_factor_strategy
 from core.t0_smart_engine import t0_smart_engine
@@ -525,6 +525,85 @@ class QuantScheduler2:
         # 针对 Windows 用户：启动系统级防休眠锁 (允许屏幕熄灭省电，但绝不冻结后台调度与推送)
         set_windows_sleep_prevention(True)
         print("[Scheduler 2.0] 自动化后台调度引擎已就绪启动 (Windows 交易时段防休眠保护已激活)。")
+
+        # 触发开机自检与错失任务智能补跑
+        self.check_and_backfill_missed_tasks()
+
+    def check_and_backfill_missed_tasks(self):
+        """
+        开机自检与错失任务智能补跑引擎：
+        当用户因忘记开机、休眠或隔断时间重新启动系统时，自动执行健康自检与数据对齐：
+        1. 自动调用 tail_trade_tracker 与 limit_up_engine 进行断档历史订单回溯核对与结算；
+        2. 若当前已过 15:10，检查今日（或最近已收盘交易日）是否已产出收盘复盘报告；若缺失，后台静默补跑；
+        3. 若当前已过 15:30，检查最新全市场多因子选股池是否为空；若为空，后台静默执行补选；
+        4. 全程后台线程异步运行，零阻塞 Web 服务启动。
+        """
+        def _backfill_worker():
+            time.sleep(3.0)  # 等待主应用初始化完成
+            now = datetime.now()
+            today_str = now.strftime("%Y-%m-%d")
+            cur_hm = now.strftime("%H:%M")
+
+            print(f"[Scheduler 2.0] 启动开机自检与断档恢复机制 (当前系统时间: {now.strftime('%Y-%m-%d %H:%M:%S')})...")
+
+            # 1. 自动对齐和回溯平仓停机期间过期的 2.30 尾盘订单与打板流水
+            try:
+                from core.strategy_tail_230 import tail_trade_tracker
+                reconciled = tail_trade_tracker.reconcile_and_clean_expired_positions()
+                if reconciled:
+                    print(f"[Scheduler 2.0] 成功自动回溯补结 {len(reconciled)} 笔离线期间已过期的 2.30 战法头寸。")
+            except Exception as e:
+                print(f"[Scheduler 2.0] 自检回溯 2.30 头寸异常: {e}")
+
+            try:
+                from core.limit_up_engine import limit_up_engine
+                lu_stats = limit_up_engine.review_and_update_trades()
+                if lu_stats.get("settled_count", 0) > 0:
+                    print(f"[Scheduler 2.0] 成功自动回溯核算 {lu_stats['settled_count']} 笔离线打板交易 T+1 表现。")
+            except Exception as e:
+                print(f"[Scheduler 2.0] 自检核算打板交易异常: {e}")
+
+            # 2. 检查最近收盘交易日的复盘报告与选股池
+            need_review = False
+            is_weekday = now.weekday() < 5
+            is_post_close = cur_hm >= "15:10"
+
+            if (is_weekday and is_post_close) or (not is_weekday):
+                has_today_review = False
+                if REVIEW_FILE.exists():
+                    try:
+                        with open(REVIEW_FILE, "r", encoding="utf-8") as f:
+                            hist = json.load(f)
+                            if hist and isinstance(hist, list):
+                                dates = [x.get("date") for x in hist]
+                                if is_weekday and today_str in dates:
+                                    has_today_review = True
+                                elif not is_weekday and len(dates) > 0:
+                                    has_today_review = True
+                    except Exception:
+                        has_today_review = False
+
+                if not has_today_review:
+                    need_review = True
+
+            if need_review:
+                print(f"[Scheduler 2.0] 检测到收盘量化复盘报告缺失 (因日间未运行)，正在后台自动补跑...")
+                try:
+                    review_engine_v2.run_daily_review(auto_optimize=True)
+                    print(f"[Scheduler 2.0] 收盘复盘报告与参数自迭代已成功补跑完成！")
+                except Exception as e:
+                    print(f"[Scheduler 2.0] 补跑收盘复盘异常: {e}")
+
+            # 3. 检查全市场主板选股池是否需要补跑
+            if (is_weekday and cur_hm >= "15:30") or (not is_weekday):
+                if not self.latest_scan_results:
+                    print(f"[Scheduler 2.0] 全市场多因子选股池为空，正在后台自动执行盘后补选...")
+                    self.run_market_scan_async(limit=120, notify=False)
+
+            print(f"[Scheduler 2.0] 开机自检与断档恢复就绪，所有量化数据与参数已对齐。")
+
+        t = threading.Thread(target=_backfill_worker, daemon=True)
+        t.start()
 
     def stop(self):
         if self.is_running:

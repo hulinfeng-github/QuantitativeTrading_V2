@@ -169,7 +169,7 @@ class T0SmartEngine:
             stop_pct = round(stop_pct * 0.6, 2)
 
         # 1. 获取分时数据与计算 VWAP 及动态布林带
-        if df_minute is None or len(df_minute) < 5:
+        if df_minute is None:
             df_minute = data_engine.get_minute_data(symbol)
 
         vwap = current_price

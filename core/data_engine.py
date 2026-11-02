@@ -390,59 +390,114 @@ class DataEngine:
         """
         获取全A股主板股票清单（代码、名称）
         严格剔除：科创板(688)、创业板(300)、北交所、ST股
+        双通道容灾架构：新浪极速金融通道 + 东方财富云端通道 + 本地永续缓存防击穿
         """
         if not force_refresh and STOCK_LIST_CACHE.exists():
             try:
                 mtime = STOCK_LIST_CACHE.stat().st_mtime
                 if time.time() - mtime < 7 * 86400:
                     with open(STOCK_LIST_CACHE, "r", encoding="utf-8") as f:
-                        stocks = json.load(f)
-                        if len(stocks) > 1000:
-                            return stocks
+                        cached_stocks = json.load(f)
+                        if len(cached_stocks) > 500:
+                            return cached_stocks
             except Exception:
                 pass
 
         stocks = []
+        # 通道 1: 新浪行情中心 (极速、无防爬断连、夜间高可用)
         try:
+            sina_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
+                "Referer": "http://finance.sina.com.cn"
+            }
+            # 沪深A股共约 5000 只标的，每页 100 只，35 页即可全覆盖主板合规标的
             for p in range(1, 40):
-                url = (
-                    "https://push2.eastmoney.com/api/qt/clist/get"
-                    f"?pn={p}&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
-                    "&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-                    "&fields=f12,f14,f2,f3,f6"
-                )
-                resp = self.session.get(url, timeout=5)
-                if resp.status_code != 200:
-                    break
-                data = resp.json().get("data")
-                if not data or not data.get("diff"):
-                    break
-                diff = data["diff"]
-                for item in diff:
-                    code = str(item.get("f12", ""))
-                    name = str(item.get("f14", ""))
-                    if not self.is_main_board(code):
-                        continue
-                    if "ST" in name.upper() or "退" in name:
-                        continue
-                    symbol = self.format_symbol(code)
-                    stocks.append({
-                        "code": code,
-                        "name": name,
-                        "symbol": symbol,
-                        "price": item.get("f2", 0),
-                        "change_pct": item.get("f3", 0),
-                        "turnover": item.get("f6", 0)
-                    })
-                if len(diff) < 100:
-                    break
-        except Exception as e:
-            print(f"东方财富全市场拉取异常: {e}")
+                url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={p}&num=100&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page"
+                r = self.session.get(url, headers=sina_headers, timeout=4)
+                if r.status_code == 200:
+                    text = r.content.decode('gbk', errors='ignore')
+                    items = json.loads(text)
+                    if not items or len(items) == 0:
+                        break
+                    for it in items:
+                        code = str(it.get('code', '')).strip()
+                        name = str(it.get('name', '')).strip()
+                        if not self.is_main_board(code):
+                            continue
+                        if 'ST' in name.upper() or '退' in name:
+                            continue
+                        stocks.append({
+                            "code": code,
+                            "name": name,
+                            "symbol": self.format_symbol(code),
+                            "price": float(it.get('trade', 0.0) or 0.0),
+                            "change_pct": float(it.get('changepercent', 0.0) or 0.0),
+                            "turnover": float(it.get('amount', 0.0) or 0.0)
+                        })
+                    if len(items) < 100:
+                        break
+        except Exception:
+            pass
 
+        # 通道 2: 若新浪通道获取标的偏少，使用东财通道补充
         if len(stocks) < 500:
+            try:
+                em_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0",
+                    "Referer": "https://quote.eastmoney.com/"
+                }
+                for p in range(1, 40):
+                    url = (
+                        "https://push2.eastmoney.com/api/qt/clist/get"
+                        f"?pn={p}&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
+                        "&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
+                        "&fields=f12,f14,f2,f3,f6"
+                    )
+                    resp = self.session.get(url, headers=em_headers, timeout=4)
+                    if resp.status_code != 200:
+                        break
+                    data = resp.json().get("data")
+                    if not data or not data.get("diff"):
+                        break
+                    diff = data["diff"]
+                    for item in diff:
+                        code = str(item.get("f12", ""))
+                        name = str(item.get("f14", ""))
+                        if not self.is_main_board(code):
+                            continue
+                        if "ST" in name.upper() or "退" in name:
+                            continue
+                        symbol = self.format_symbol(code)
+                        stocks.append({
+                            "code": code,
+                            "name": name,
+                            "symbol": symbol,
+                            "price": item.get("f2", 0),
+                            "change_pct": item.get("f3", 0),
+                            "turnover": item.get("f6", 0)
+                        })
+                    if len(diff) < 100:
+                        break
+            except Exception:
+                pass
+
+        # 通道 3: 本地永续缓存防击穿保护
+        # 若因断网或接口异常未能拉取到足够标的，坚决禁止用 33 只种子覆写已有的上千只标的！
+        if len(stocks) < 500 and STOCK_LIST_CACHE.exists():
+            try:
+                with open(STOCK_LIST_CACHE, "r", encoding="utf-8") as f:
+                    cached_stocks = json.load(f)
+                    if len(cached_stocks) > len(stocks):
+                        stocks = cached_stocks
+            except Exception:
+                pass
+
+        # 通道 4: 极端无缓存冷启动兜底
+        if len(stocks) < 100:
             stocks = self._get_fallback_stock_list()
 
-        if stocks:
+        # 仅当获取到大于 500 只有效主板标的时才刷新写入本地磁盘缓存，防毒缓存污染
+        if len(stocks) >= 500:
             try:
                 with open(STOCK_LIST_CACHE, "w", encoding="utf-8") as f:
                     json.dump(stocks, f, ensure_ascii=False, indent=2)
