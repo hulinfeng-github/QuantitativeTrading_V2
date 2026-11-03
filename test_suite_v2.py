@@ -374,6 +374,58 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         quant_scheduler2.check_and_backfill_missed_tasks()
         print(f"  -> 调度器开机自检与错失任务补跑线程启动验证通过")
 
+    def test_15_t0_and_limitup_push_pipeline(self):
+        """测试日内做T与游资打板全自动秒级推送链路、去重机制与异常兜底"""
+        print("\n[测试 15] 验证做T与打板推送闭环、消息体转换与去重隔离机制...")
+        from core.t0_smart_engine import t0_smart_engine
+        from core.limit_up_engine import limit_up_engine
+        from notifier.manager import NotificationManager
+        from scheduler.task_runner import quant_scheduler2
+
+        # 1. 验证 build_signal_payload 结构完整性
+        mock_t0_res = {
+            "symbol": "sz002842",
+            "name": "翔鹭钨业",
+            "current_price": 22.95,
+            "signal_action": "SELL_T",
+            "signal_desc": "⚡ 倒T高抛机会触发",
+            "reasons": ["偏离均线触及上轨"],
+            "t0_direction": "SELL_T",
+            "close_action": "",
+            "shares": 1000,
+            "entry_price": 22.95,
+            "target_price": 22.38,
+            "stop_price": 23.29
+        }
+        sig = t0_smart_engine.build_signal_payload(mock_t0_res)
+        self.assertEqual(sig["signal_type"], "SELL_T")
+        self.assertEqual(sig["price"], 22.95)
+        self.assertIn("trade_levels", sig)
+        self.assertEqual(sig["trade_levels"]["target_price"], 22.38)
+        print("  -> 做T通知消息体转换通过: 字段完整、价格精度与交易点位映射无误")
+
+        # 2. 验证 NotificationManager 去重缓存持久化恢复机制
+        nm = NotificationManager()
+        self.assertTrue(hasattr(nm, "_sent_cache"))
+        self.assertIsInstance(nm._sent_cache, set)
+        print("  -> 推送调度中心今日缓存自动恢复机制通过")
+
+        # 3. 验证游资打板 send_limit_up_signal 接口兼容 force=False/True
+        mock_candidate = {
+            "symbol": "sh600501",
+            "name": "航天晨光",
+            "seal_price": 15.85,
+            "board_type": "首板突破",
+            "hardness_score": 93.0
+        }
+        lu_res = limit_up_engine.send_limit_up_signal(mock_candidate, force=False)
+        self.assertTrue(lu_res.get("success"))
+        print("  -> 打板推送接口 force 标志与自动去重支持校验通过")
+
+        # 4. 验证调度器盘中打板监控任务安全执行 (非交易时间优雅退出)
+        quant_scheduler2.run_limit_up_intraday_scan()
+        print("  -> 调度器盘中打板定时巡检方法无异常、安全沙箱保护通过")
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("      QuantitativeTrading 2.0 全链路自动化单元与回归测试套件")

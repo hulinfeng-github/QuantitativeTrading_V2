@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>A股智能量化投研与实战交易系统 2.0</title>
-  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/style.css?v=2.2.0">
   <!-- 引入 Apache ECharts 5 库 -->
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 </head>
@@ -19,6 +19,17 @@
       </div>
     </div>
     <div class="nav-status">
+      <!-- 主题皮肤快速切换 -->
+      <div class="theme-selector-box">
+        <label for="themeSelector" class="theme-label">🎨 皮肤:</label>
+        <select id="themeSelector" class="theme-select" onchange="changeTheme(this.value)">
+          <option value="aurora">🌌 深空极光</option>
+          <option value="obsidian">🌑 华尔街黑金</option>
+          <option value="cyber">🌊 赛博霓虹</option>
+          <option value="emerald">🌲 翡翠墨绿</option>
+          <option value="light">☀️ 机构白昼</option>
+        </select>
+      </div>
       <div class="sentiment-badge">
         <span class="pulse-dot"></span>
         <span id="macroRegimeText">大盘环境评估中...</span>
@@ -119,10 +130,13 @@
           <div>
             <div class="card-title">🎯 A股 T+1 底仓日内做T助手 (分时VWAP + 动态布林带)</div>
             <p style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">
-              顺应多头只做正T（负偏离低吸高抛），空头只做倒T；单日单向唯一锁定，冲高回落自动对冲止盈。
+              顺应多头只做正T（负偏离低吸高抛），空头只做倒T；单日单向唯一锁定，冲高回落自动对冲止盈。<strong style="color: var(--c-cyan);">💡 点击下方已添加的任意股票或 ETF，将自动跳转至单股深度诊断与专业 K 线展开全维分析。</strong>
             </p>
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="resetT0Today()">🔄 重置今日做T状态</button>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-primary btn-sm" onclick="showAddWatchlistModal()">+ 添加做T标的 (股票/ETF)</button>
+            <button class="btn btn-secondary btn-sm" onclick="resetT0Today()">🔄 重置今日做T状态</button>
+          </div>
         </div>
       </div>
       <div id="t0CardsContainer" class="screener-grid">
@@ -238,6 +252,35 @@
 
     <!-- 7. 策略与推送配置 -->
     <section id="pane-settings" class="tab-pane" style="display: none;">
+      <!-- 系统多主题皮肤切换 -->
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="card-header">
+          <div class="card-title">🎨 系统主题皮肤与金融终端视觉风格</div>
+        </div>
+        <div style="grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px;">
+          <div class="theme-card-option" onclick="changeTheme('aurora')">
+            <div style="font-weight: 700; color: #38bdf8; margin-bottom: 4px; font-size: 14px;">🌌 深空极光 (科技)</div>
+            <div style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">暗黑科技风 · 极光荧光蓝 · 默认夜间量化</div>
+          </div>
+          <div class="theme-card-option" onclick="changeTheme('obsidian')">
+            <div style="font-weight: 700; color: #fbbf24; margin-bottom: 4px; font-size: 14px;">🌑 华尔街黑金 (高奢)</div>
+            <div style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">高奢深黑底色 · 尊贵香槟金 · 极简对冲风</div>
+          </div>
+          <div class="theme-card-option" onclick="changeTheme('cyber')">
+            <div style="font-weight: 700; color: #d946ef; margin-bottom: 4px; font-size: 14px;">🌊 赛博霓虹 (炫彩)</div>
+            <div style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">炫彩赛博电音 · 紫粉荧光 · 高对比度视觉</div>
+          </div>
+          <div class="theme-card-option" onclick="changeTheme('emerald')">
+            <div style="font-weight: 700; color: #34d399; margin-bottom: 4px; font-size: 14px;">🌲 翡翠墨绿 (低疲劳)</div>
+            <div style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">雅致墨玉绿 · 舒缓低刺激 · 护眼长久盯盘</div>
+          </div>
+          <div class="theme-card-option" onclick="changeTheme('light')">
+            <div style="font-weight: 700; color: #0284c7; margin-bottom: 4px; font-size: 14px;">☀️ 机构白昼 (明亮)</div>
+            <div style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">明亮研报质感 · 商务报告风 · 白天采光友好</div>
+          </div>
+        </div>
+      </div>
+
       <div class="card">
         <div class="card-header">
           <div class="card-title">⚙️ 2.0 策略模型与风控参数设置</div>
@@ -618,8 +661,8 @@
         <button class="btn btn-secondary btn-sm" onclick="hideAddWatchlistModal()">✕</button>
       </div>
       <div class="form-group">
-        <label class="form-label">股票代码或名称 (仅支持沪深主板，如 600519 或 贵州茅台)</label>
-        <input id="addCode" class="form-input" placeholder="代码/名称">
+        <label class="form-label">股票/ETF代码或名称 (支持沪深主板股票与主流ETF，如 600519、510300、159915、贵州茅台、300ETF)</label>
+        <input id="addCode" class="form-input" placeholder="输入代码或名称 (如 601138, 510300, 茅台, 300ETF)...">
       </div>
       <div class="form-group">
         <label class="form-label">持仓买入成本 (元，若仅为观察自选可填 0)</label>
@@ -640,6 +683,6 @@
     </div>
   </div>
 
-  <script src="/static/js/app.js"></script>
+  <script src="/static/js/app.js?v=2.2.0"></script>
 </body>
 </html>

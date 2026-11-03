@@ -376,6 +376,35 @@ class T0SmartEngine:
             "shares": active_shares
         }
 
+    def build_signal_payload(self, t0_res: Dict[str, Any]) -> Dict[str, Any]:
+        """将日内做T研判结果转换为统一的通知卡片消息体"""
+        cur_p = float(t0_res.get("current_price", 0.0))
+        entry_p = float(t0_res.get("entry_price") or cur_p)
+        stop_p = float(t0_res.get("stop_price") or cur_p * 0.985)
+        target_p = float(t0_res.get("target_price") or cur_p * 1.015)
+        shares = int(t0_res.get("shares") or 100)
+        sym = str(t0_res.get("symbol", ""))
+
+        return {
+            "symbol": sym,
+            "name": t0_res.get("name", sym),
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "price": cur_p,
+            "signal_type": t0_res.get("signal_action", ""),
+            "signal_desc": t0_res.get("signal_desc", ""),
+            "score": 88,
+            "reasons": t0_res.get("reasons", []),
+            "t0_direction": t0_res.get("t0_direction", ""),
+            "close_action": t0_res.get("close_action", ""),
+            "holding_shares": shares,
+            "holding_cost": entry_p,
+            "trade_levels": {
+                "entry_price": entry_p,
+                "initial_stop": stop_p,
+                "target_price": target_p
+            }
+        }
+
     def check_eod_unclosed_positions(self) -> List[Dict[str, Any]]:
         """
         尾盘（14:45 - 14:55）核查未对冲做T持仓，发出强制平仓/对冲决策警报

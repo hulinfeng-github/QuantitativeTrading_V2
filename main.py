@@ -174,7 +174,15 @@ def run_web_server(port: int = None, host: str = None):
     print(f"👉 本地访问地址: http://{h}:{p}")
     print(f"👉 自动化调度后台已就绪，按 Ctrl+C 可停止运行\n")
 
-    uvicorn.run("web.app:app", host=h, port=p, reload=True, log_level="info")
+    uvicorn.run(
+        "web.app:app",
+        host=h,
+        port=p,
+        reload=True,
+        reload_dirs=["core", "web", "notifier", "scheduler"],
+        reload_excludes=["storage/*", "*.json", "*.csv", "*.log", ".venv/*"],
+        log_level="info"
+    )
 
 def main():
     parser = argparse.ArgumentParser(description="QuantitativeTrading 2.0 启动入口")

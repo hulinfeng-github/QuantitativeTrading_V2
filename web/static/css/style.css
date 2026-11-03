@@ -3,7 +3,7 @@
    设计规范：Glassmorphism (磨砂玻璃)、暗黑赛博荧光、ECharts 深度自适应、极速响应式布局
    ========================================================================== */
 
-:root {
+:root, [data-theme="aurora"] {
   --bg-base: #070a12;
   --bg-surface: #0e1526;
   --bg-card: rgba(16, 24, 43, 0.75);
@@ -32,6 +32,110 @@
   --radius-lg: 16px;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, Menlo, monospace;
+}
+
+/* 2. 华尔街黑金 (高奢极暗对冲基金风) */
+[data-theme="obsidian"] {
+  --bg-base: #06070a;
+  --bg-surface: #0c0e14;
+  --bg-card: rgba(16, 18, 26, 0.85);
+  --bg-card-hover: rgba(24, 28, 42, 0.95);
+  --border-subtle: rgba(251, 191, 36, 0.12);
+  --border-accent: rgba(251, 191, 36, 0.45);
+
+  --text-main: #fdfbf7;
+  --text-muted: #a3a3a3;
+  --text-dim: #737373;
+
+  --c-up: #ef4444;
+  --c-up-bg: rgba(239, 68, 68, 0.14);
+  --c-down: #10b981;
+  --c-down-bg: rgba(16, 185, 129, 0.14);
+
+  --c-cyan: #fbbf24;
+  --c-gold: #f59e0b;
+  --c-purple: #fcd34d;
+  --c-indigo: #d97706;
+
+  --shadow-card: 0 8px 32px 0 rgba(0, 0, 0, 0.65);
+}
+
+/* 3. 赛博霓虹 (炫彩未来电音风) */
+[data-theme="cyber"] {
+  --bg-base: #050716;
+  --bg-surface: #090e2a;
+  --bg-card: rgba(14, 19, 52, 0.82);
+  --bg-card-hover: rgba(24, 32, 84, 0.92);
+  --border-subtle: rgba(192, 132, 252, 0.18);
+  --border-accent: rgba(192, 132, 252, 0.55);
+
+  --text-main: #f8fafc;
+  --text-muted: #cbd5e1;
+  --text-dim: #818cf8;
+
+  --c-up: #ff3366;
+  --c-up-bg: rgba(255, 51, 102, 0.18);
+  --c-down: #00ffaa;
+  --c-down-bg: rgba(0, 255, 170, 0.18);
+
+  --c-cyan: #00f0ff;
+  --c-gold: #ffe600;
+  --c-purple: #d946ef;
+  --c-indigo: #818cf8;
+
+  --shadow-card: 0 8px 32px 0 rgba(192, 132, 252, 0.22);
+}
+
+/* 4. 翡翠墨绿 (护眼舒缓森林风) */
+[data-theme="emerald"] {
+  --bg-base: #030e0b;
+  --bg-surface: #061914;
+  --bg-card: rgba(8, 28, 23, 0.85);
+  --bg-card-hover: rgba(13, 44, 36, 0.95);
+  --border-subtle: rgba(52, 211, 153, 0.15);
+  --border-accent: rgba(52, 211, 153, 0.45);
+
+  --text-main: #ecfdf5;
+  --text-muted: #a7f3d0;
+  --text-dim: #6ee7b7;
+
+  --c-up: #f87171;
+  --c-up-bg: rgba(248, 113, 113, 0.15);
+  --c-down: #34d399;
+  --c-down-bg: rgba(52, 211, 153, 0.15);
+
+  --c-cyan: #2dd4bf;
+  --c-gold: #fde047;
+  --c-purple: #86efac;
+  --c-indigo: #059669;
+
+  --shadow-card: 0 8px 32px 0 rgba(3, 14, 11, 0.55);
+}
+
+/* 5. 机构白昼 (清新明亮研报风) */
+[data-theme="light"] {
+  --bg-base: #f8fafc;
+  --bg-surface: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f1f5f9;
+  --border-subtle: #e2e8f0;
+  --border-accent: rgba(2, 132, 199, 0.4);
+
+  --text-main: #0f172a;
+  --text-muted: #475569;
+  --text-dim: #64748b;
+
+  --c-up: #dc2626;
+  --c-up-bg: rgba(220, 38, 38, 0.08);
+  --c-down: #16a34a;
+  --c-down-bg: rgba(22, 163, 74, 0.08);
+
+  --c-cyan: #0284c7;
+  --c-gold: #d97706;
+  --c-purple: #7c3aed;
+  --c-indigo: #4338ca;
+
+  --shadow-card: 0 4px 20px 0 rgba(0, 0, 0, 0.05);
 }
 
 * {
@@ -597,4 +701,171 @@ body {
   border-radius: 4px;
   margin: 2px 4px 2px 0;
 }
+
+/* ==========================================================================
+   主题皮肤选择器与明亮模式深度适配
+   ========================================================================== */
+.theme-selector-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 4px 10px;
+  border-radius: 20px;
+  border: 1px solid var(--border-subtle);
+  transition: all 0.25s ease;
+}
+
+.theme-selector-box:hover {
+  border-color: var(--border-accent);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.theme-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.theme-select {
+  background: transparent;
+  color: var(--text-main);
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  outline: none;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.theme-select option {
+  background: #111827;
+  color: #f1f5f9;
+}
+
+/* 设置面板中的皮肤选择卡片 */
+.theme-card-option {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 14px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.theme-card-option:hover {
+  border-color: var(--border-accent);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.theme-card-option.active-theme {
+  border-color: var(--c-cyan);
+  background: rgba(56, 189, 248, 0.08);
+  box-shadow: 0 0 0 1px var(--c-cyan);
+}
+
+/* 针对浅色明亮模式 (Light Mode) 的深度适配 */
+[data-theme="light"] body {
+  background-image: 
+    radial-gradient(circle at 15% 15%, rgba(2, 132, 199, 0.06) 0%, transparent 40%),
+    radial-gradient(circle at 85% 85%, rgba(99, 102, 241, 0.05) 0%, transparent 40%);
+}
+
+[data-theme="light"] .navbar {
+  background: rgba(255, 255, 255, 0.92);
+  border-bottom: 1px solid #e2e8f0;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+}
+
+[data-theme="light"] .brand-text h1 {
+  background: linear-gradient(to right, #0f172a, #334155);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+[data-theme="light"] .card {
+  background: #ffffff;
+  border-color: #e2e8f0;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.04);
+}
+
+[data-theme="light"] .macro-card {
+  background: #ffffff;
+  border-color: #e2e8f0;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+}
+
+[data-theme="light"] .stock-card {
+  background: #ffffff;
+  border-color: #e2e8f0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03);
+}
+
+[data-theme="light"] .stock-card:hover {
+  background: #f8fafc;
+  border-color: var(--c-cyan);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+}
+
+[data-theme="light"] .form-input {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+  color: #0f172a;
+}
+
+[data-theme="light"] .form-input:focus {
+  background: #ffffff;
+  border-color: #0284c7;
+}
+
+[data-theme="light"] .data-table th {
+  background: #f1f5f9;
+  color: #475569;
+  border-color: #e2e8f0;
+}
+
+[data-theme="light"] .data-table td {
+  border-color: #f1f5f9;
+  color: #1e293b;
+}
+
+[data-theme="light"] .data-table tr:hover {
+  background: #f8fafc;
+}
+
+[data-theme="light"] .tab-btn:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: #0f172a;
+}
+
+[data-theme="light"] .tab-btn.active {
+  color: #0284c7;
+  background: rgba(2, 132, 199, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(2, 132, 199, 0.25);
+}
+
+[data-theme="light"] .chart-container {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+[data-theme="light"] .fin-dupont-box,
+[data-theme="light"] .fin-report-card,
+[data-theme="light"] .fin-mini-strip {
+  background: #f8fafc;
+  border-color: #e2e8f0;
+}
+
+[data-theme="light"] .theme-select option {
+  background: #ffffff;
+  color: #0f172a;
+}
+
 

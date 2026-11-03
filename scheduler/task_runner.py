@@ -93,105 +93,90 @@ class QuantScheduler2:
         quotes = data_engine.get_realtime_quotes(all_symbols)
 
         for item in watchlist:
-            sym = item.get('symbol')
-            name = item.get('name', sym)
-            cost = float(item.get('holding_cost') or item.get('entry_price') or 0.0)
-            shares = int(item.get('holding_shares') or item.get('shares') or 100)
+            try:
+                sym = item.get('symbol')
+                name = item.get('name', sym)
+                cost = float(item.get('holding_cost') or item.get('entry_price') or 0.0)
+                shares = int(item.get('holding_shares') or item.get('shares') or 100)
 
-            q = quotes.get(sym)
-            if not q:
-                continue
+                q = quotes.get(sym)
+                if not q:
+                    continue
 
-            cur_p = q.get('price', 0.0)
-            if cur_p <= 0:
-                continue
+                cur_p = q.get('price', 0.0)
+                if cur_p <= 0:
+                    continue
 
-            # 1. 检查真实持仓强制平仓/硬止损风控
-            pnl_pct = round((cur_p - cost) / cost * 100.0, 2) if cost > 0 else 0.0
-            pnl_amt = round((cur_p - cost) * shares, 2) if cost > 0 else 0.0
+                # 1. 检查真实持仓强制平仓/硬止损风控
+                pnl_pct = round((cur_p - cost) / cost * 100.0, 2) if cost > 0 else 0.0
+                pnl_amt = round((cur_p - cost) * shares, 2) if cost > 0 else 0.0
 
-            df_kline = data_engine.get_daily_kline(sym, count=120)
-            analysis_res = None
-            if df_kline is not None and len(df_kline) >= 30:
-                analysis_res = multi_factor_strategy.analyze(sym, name, df_kline)
+                df_kline = data_engine.get_daily_kline(sym, count=120)
+                analysis_res = None
+                if df_kline is not None and len(df_kline) >= 30:
+                    analysis_res = multi_factor_strategy.analyze(sym, name, df_kline)
 
-            # 持仓硬止损检查 (如果存在真实持仓)
-            if cost > 0 and shares > 0:
-                cfg = load_config()
-                hard_stop = cfg.get("hard_stop_loss_pct", 8.0)
-                control_st = analysis_res.get("control_status", "") if analysis_res else ""
+                # 持仓硬止损检查 (如果存在真实持仓)
+                if cost > 0 and shares > 0:
+                    cfg = load_config()
+                    hard_stop = cfg.get("hard_stop_loss_pct", 8.0)
+                    control_st = analysis_res.get("control_status", "") if analysis_res else ""
 
-                # 触发条件: 浮亏超过硬止损线 (如 -8%)，或主力破位杀跌且严重亏损
-                if pnl_pct <= -hard_stop or (control_st == "主力破位杀跌" and pnl_pct <= -5.0):
-                    force_signal = {
-                        "symbol": sym,
-                        "name": name,
-                        "date": datetime.now().strftime("%Y-%m-%d"),
-                        "price": cur_p,
-                        "signal_type": "FORCE_EXIT",
-                        "signal_desc": "🚨 强制平仓/硬止损离场警报",
-                        "score": analysis_res.get("score", 0) if analysis_res else 0,
-                        "holding_cost": cost,
-                        "holding_shares": shares,
-                        "pnl_pct": pnl_pct,
-                        "pnl_amt": pnl_amt,
-                        "control_status": control_st or "严重破位",
-                        "main_cost": analysis_res.get("main_cost", cost) if analysis_res else cost,
-                        "rsrs_norm": analysis_res.get("rsrs_norm", -1.0) if analysis_res else -1.0,
-                        "reasons": [
-                            f"持仓浮亏达 {pnl_pct:+.2f}% (亏损 {abs(pnl_amt):.2f} 元)，已触及 -{hard_stop}% 账户硬止损保护线",
-                            f"现价({cur_p}元)较买入成本({cost}元)大幅下挫，技术面处于[{control_st}]",
-                            "严禁死扛或盲目补仓，必须严格执行量化纪律，建议立即挂单卖出平仓止损避险！"
-                        ],
-                        "trade_levels": {
-                            "entry_price": cur_p,
-                            "suggested_sell_price": cur_p,
-                            "initial_stop": round(cost * (1.0 - hard_stop / 100.0), 2)
+                    # 触发条件: 浮亏超过硬止损线 (如 -8%)，或主力破位杀跌且严重亏损
+                    if pnl_pct <= -hard_stop or (control_st == "主力破位杀跌" and pnl_pct <= -5.0):
+                        force_signal = {
+                            "symbol": sym,
+                            "name": name,
+                            "date": datetime.now().strftime("%Y-%m-%d"),
+                            "price": cur_p,
+                            "signal_type": "FORCE_EXIT",
+                            "signal_desc": "🚨 强制平仓/硬止损离场警报",
+                            "score": analysis_res.get("score", 0) if analysis_res else 0,
+                            "holding_cost": cost,
+                            "holding_shares": shares,
+                            "pnl_pct": pnl_pct,
+                            "pnl_amt": pnl_amt,
+                            "control_status": control_st or "严重破位",
+                            "main_cost": analysis_res.get("main_cost", cost) if analysis_res else cost,
+                            "rsrs_norm": analysis_res.get("rsrs_norm", -1.0) if analysis_res else -1.0,
+                            "reasons": [
+                                f"持仓浮亏达 {pnl_pct:+.2f}% (亏损 {abs(pnl_amt):.2f} 元)，已触及 -{hard_stop}% 账户硬止损保护线",
+                                f"现价({cur_p}元)较买入成本({cost}元)大幅下挫，技术面处于[{control_st}]",
+                                "严禁死扛或盲目补仓，必须严格执行量化纪律，建议立即挂单卖出平仓止损避险！"
+                            ],
+                            "trade_levels": {
+                                "entry_price": cur_p,
+                                "suggested_sell_price": cur_p,
+                                "initial_stop": round(cost * (1.0 - hard_stop / 100.0), 2)
+                            }
                         }
-                    }
-                    notification_manager.send_signal(force_signal)
+                        notification_manager.send_signal(force_signal)
 
-            # 2. 检查波段策略多因子信号
-            if analysis_res:
-                sig_type = analysis_res.get("signal_type")
-                if sig_type in ["BUY", "SELL"]:
-                    if sig_type == "SELL" and cost > 0:
-                        analysis_res["holding_cost"] = cost
-                        analysis_res["holding_shares"] = shares
-                        analysis_res["pnl_pct"] = pnl_pct
-                    notification_manager.send_signal(analysis_res)
+                # 2. 检查波段策略多因子信号
+                if analysis_res:
+                    sig_type = analysis_res.get("signal_type")
+                    if sig_type in ["BUY", "SELL"]:
+                        if sig_type == "SELL" and cost > 0:
+                            analysis_res["holding_cost"] = cost
+                            analysis_res["holding_shares"] = shares
+                            analysis_res["pnl_pct"] = pnl_pct
+                        notification_manager.send_signal(analysis_res)
 
-            # 3. 检查日内做T机会
-            t0_res = t0_smart_engine.analyze_t0(
-                symbol=sym,
-                name=name,
-                current_price=cur_p,
-                daily_kline=df_kline,
-                holding_cost=cost,
-                holding_shares=shares
-            )
-            act = t0_res.get("signal_action")
-            if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
-                sig_payload = {
-                    "symbol": sym,
-                    "name": name,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                    "price": cur_p,
-                    "signal_type": act,
-                    "signal_desc": t0_res.get("signal_desc", ""),
-                    "score": 88,
-                    "reasons": t0_res.get("reasons", []),
-                    "t0_direction": t0_res.get("t0_direction", ""),
-                    "close_action": t0_res.get("close_action", ""),
-                    "holding_shares": t0_res.get("shares", shares),
-                    "holding_cost": t0_res.get("entry_price", cur_p),
-                    "trade_levels": {
-                        "entry_price": t0_res.get("entry_price", cur_p),
-                        "initial_stop": t0_res.get("stop_price", cur_p * 0.985),
-                        "target_price": t0_res.get("target_price", cur_p * 1.015)
-                    }
-                }
-                notification_manager.send_signal(sig_payload)
+                # 3. 检查日内做T机会
+                t0_res = t0_smart_engine.analyze_t0(
+                    symbol=sym,
+                    name=name,
+                    current_price=cur_p,
+                    daily_kline=df_kline,
+                    holding_cost=cost,
+                    holding_shares=shares
+                )
+                act = t0_res.get("signal_action")
+                if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
+                    sig_payload = t0_smart_engine.build_signal_payload(t0_res)
+                    notification_manager.send_signal(sig_payload)
+            except Exception as e:
+                print(f"[Scheduler 2.0] 巡检个股 {item.get('symbol', '')} 异常: {e}")
 
         # 4. 尾盘时段 (14:45-14:55) 自动检查未闭环做T头寸，发出强制平仓/对冲决策
         cur_hm = datetime.now().strftime("%H:%M")
@@ -432,6 +417,48 @@ class QuantScheduler2:
         for sig in signals:
             notification_manager.send_signal(sig)
 
+    def run_limit_up_intraday_scan(self):
+        """盘中游资打板量化扫描与精选个股通知推送 (自动记录实战跟踪账本并发送保姆级新手操盘卡片)"""
+        if not self.is_trading_time():
+            return
+
+        cfg = load_config()
+        if not cfg.get("limit_up_auto_notify_enabled", True):
+            return
+
+        min_score = float(cfg.get("limit_up_min_hardness", 80.0))
+        top_n = int(cfg.get("limit_up_auto_track_top_n", 2))
+
+        try:
+            from core.limit_up_engine import limit_up_engine
+            candidates = limit_up_engine.scan_today_candidates(limit=15)
+            if not candidates:
+                return
+
+            qualified = [c for c in candidates if float(c.get("hardness_score", 0)) >= min_score][:top_n]
+            if not qualified:
+                return
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发盘中游资打板量化监控，精选出 {len(qualified)} 只优质涨停突破标的...")
+
+            # 自动录入打板流水账本
+            try:
+                limit_up_engine.record_board_hitting_trades(qualified, top_n=top_n)
+            except Exception as e:
+                print(f"[LimitUp] 自动记账异常: {e}")
+
+            # 发送保姆级打板卡片 (force=False 保证单日单股仅推送一次)
+            pushed_count = 0
+            for c in qualified:
+                res = limit_up_engine.send_limit_up_signal(c, force=False)
+                if res.get("res", {}).get("dingtalk") or res.get("res", {}).get("wechat"):
+                    pushed_count += 1
+
+            if pushed_count > 0:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 成功向推送通道发送 {pushed_count} 条打板量化操盘卡片。")
+        except Exception as e:
+            print(f"[Scheduler 2.0] 盘中打板监控异常: {e}")
+
     def run_post_market_review(self):
         """执行盘后 15:10 全景复盘与参数自进化（完整富文本推送到钉钉/微信，免网页端）"""
         now = datetime.now()
@@ -481,7 +508,17 @@ class QuantScheduler2:
             replace_existing=True
         )
 
-        # 3. 尾盘 14:48 做T未对冲强制平仓与底仓抉择检查
+        # 4. 盘中游资打板扫描与精选通知 (默认每 10 分钟自动扫描全市场主板涨停板并推送)
+        lu_interval = cfg.get("limit_up_scan_interval_minutes", 10)
+        self.scheduler.add_job(
+            self.run_limit_up_intraday_scan,
+            "interval",
+            minutes=lu_interval,
+            id="limit_up_intraday_scan",
+            replace_existing=True
+        )
+
+        # 5. 尾盘 14:48 做T未对冲强制平仓与底仓抉择检查
         self.scheduler.add_job(
             self.run_eod_t0_check,
             "cron",

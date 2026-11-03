@@ -49,6 +49,10 @@
   "scan_interval_minutes": 5,
   "market_review_time": "15:10",
   "market_close_scan_time": "15:30",
+  "limit_up_auto_notify_enabled": true,
+  "limit_up_scan_interval_minutes": 10,
+  "limit_up_min_hardness": 80.0,
+  "limit_up_auto_track_top_n": 2,
   "web_port": 8089,
   "web_host": "127.0.0.1"
 }

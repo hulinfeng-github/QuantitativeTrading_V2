@@ -13,6 +13,24 @@ from notifier.wechat import WeChatNotifier
 class NotificationManager:
     def __init__(self):
         self._sent_cache = set()
+        self._load_sent_cache()
+
+    def _load_sent_cache(self):
+        """系统启动或重载时从 signals_history.json 预加载今日已发推送去重缓存，防止服务重启后重复刷屏"""
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if SIGNALS_FILE.exists():
+                with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+                    if isinstance(history, list):
+                        for sig in history:
+                            if isinstance(sig, dict) and sig.get("date") == today:
+                                sym = sig.get("symbol", "")
+                                st = sig.get("signal_type", "")
+                                if sym and st:
+                                    self._sent_cache.add(f"{sym}_{st}_{today}")
+        except Exception:
+            pass
 
     def send_signal(self, signal: Dict[str, Any], force: bool = False) -> Dict[str, bool]:
         symbol = signal.get("symbol", "")

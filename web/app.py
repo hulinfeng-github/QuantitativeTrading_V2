@@ -29,6 +29,16 @@ from scheduler.task_runner import quant_scheduler2
 
 app = FastAPI(title="A-Share Smart Quant System 2.0", version="2.0.0")
 
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static") or path == "/" or path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -250,6 +260,12 @@ def get_t0_monitor():
         t0_res["change_pct"] = q.get('change_pct', 0.0)
         results.append(t0_res)
 
+        # 实时自动同步推送做T开仓/平仓/止损指令 (去重机制由 notification_manager 兜底，绝不重复刷屏)
+        act = t0_res.get("signal_action")
+        if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
+            sig_payload = t0_smart_engine.build_signal_payload(t0_res)
+            notification_manager.send_signal(sig_payload)
+
     return results
 
 @app.post("/api/t0/reset")
@@ -327,13 +343,13 @@ def get_stock_kline(symbol: str, count: int = 150):
             "high": float(r['high']),
             "low": float(r['low']),
             "volume": float(r['volume']),
-            "ma5": round(float(r['ma5']), 2) if not np.isnan(r['ma5']) else None,
-            "ma20": round(float(r['ma20']), 2) if not np.isnan(r['ma20']) else None,
-            "ma60": round(float(r['ma60']), 2) if not np.isnan(r['ma60']) else None,
-            "dif": round(float(r['dif']), 3) if not np.isnan(r['dif']) else 0.0,
-            "dea": round(float(r['dea']), 3) if not np.isnan(r['dea']) else 0.0,
-            "macd_bar": round(float(r['macd_bar']), 3) if not np.isnan(r['macd_bar']) else 0.0,
-            "rsrs_norm": round(float(r['rsrs_norm']), 3) if not np.isnan(r['rsrs_norm']) else 0.0
+            "ma5": round(float(r['ma5']), 2) if 'ma5' in r and not np.isnan(r['ma5']) else None,
+            "ma20": round(float(r['ma20']), 2) if 'ma20' in r and not np.isnan(r['ma20']) else None,
+            "ma60": round(float(r['ma60']), 2) if 'ma60' in r and not np.isnan(r['ma60']) else None,
+            "dif": round(float(r['dif']), 3) if 'dif' in r and not np.isnan(r['dif']) else 0.0,
+            "dea": round(float(r['dea']), 3) if 'dea' in r and not np.isnan(r['dea']) else 0.0,
+            "macd_bar": round(float(r['macd_bar']), 3) if 'macd_bar' in r and not np.isnan(r['macd_bar']) else 0.0,
+            "rsrs_norm": round(float(r['rsrs_norm']), 3) if 'rsrs_norm' in r and not np.isnan(r['rsrs_norm']) else 0.0
         })
 
     return {

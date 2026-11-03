@@ -6,9 +6,11 @@
 let klineChartInstance = null;
 let t0ChartInstance = null;
 let backtestChartInstance = null;
+let lastDiagnosedSymbol = "";
 
 // 初始化入口
 document.addEventListener("DOMContentLoaded", () => {
+  initTheme();
   initTabs();
   loadStatusAndSentiment();
   loadScreenerResults();
@@ -27,29 +29,87 @@ document.addEventListener("DOMContentLoaded", () => {
   }, 15000);
 });
 
-// 标签切换
+// 主题皮肤管理系统 (深空极光 / 华尔街黑金 / 赛博霓虹 / 翡翠墨绿 / 机构白昼)
+function initTheme() {
+  const savedTheme = localStorage.getItem("qt_theme") || "aurora";
+  applyTheme(savedTheme);
+}
+
+function changeTheme(themeName) {
+  applyTheme(themeName);
+  localStorage.setItem("qt_theme", themeName);
+}
+
+function applyTheme(themeName) {
+  document.documentElement.setAttribute("data-theme", themeName);
+  document.body.setAttribute("data-theme", themeName);
+
+  // 同步所有皮肤选择下拉菜单
+  const selectors = document.querySelectorAll("#themeSelector, #settingsThemeSelector");
+  selectors.forEach(sel => { if (sel) sel.value = themeName; });
+
+  // 同步设置面板的高亮状态
+  document.querySelectorAll(".theme-card-option").forEach(card => {
+    if (card.getAttribute("onclick") && card.getAttribute("onclick").includes(`'${themeName}'`)) {
+      card.classList.add("active-theme");
+    } else {
+      card.classList.remove("active-theme");
+    }
+  });
+
+  // 如果已有K线图，重新载入以适配主题坐标轴与背景色
+  if (klineChartInstance && lastDiagnosedSymbol) {
+    loadKlineChart(lastDiagnosedSymbol);
+  } else if (klineChartInstance) {
+    klineChartInstance.resize();
+  }
+}
+window.changeTheme = changeTheme;
+window.applyTheme = applyTheme;
+
+// 显式标签切换控制函数
+function switchTab(targetTab) {
+  if (!targetTab) return;
+  const tabBtns = document.querySelectorAll(".tab-btn");
+  tabBtns.forEach(btn => {
+    if (btn.dataset.tab === targetTab) {
+      btn.classList.add("active");
+    } else {
+      btn.classList.remove("active");
+    }
+  });
+
+  document.querySelectorAll(".tab-pane").forEach(pane => {
+    pane.style.display = "none";
+  });
+
+  const activePane = document.getElementById(`pane-${targetTab}`);
+  if (activePane) {
+    activePane.style.display = "block";
+  }
+
+  // 切换到对应面板时加载数据
+  if (targetTab === "tail230") loadTail230Data();
+  if (targetTab === "limitup") loadLimitUpData();
+  if (targetTab === "t0") loadT0Monitor();
+  if (targetTab === "watchlist") loadWatchlist();
+
+  // 切换到带图表的面板时自适应尺寸
+  if (targetTab === "diagnose" && klineChartInstance) {
+    setTimeout(() => { if (klineChartInstance) klineChartInstance.resize(); }, 60);
+  }
+  if (targetTab === "backtest" && backtestChartInstance) {
+    setTimeout(() => { if (backtestChartInstance) backtestChartInstance.resize(); }, 60);
+  }
+}
+window.switchTab = switchTab;
+
+// 标签导航初始化
 function initTabs() {
   const tabBtns = document.querySelectorAll(".tab-btn");
   tabBtns.forEach(btn => {
     btn.addEventListener("click", () => {
-      tabBtns.forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-
-      const targetTab = btn.dataset.tab;
-      document.querySelectorAll(".tab-pane").forEach(pane => {
-        pane.style.display = "none";
-      });
-
-      const activePane = document.getElementById(`pane-${targetTab}`);
-      if (activePane) activePane.style.display = "block";
-
-      // 切换到 2.30 战法或打板面板时加载数据
-      if (targetTab === "tail230") loadTail230Data();
-      if (targetTab === "limitup") loadLimitUpData();
-
-      // 切换到带图表的面板时自适应尺寸
-      if (targetTab === "diagnose" && klineChartInstance) klineChartInstance.resize();
-      if (targetTab === "backtest" && backtestChartInstance) backtestChartInstance.resize();
+      switchTab(btn.dataset.tab);
     });
   });
 }
@@ -292,7 +352,10 @@ async function deleteWatchlist(symbol) {
   if (!confirm(`确定将 ${symbol} 移出自选监控池吗？`)) return;
   try {
     const res = await fetch(`/api/watchlist/${symbol}`, { method: "DELETE" });
-    if (res.ok) loadWatchlist();
+    if (res.ok) {
+      loadWatchlist();
+      loadT0Monitor();
+    }
   } catch (e) {
     alert("删除失败: " + e);
   }
@@ -324,6 +387,7 @@ async function submitAddWatchlist() {
     if (res.ok) {
       hideAddWatchlistModal();
       loadWatchlist();
+      loadT0Monitor();
     } else {
       alert("添加失败: " + (data.detail || "未知错误"));
     }
@@ -341,12 +405,18 @@ async function loadT0Monitor() {
     const container = document.getElementById("t0CardsContainer");
 
     if (!items || items.length === 0) {
-      container.innerHTML = `<div style="grid-column: 1 / -1; text-align: center; color: var(--text-dim); padding: 40px;">暂无持仓股票做T监控数据，请先在自选池中添加标的</div>`;
+      container.innerHTML = `
+        <div style="grid-column: 1 / -1; text-align: center; color: var(--text-dim); padding: 50px 20px; background: rgba(0,0,0,0.15); border: 1px dashed var(--border-subtle); border-radius: var(--radius-md);">
+          <div style="font-size: 28px; margin-bottom: 10px;">🎯</div>
+          <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px;">暂无持仓股票或 ETF 做T监控数据，请先添加自选/底仓标的</p>
+          <button class="btn btn-primary btn-sm" onclick="showAddWatchlistModal()">+ 立即添加股票 / ETF 标的</button>
+        </div>`;
       return;
     }
 
     let html = "";
     items.forEach(t => {
+      const sym = t.symbol || t.code || "";
       const pos = t.position || {};
       const hasOpenPos = pos.status === "OPEN";
       const isBuyT = t.signal_action === "BUY_T";
@@ -358,39 +428,62 @@ async function loadT0Monitor() {
                     `<span class="pill pill-cyan">通道内震荡</span>`;
 
       html += `
-        <div class="stock-card" style="border-left: 4px solid ${isBuyT ? 'var(--c-up)' : isSellT ? 'var(--c-down)' : 'var(--border-subtle)'};">
+        <div class="stock-card" data-symbol="${sym}" onclick="openStockDiagnose('${sym}')" title="点击直接跳转单股深度诊断与专业K线分析" style="border-left: 4px solid ${isBuyT ? 'var(--c-up)' : isSellT ? 'var(--c-down)' : 'var(--border-subtle)'}; cursor: pointer;">
           <div class="stock-header">
             <div>
-              <h3 style="font-size: 15px;">${t.name} (${t.symbol}) ${badge}</h3>
-              <span style="font-size: 11px; color: var(--text-dim);">趋势通道: ${t.trend_direction === 'BULL' ? '顺势多头' : '空头破位'}</span>
+              <h3 style="font-size: 15px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                <span class="stock-name-link" style="color: var(--text-main); font-weight: 700; text-decoration: underline; text-decoration-color: var(--c-cyan); text-underline-offset: 4px;">${t.name}</span>
+                <span style="font-size: 12px; color: var(--text-dim); font-weight: normal;">(${sym})</span>
+                ${badge}
+              </h3>
+              <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px;">
+                <span style="font-size: 11px; color: var(--text-dim);">趋势通道: ${t.trend_direction === 'BULL' ? '顺势多头' : '空头破位'}</span>
+                <span style="font-size: 11px; color: var(--c-cyan); font-weight: 600;">🔍 点击进入深度诊断</span>
+              </div>
             </div>
-            <span style="font-size: 16px; font-weight: 700; font-family: var(--font-mono);">${t.current_price.toFixed(2)}</span>
+            <div style="text-align: right;">
+              <span style="font-size: 16px; font-weight: 700; font-family: var(--font-mono);">${(t.current_price || 0).toFixed(2)}</span>
+              <div style="font-size: 11px;" class="${(t.change_pct || 0) >= 0 ? 'text-up' : 'text-down'}">${(t.change_pct || 0) >= 0 ? '+' : ''}${(t.change_pct || 0).toFixed(2)}%</div>
+            </div>
           </div>
 
           <div class="stock-metric-row">
             <div class="metric-item">
               <div class="metric-label">分时均价 VWAP</div>
-              <div class="metric-value">${t.vwap.toFixed(2)}</div>
+              <div class="metric-value">${(t.vwap || 0).toFixed(2)}</div>
             </div>
             <div class="metric-item">
               <div class="metric-label">分时偏离度</div>
-              <div class="metric-value ${t.bias_pct > 0 ? 'text-up' : 'text-down'}">${t.bias_pct > 0 ? '+' : ''}${t.bias_pct}%</div>
+              <div class="metric-value ${(t.bias_pct || 0) > 0 ? 'text-up' : 'text-down'}">${(t.bias_pct || 0) > 0 ? '+' : ''}${t.bias_pct || 0}%</div>
             </div>
             <div class="metric-item">
               <div class="metric-label">动态布林下/上轨</div>
-              <div class="metric-value" style="font-size: 11px;">${t.dyn_lower} / ${t.dyn_upper}</div>
+              <div class="metric-value" style="font-size: 11px;">${t.dyn_lower || '-'} / ${t.dyn_upper || '-'}</div>
             </div>
           </div>
 
           <div style="font-size: 12px; margin-bottom: 8px;">
-            <strong>研判指导:</strong> <span class="text-cyan">${t.signal_desc}</span>
+            <strong>研判指导:</strong> <span class="text-cyan">${t.signal_desc || '-'}</span>
           </div>
 
-          ${t.reasons && t.reasons.length ? `<p style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">${t.reasons.join("；")}</p>` : ''}
+          ${t.reasons && t.reasons.length ? `<p style="font-size: 11px; color: var(--text-muted); line-height: 1.5; margin-bottom: 8px;">${t.reasons.join("；")}</p>` : ''}
+
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border-subtle);">
+            <span style="font-size: 11px; color: var(--text-dim);">底仓: ${(t.holding_cost || 0) > 0 ? t.holding_cost.toFixed(2) + '元' : '观察中'} · ${(t.holding_shares || 0) > 0 ? t.holding_shares + '股' : '未持股'}</span>
+            <button type="button" class="btn btn-primary btn-xs" style="padding: 4px 12px; font-size: 11px;" onclick="event.stopPropagation(); openStockDiagnose('${sym}')">🔍 深度量化诊断与专业K线 →</button>
+          </div>
         </div>
       `;
     });
     container.innerHTML = html;
+
+    // 双重绑定原生点击事件，杜绝浏览器限制
+    container.querySelectorAll(".stock-card").forEach(card => {
+      card.addEventListener("click", () => {
+        const sym = card.getAttribute("data-symbol");
+        if (sym) openStockDiagnose(sym);
+      });
+    });
   } catch (e) {
     console.error("加载做T监控异常:", e);
   }
@@ -404,29 +497,78 @@ async function resetT0Today() {
 
 // 5. 单股量化诊断与 ECharts 专业K线图 + 筹码分布
 async function openStockDiagnose(symbol) {
-  document.querySelector('.tab-btn[data-tab="diagnose"]').click();
-  document.getElementById("diagnoseInput").value = symbol;
-  runDiagnose();
+  console.log("[Quant2.0] 触发单股深度诊断联动:", symbol);
+  if (!symbol) return;
+  const cleanSym = String(symbol).trim();
+  lastDiagnosedSymbol = cleanSym;
+
+  // 1. 显式切换至单股诊断面板
+  switchTab("diagnose");
+
+  // 2. 填写输入框
+  const input = document.getElementById("diagnoseInput");
+  if (input) {
+    input.value = cleanSym;
+  }
+
+  // 3. 滚动到页面诊断区域顶部
+  const activePane = document.getElementById("pane-diagnose");
+  if (activePane) {
+    activePane.scrollIntoView({ behavior: "smooth", block: "start" });
+  } else {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  // 4. 立即执行诊断并加载K线图
+  await runDiagnose();
 }
+window.openStockDiagnose = openStockDiagnose;
 
 async function runDiagnose() {
   const query = document.getElementById("diagnoseInput").value.trim();
   if (!query) { alert("请输入股票代码或名称"); return; }
+  lastDiagnosedSymbol = query;
+
+  const box = document.getElementById("diagnoseSummaryBox");
+  if (box) {
+    box.innerHTML = `
+      <div style="text-align: center; padding: 40px; color: var(--text-muted);">
+        <div style="font-size: 28px; margin-bottom: 8px;">🔍</div>
+        <div style="font-size: 15px; color: var(--c-cyan); font-weight: 600;">正在加载并分析【${query}】量化多因子与专业K线...</div>
+        <div style="font-size: 12px; color: var(--text-dim); margin-top: 6px;">正在拉取历史K线、主力筹码分布、RSRS 偏度动量与财报/ETF画像...</div>
+      </div>
+    `;
+  }
 
   try {
     const res = await fetch(`/api/stock/diagnose?symbol=${encodeURIComponent(query)}`);
     if (!res.ok) {
       const err = await res.json();
-      alert("诊断失败: " + (err.detail || "标的无效"));
+      if (box) {
+        box.innerHTML = `
+          <div style="text-align: center; padding: 30px; color: #f87171; background: rgba(239, 68, 68, 0.08); border-radius: var(--radius-sm);">
+            <strong>❌ 诊断失败:</strong> ${err.detail || "标的无效或历史K线数据不足"}
+          </div>
+        `;
+      }
       return;
     }
     const data = await res.json();
     renderDiagnoseSummary(data);
 
     // 加载专业K线图与筹码分布
-    loadKlineChart(data.symbol);
+    await loadKlineChart(data.symbol);
+    if (klineChartInstance) {
+      setTimeout(() => klineChartInstance.resize(), 50);
+    }
   } catch (e) {
-    alert("诊断异常: " + e);
+    if (box) {
+      box.innerHTML = `
+        <div style="text-align: center; padding: 30px; color: #f87171; background: rgba(239, 68, 68, 0.08); border-radius: var(--radius-sm);">
+          <strong>❌ 诊断异常:</strong> ${e}
+        </div>
+      `;
+    }
   }
 }
 
@@ -635,15 +777,22 @@ async function loadKlineChart(symbol) {
     const ma60 = klineData.map(d => d.ma60);
     const volumes = klineData.map(d => d.volume);
 
+    const isLight = document.documentElement.getAttribute("data-theme") === "light";
+    const axisColor = isLight ? "#94a3b8" : "#334155";
+    const splitColor = isLight ? "rgba(0,0,0,0.06)" : "rgba(255,255,255,0.04)";
+    const tooltipBg = isLight ? "rgba(255, 255, 255, 0.96)" : "rgba(16, 24, 43, 0.9)";
+    const tooltipBorder = isLight ? "rgba(2, 132, 199, 0.35)" : "rgba(56, 189, 248, 0.3)";
+    const tooltipText = isLight ? "#0f172a" : "#ffffff";
+
     const option = {
       animation: false,
       backgroundColor: "transparent",
       tooltip: {
         trigger: "axis",
         axisPointer: { type: "cross" },
-        backgroundColor: "rgba(16, 24, 43, 0.9)",
-        borderColor: "rgba(56, 189, 248, 0.3)",
-        textStyle: { color: "#fff", fontSize: 12 }
+        backgroundColor: tooltipBg,
+        borderColor: tooltipBorder,
+        textStyle: { color: tooltipText, fontSize: 12 }
       },
       axisPointer: { link: [{ xAxisIndex: "all" }] },
       grid: [
@@ -651,12 +800,12 @@ async function loadKlineChart(symbol) {
         { left: "5%", right: "8%", top: "68%", height: "22%" }
       ],
       xAxis: [
-        { type: "category", data: dates, gridIndex: 0, axisLine: { lineStyle: { color: "#334155" } } },
-        { type: "category", data: dates, gridIndex: 1, axisLine: { lineStyle: { color: "#334155" } } }
+        { type: "category", data: dates, gridIndex: 0, axisLine: { lineStyle: { color: axisColor } } },
+        { type: "category", data: dates, gridIndex: 1, axisLine: { lineStyle: { color: axisColor } } }
       ],
       yAxis: [
-        { scale: true, gridIndex: 0, axisLine: { lineStyle: { color: "#334155" } }, splitLine: { lineStyle: { color: "rgba(255,255,255,0.04)" } } },
-        { scale: true, gridIndex: 1, axisLine: { lineStyle: { color: "#334155" } }, splitLine: { show: false } }
+        { scale: true, gridIndex: 0, axisLine: { lineStyle: { color: axisColor } }, splitLine: { lineStyle: { color: splitColor } } },
+        { scale: true, gridIndex: 1, axisLine: { lineStyle: { color: axisColor } }, splitLine: { show: false } }
       ],
       series: [
         {

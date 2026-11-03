@@ -523,13 +523,47 @@ class DataEngine:
         ]
         return [{"code": c, "name": n, "symbol": self.format_symbol(c)} for c, n in core_seeds]
 
+    COMMON_ETFS = {
+        "300etf": ("510300", "sh510300", "沪深300ETF"),
+        "沪深300etf": ("510300", "sh510300", "沪深300ETF"),
+        "沪深300": ("510300", "sh510300", "沪深300ETF"),
+        "500etf": ("510500", "sh510500", "中证500ETF"),
+        "中证500etf": ("510500", "sh510500", "中证500ETF"),
+        "中证500": ("510500", "sh510500", "中证500ETF"),
+        "50etf": ("510050", "sh510050", "上证50ETF"),
+        "上证50etf": ("510050", "sh510050", "上证50ETF"),
+        "上证50": ("510050", "sh510050", "上证50ETF"),
+        "创业板etf": ("159915", "sz159915", "创业板ETF"),
+        "科创50etf": ("588000", "sh588000", "科创50ETF"),
+        "科创50": ("588000", "sh588000", "科创50ETF"),
+        "证券etf": ("512880", "sh512880", "证券ETF"),
+        "券商etf": ("512000", "sh512000", "券商ETF"),
+        "半导体etf": ("512480", "sh512480", "半导体ETF"),
+        "芯片etf": ("159995", "sz159995", "芯片ETF"),
+        "酒etf": ("512690", "sh512690", "酒ETF"),
+        "白酒etf": ("512690", "sh512690", "酒ETF"),
+        "医药etf": ("512010", "sh512010", "医药ETF"),
+        "军工etf": ("512660", "sh512660", "军工ETF"),
+        "红利etf": ("510880", "sh510880", "红利ETF"),
+        "红利低波etf": ("512890", "sh512890", "红利低波ETF"),
+        "恒生科技etf": ("513180", "sh513180", "恒生科技ETF"),
+        "黄金etf": ("518880", "sh518880", "黄金ETF"),
+    }
+
     def search_stocks(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """根据代码、名称模糊搜索"""
+        """根据代码、名称模糊搜索主板股票与主流ETF"""
         q = str(query).strip().lower()
         if not q:
             return []
-        stocks = self.get_main_board_stock_list()
         matches = []
+        # 优先匹配主流 ETF 字典
+        for k, (c, s, n) in self.COMMON_ETFS.items():
+            if q in k or q in c or q in n.lower():
+                matches.append({"code": c, "symbol": s, "name": n})
+                if len(matches) >= limit:
+                    return matches
+
+        stocks = self.get_main_board_stock_list()
         is_num = q.isdigit()
         for s in stocks:
             code = s.get("code", "")
@@ -548,10 +582,18 @@ class DataEngine:
         return matches
 
     def resolve_symbol(self, query: str) -> Optional[Dict[str, str]]:
-        """解析股票代码或名称为标准化结构"""
+        """解析股票代码或名称为标准化结构 (支持主板股票与主流ETF)"""
         q = str(query).strip()
         if not q:
             return None
+
+        # 1. 优先匹配主流 ETF 别名
+        q_lower = q.lower()
+        if q_lower in self.COMMON_ETFS:
+            c, s, n = self.COMMON_ETFS[q_lower]
+            return {"code": c, "symbol": s, "name": n}
+
+        # 2. 符合主板股票或场内主流 ETF 代码规则
         if self.is_main_board(q):
             sym = self.format_symbol(q)
             code = self.clean_code(q)
@@ -559,8 +601,18 @@ class DataEngine:
             for s in stocks:
                 if s.get("code") == code:
                     return {"code": code, "symbol": sym, "name": s.get("name", code)}
+            # 针对主流ETF等非主板个股标的，尝试从实时行情快照补齐正式中文名称
+            try:
+                quotes = self.get_realtime_quotes([sym])
+                if quotes and sym in quotes and quotes[sym].get("name"):
+                    real_name = quotes[sym]["name"]
+                    if real_name and not real_name.isdigit():
+                        return {"code": code, "symbol": sym, "name": real_name}
+            except Exception:
+                pass
             return {"code": code, "symbol": sym, "name": code}
 
+        # 3. 模糊名称或别名搜索匹配
         matches = self.search_stocks(q, limit=1)
         if matches:
             top = matches[0]

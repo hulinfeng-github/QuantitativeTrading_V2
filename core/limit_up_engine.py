@@ -360,7 +360,7 @@ class LimitUpEngine:
             }
         }
 
-    def send_limit_up_signal(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    def send_limit_up_signal(self, candidate: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
         """
         向钉钉与微信推送极度详细的新手小白打板实操指令卡片（在什么点买、如何撤单防守、次日三大剧本具体怎么卖）
         """
@@ -388,7 +388,7 @@ class LimitUpEngine:
             }),
             "reasons": candidate.get("reasons", [])
         }
-        res = notification_manager.send_signal(signal_payload, force=True)
+        res = notification_manager.send_signal(signal_payload, force=force)
         return {"success": True, "res": res, "signal": signal_payload}
 
     def scan_today_candidates(self, limit: int = 15) -> List[Dict[str, Any]]:

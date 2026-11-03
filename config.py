@@ -99,7 +99,13 @@ DEFAULT_CONFIG = {
     "tail230_auto_track_top_n": 3,      # 每日14:32自动纳入次日卖出监控的前N只标的
     "tail230_morning_check_enabled": True, # 开启次日 09:28 集合竞价操盘计划预警
     
-    # ---------------- 8. Web 服务配置 (默认 8089 避开冲突) ----------------
+    # ---------------- 8. 游资龙虎打板量化参数 ----------------
+    "limit_up_auto_notify_enabled": True,  # 是否开启盘中打板机会自动推送
+    "limit_up_scan_interval_minutes": 10,  # 盘中打板监控扫描间隔 (分钟)
+    "limit_up_min_hardness": 80.0,         # 自动推送要求的最低封板硬度分
+    "limit_up_auto_track_top_n": 2,        # 每次自动推送并跟踪的精选标的数
+
+    # ---------------- 9. Web 服务配置 (默认 8089 避开冲突) ----------------
     "web_port": 8089,
     "web_host": "127.0.0.1"
 }
