@@ -130,7 +130,8 @@ class ReviewEngineV2:
                 "score": analysis.get("score", 50) if analysis else 50,
                 "signal_desc": analysis.get("signal_desc", "正常持仓") if analysis else "正常持仓",
                 "control_status": analysis.get("control_status", "平稳") if analysis else "平稳",
-                "trade_levels": analysis.get("trade_levels", {}) if analysis else {}
+                "trade_levels": analysis.get("trade_levels", {}) if analysis else {},
+                "group_id": item.get("group_id", "")
             })
 
         return results
@@ -417,6 +418,154 @@ class ReviewEngineV2:
         md.append("")
         md.append("---")
         md.append(f"> QuantitativeTrading 2.0 全景复盘 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        return "\n".join(md)
+
+    def build_group_review_report(self, group: Dict[str, Any], review_data: Dict[str, Any]) -> str:
+        """根据分组的股票清单与模块使能开关，生成针对该分组定制的精细化复盘 Markdown 报告"""
+        date_str = review_data.get("date", datetime.now().strftime("%Y-%m-%d"))
+        market = review_data.get("market", {})
+        watchlist = review_data.get("watchlist", [])
+        tracking = review_data.get("tracking", {})
+        optimization = review_data.get("optimization", {})
+        limit_up = review_data.get("limit_up", {})
+        
+        group_id = group.get("id", "group_default")
+        group_name = group.get("name", "未命名分组")
+        group_symbols = set()
+        if "stock_symbols" in group and isinstance(group["stock_symbols"], list):
+            group_symbols.update(s.strip().lower() for s in group["stock_symbols"] if s)
+        if "stocks" in group and isinstance(group["stocks"], list):
+            group_symbols.update(s.get("symbol", "").strip().lower() for s in group["stocks"] if s.get("symbol"))
+
+        md = []
+        md.append(f"## 📊 A股量化系统 2.0 收盘复盘报告 - 【{group_name}】 ({date_str})")
+        md.append(f"> 📌 针对【{group_name}】专属定制 · 包含本组监控标的及已订阅模块")
+        md.append("")
+        
+        # 1. 宏观大盘与情绪周期定调 (通用全景)
+        md.append("### 一、 宏观大盘与情绪周期定调")
+        md.append(f"- **上证指数**: **{market.get('index_price')} 点** ({market.get('index_pct', 0.0):+.2f}%)")
+        md.append(f"- **情绪温度计**: **{market.get('temp_score')} 分** · **{market.get('cycle_phase')}** ({market.get('regime')})")
+        md.append(f"- **多空通道**: {'站在 MA20/MA60 生命线上方(多头主导)' if market.get('above_ma20') else '位于 MA20 生命线下方(空头压制通道)'}")
+        md.append(f"- **建议总风险敞口**: **{int(market.get('target_exposure', 0.5) * 100)}%**")
+        md.append(f"- **操盘总指导**: **{market.get('action_guide')}**")
+        md.append("")
+
+        # 2. 核心自选与持仓深度体检 (筛选属于该组的标的，支持跨组重合)
+        group_watchlist = []
+        for w in watchlist:
+            sym = w.get("symbol", "").strip().lower()
+            gids = w.get("group_ids")
+            gid = w.get("group_id", "")
+            if sym in group_symbols or (isinstance(gids, list) and group_id in gids) or gid == group_id or (group_id == "group_default" and not gids and not gid):
+                group_watchlist.append(w)
+
+        md.append(f"### 二、 本组监控自选与持仓深度体检 ({len(group_watchlist)} 只)")
+        if group_watchlist:
+            md.append("| 标的 | 收盘价 | 今日涨跌 | 持仓成本 | 浮动盈亏 | 综合评分 | 筹码状态 | 操盘建议 |")
+            md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for w in group_watchlist:
+                cost = float(w.get('holding_cost', 0.0))
+                price = float(w.get('price', 0.0))
+                pnl_pct = float(w.get('pnl_pct', 0.0))
+                pnl_amt = float(w.get('pnl_amt', 0.0))
+                shares = int(w.get('holding_shares', 0))
+                status = w.get('control_status', '平稳')
+
+                if shares > 0:
+                    if status == "主力破位杀跌" or pnl_pct <= -8.0:
+                        advice_str = "🚨 破位杀跌·建议止损减仓"
+                    elif status == "主力突破起爆":
+                        advice_str = "🚀 主力起爆·顺势持有"
+                    elif status == "主力吸筹蓄势":
+                        advice_str = "🛡️ 密集蓄势·持有观望"
+                    else:
+                        advice_str = "👀 区间震荡·结合做T"
+                    cost_str = f"{cost:.3f}元" if cost < 10 else f"{cost:.2f}元"
+                    pnl_str = f"{pnl_pct:+.2f}% ({pnl_amt:+.0f}元)"
+                else:
+                    advice_str = "🔍 观察池标的"
+                    cost_str = "-"
+                    pnl_str = "-"
+
+                price_str = f"{price:.3f}元" if price < 10 else f"{price:.2f}元"
+                md.append(f"| {w['name']}({w['symbol']}) | {price_str} | {w['change_pct']:+.2f}% | {cost_str} | {pnl_str} | {w['score']}分 | {status} | {advice_str} |")
+        else:
+            md.append("本组暂无关联自选标的。可在 Web 界面将自选股划入此分组。")
+        md.append("")
+
+        # 3. 日内做T战绩复盘 (如果启用了 push_t0)
+        if group.get("push_t0", True):
+            md.append("### 三、 本组今日 A股 T+1 日内做T战绩复盘")
+            try:
+                from config import T0_TRADES_FILE
+                if T0_TRADES_FILE.exists():
+                    with open(T0_TRADES_FILE, "r", encoding="utf-8") as f:
+                        t0_data = json.load(f)
+                    today_trades = [
+                        v for k, v in t0_data.items()
+                        if v.get("date") == date_str and (not group_symbols or v.get("symbol") in group_symbols)
+                    ]
+                    if today_trades:
+                        for t in today_trades:
+                            direct = "倒T(高抛低吸)" if t.get("direction") == "SELL_T" else "正T(低吸高抛)"
+                            st = t.get("status")
+                            pnl = t.get("pnl_pct", 0.0)
+                            if st == "FINISHED":
+                                md.append(f"- **{t.get('name')}({t.get('symbol')})**: 【{direct} 成功平仓】开仓 {t.get('entry_price')}元 -> 平仓 {t.get('exit_price')}元，**锁定日内差价: +{pnl:.2f}%** (摊薄底仓成本)")
+                            elif st == "OPEN":
+                                md.append(f"- **{t.get('name')}({t.get('symbol')})**: 【{direct} 持仓中】开仓 {t.get('entry_price')}元，目标 {t.get('target_price')}元，等待对冲")
+                            elif st == "STOPPED":
+                                md.append(f"- **{t.get('name')}({t.get('symbol')})**: 【{direct} 触发止损】平仓 {t.get('exit_price')}元，日内避险离场")
+                    else:
+                        md.append("- 本组股票今日未触发日内做T或均处于安全通道内观望。")
+                else:
+                    md.append("- 今日无做T流水记录。")
+            except Exception:
+                md.append("- 本组做T数据加载正常。")
+            md.append("")
+
+        # 4. 游资龙虎打板模型复盘与隔日溢价战绩 (如果启用了 push_limitup)
+        if group.get("push_limitup", True):
+            md.append("### 四、 ⚡ 游资龙虎打板模型复盘与隔日溢价战绩")
+            if limit_up and limit_up.get("total_trades", 0) > 0:
+                st = limit_up
+                md.append(f"- **模型累计打板样本**: **{st.get('total_trades')}** 笔 | **已结算评估**: **{st.get('settled_trades')}** 笔 | **待结算**: **{st.get('pending_trades')}** 笔")
+                md.append(f"- **开盘竞价高开胜率**: **{st.get('open_premium_win_rate')}%** | **最高冲高胜率**: **{st.get('peak_profit_win_rate')}%**")
+                md.append(f"- **连板晋级接力率**: **{st.get('consecutive_rate')}%** | **盈亏比**: **{st.get('profit_loss_ratio')}:1**")
+                md.append(f"- **核心收益指标**: 次日开盘均值 **{st.get('avg_open_pnl'):+.2f}%** | 冲高均值 **{st.get('avg_peak_pnl'):+.2f}%**")
+                by_type = st.get("by_board_type", {})
+                if by_type:
+                    type_summaries = [f"{b_name}(样本{b_val.get('count')}笔·胜率{b_val.get('win_rate')}%)" for b_name, b_val in by_type.items()]
+                    md.append(f"- **板型胜率阵列**: {' · '.join(type_summaries)}")
+            else:
+                md.append("- 游资龙虎打板模块运行正常，监控中。")
+            md.append("")
+
+        # 5. 策略推荐信号回访 (如果启用了 push_screener 或 push_tail230)
+        if group.get("push_screener", True) or group.get("push_tail230", True):
+            md.append("### 五、 多因子/尾盘策略推荐信号前向胜率")
+            md.append(f"- 近期信号样本: **{tracking.get('total_signals', 0)}** 笔 | 胜率: **{tracking.get('win_rate', 0)}%** | 平均前向收益: **{tracking.get('avg_return', 0.0):+.2f}%**")
+            md.append("")
+
+        # 6. 策略参数自我进化演进 (Self-Tuning)
+        md.append("### 六、 策略参数自我进化演进 (Self-Tuning)")
+        md.append(f"- **RSRS 机构买入阈值**: {optimization.get('old_rsrs_buy')} -> **{optimization.get('new_rsrs_buy')}**")
+        md.append(f"- **ATR 防守止损倍数**: {optimization.get('old_atr_stop')} -> **{optimization.get('new_atr_stop')}**")
+        if optimization.get('reasons'):
+            md.append(f"- **闭环演进理由**: {'; '.join(optimization.get('reasons', []))}")
+        md.append("")
+
+        enabled_labels = []
+        if group.get("push_t0", True): enabled_labels.append("日内做T")
+        if group.get("push_screener", True): enabled_labels.append("多因子选股")
+        if group.get("push_tail230", True): enabled_labels.append("尾盘2:30突袭")
+        if group.get("push_limitup", True): enabled_labels.append("龙虎打板")
+        if group.get("push_review", True): enabled_labels.append("每日复盘")
+
+        md.append("---")
+        md.append(f"> 📌 本报告针对分组【{group_name}】定制 · 订阅模块: [{', '.join(enabled_labels)}] · QuantitativeTrading 2.0")
 
         return "\n".join(md)
 

@@ -19,6 +19,7 @@ storage/optimization_log.json
 storage/financial_cache.json
 storage/limit_up_trades.json
 storage/limit_up_ledger.csv
+storage/t0_groups.json
 
 # IDE & OS
 .vscode/

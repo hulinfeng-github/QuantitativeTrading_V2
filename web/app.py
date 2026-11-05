@@ -26,6 +26,7 @@ from core.review_engine_v2 import review_engine_v2
 from core.strategy_tail_230 import tail_strategy_230, tail_trade_tracker
 from notifier.manager import notification_manager
 from scheduler.task_runner import quant_scheduler2
+from core.t0_group_manager import t0_group_manager
 
 app = FastAPI(title="A-Share Smart Quant System 2.0", version="2.0.0")
 
@@ -130,6 +131,9 @@ def get_watchlist():
     quotes = data_engine.get_realtime_quotes(symbols)
 
     results = []
+    groups_list = t0_group_manager.get_groups(include_stocks=False)
+    groups_map = {g.get("id"): g.get("name", "未命名组") for g in groups_list}
+
     for it in items:
         sym = it.get('symbol', '')
         name = it.get('name', sym)
@@ -143,6 +147,9 @@ def get_watchlist():
         pnl_pct = round((cur_p - cost) / cost * 100.0, 2) if cost > 0 else 0.0
         pnl_val = round((cur_p - cost) * shares, 2) if cost > 0 else 0.0
 
+        gid = it.get('group_id', '')
+        gname = groups_map.get(gid, "默认做T组" if gid == "group_default" else "未分组") if gid else "未分组"
+
         results.append({
             "symbol": sym,
             "code": it.get('code', data_engine.clean_code(sym)),
@@ -154,7 +161,10 @@ def get_watchlist():
             "turnover": q.get('turnover', 0.0),
             "pnl_pct": pnl_pct,
             "pnl_val": pnl_val,
-            "notes": it.get('notes', '')
+            "notes": it.get('notes', ''),
+            "group_id": gid,
+            "group_name": gname,
+            "t0_enabled": it.get('t0_enabled', True)
         })
 
     return results
@@ -172,6 +182,8 @@ def add_to_watchlist(item: Dict[str, Any]):
     sym = resolved["symbol"]
     name = resolved["name"]
     code = resolved["code"]
+    group_id = item.get("group_id", "")
+    t0_enabled = bool(item.get("t0_enabled", True))
 
     items = []
     if WATCHLIST_FILE.exists():
@@ -186,6 +198,10 @@ def add_to_watchlist(item: Dict[str, Any]):
             it["holding_cost"] = float(item.get("holding_cost", it.get("holding_cost", 0.0)))
             it["holding_shares"] = int(item.get("holding_shares", it.get("holding_shares", 0)))
             it["notes"] = item.get("notes", it.get("notes", ""))
+            if "group_id" in item:
+                it["group_id"] = group_id
+            if "t0_enabled" in item:
+                it["t0_enabled"] = t0_enabled
             with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
                 json.dump(items, f, ensure_ascii=False, indent=2)
             return {"success": True, "message": "标的已在自选池，已更新持仓信息", "item": it}
@@ -196,7 +212,9 @@ def add_to_watchlist(item: Dict[str, Any]):
         "name": name,
         "holding_cost": float(item.get("holding_cost", 0.0)),
         "holding_shares": int(item.get("holding_shares", 0)),
-        "notes": item.get("notes", "")
+        "notes": item.get("notes", ""),
+        "group_id": group_id,
+        "t0_enabled": t0_enabled
     }
     items.append(new_item)
     with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
@@ -235,6 +253,9 @@ def get_t0_monitor():
     quotes = data_engine.get_realtime_quotes(symbols)
 
     results = []
+    groups_list = t0_group_manager.get_groups(include_stocks=False)
+    groups_map = {g.get("id"): g.get("name", "未命名组") for g in groups_list}
+
     for it in watchlist:
         sym = it.get('symbol', '')
         name = it.get('name', sym)
@@ -255,15 +276,23 @@ def get_t0_monitor():
             holding_cost=cost,
             holding_shares=shares
         )
+        gid = it.get('group_id', '')
+        gname = groups_map.get(gid, "默认做T组" if gid == "group_default" else "未分组") if gid else "未分组"
+
         t0_res["holding_cost"] = cost
         t0_res["holding_shares"] = shares
         t0_res["change_pct"] = q.get('change_pct', 0.0)
+        t0_res["group_id"] = gid
+        t0_res["group_name"] = gname
+        t0_res["t0_enabled"] = it.get('t0_enabled', True)
         results.append(t0_res)
 
         # 实时自动同步推送做T开仓/平仓/止损指令 (去重机制由 notification_manager 兜底，绝不重复刷屏)
         act = t0_res.get("signal_action")
         if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
             sig_payload = t0_smart_engine.build_signal_payload(t0_res)
+            sig_payload["group_id"] = gid
+            sig_payload["group_name"] = gname
             notification_manager.send_signal(sig_payload)
 
     return results
@@ -272,6 +301,51 @@ def get_t0_monitor():
 def reset_t0():
     t0_smart_engine.tracker.reset_today()
     return {"success": True, "message": "已重置今日全部做T持仓状态与流水"}
+
+# ==================== 做T分组与钉钉群管理专属 API ====================
+
+@app.get("/api/t0/groups")
+def get_t0_groups():
+    """获取所有做T分组详情，包含各组关联股票列表与数量"""
+    return t0_group_manager.get_groups(include_stocks=True)
+
+@app.post("/api/t0/groups")
+def save_t0_group(data: Dict[str, Any] = Body(...)):
+    """创建或更新做T分组配置"""
+    grp = t0_group_manager.save_group(data)
+    return {"success": True, "group": grp}
+
+@app.delete("/api/t0/groups/{group_id}")
+def delete_t0_group(group_id: str):
+    """删除做T分组"""
+    success = t0_group_manager.delete_group(group_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="未找到该做T分组")
+    return {"success": True, "message": "做T分组已成功删除"}
+
+@app.post("/api/t0/groups/test")
+def test_t0_group_notify(data: Dict[str, Any] = Body(...)):
+    """向指定做T分组的钉钉机器人发送测试联通卡片"""
+    res = t0_group_manager.test_group_notification(
+        group_id=data.get("group_id"),
+        webhook=data.get("dingtalk_webhook"),
+        secret=data.get("dingtalk_secret")
+    )
+    return res
+
+@app.post("/api/watchlist/group")
+def set_watchlist_stock_group(data: Dict[str, Any] = Body(...)):
+    """为单只或多只标的批量划分做T分组"""
+    symbols = data.get("symbols")
+    symbol = data.get("symbol")
+    group_id = data.get("group_id", "")
+    if symbols and isinstance(symbols, list):
+        ok = t0_group_manager.batch_set_stock_group(symbols, group_id)
+    elif symbol:
+        ok = t0_group_manager.set_stock_group(symbol, group_id)
+    else:
+        raise HTTPException(status_code=400, detail="必须提供 symbol 或 symbols")
+    return {"success": ok}
 
 @app.get("/api/stock/minute")
 def get_stock_minute(symbol: str):

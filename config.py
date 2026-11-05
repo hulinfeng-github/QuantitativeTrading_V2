@@ -17,6 +17,7 @@ REVIEW_FILE = DATA_DIR / "review_history.json"
 OPTIMIZATION_FILE = DATA_DIR / "optimization_log.json"
 LIMIT_UP_TRADES_FILE = DATA_DIR / "limit_up_trades.json"
 LIMIT_UP_CSV_FILE = DATA_DIR / "limit_up_ledger.csv"
+T0_GROUPS_FILE = DATA_DIR / "t0_groups.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 

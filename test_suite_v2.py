@@ -426,6 +426,72 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         quant_scheduler2.run_limit_up_intraday_scan()
         print("  -> 调度器盘中打板定时巡检方法无异常、安全沙箱保护通过")
 
+    def test_16_t0_groups_and_multi_dingtalk_routing(self):
+        """测试做T标的分组管理与不同钉钉群分流路由推送机制"""
+        print("\n[测试 16] 验证做T标的多群分组维护、Webhook路由与消息隔离机制...")
+        from unittest.mock import patch
+        from core.t0_group_manager import t0_group_manager
+        from notifier.manager import NotificationManager
+
+        # 1. 验证分组创建与标的分配
+        grp_data = {
+            "name": "自动化测试科技组",
+            "dingtalk_webhook": "https://oapi.dingtalk.com/robot/send?access_token=unit_test_token_999",
+            "dingtalk_secret": "SEC_UNIT_TEST_SECRET",
+            "enabled": True,
+            "notes": "单元测试专用科技组",
+            "stock_symbols": ["sz002156"]
+        }
+        saved_grp = t0_group_manager.save_group(grp_data)
+        self.assertIsNotNone(saved_grp)
+        grp_id = saved_grp["id"]
+        self.assertEqual(saved_grp["name"], "自动化测试科技组")
+        print(f"  -> 做T分组创建通过: ID={grp_id}, 名称={saved_grp['name']}")
+
+        # 2. 验证标的分组映射精准性
+        assigned_grp = t0_group_manager.get_group_for_stock("sz002156")
+        self.assertIsNotNone(assigned_grp)
+        self.assertEqual(assigned_grp["id"], grp_id)
+        print("  -> 标的与做T分组精准双向绑定通过 (sz002156 -> 自动化测试科技组)")
+
+        # 3. 验证做T信号推送到对应分组的钉钉机器人
+        nm = NotificationManager()
+        with patch("notifier.manager.DingTalkNotifier") as MockDT:
+            mock_dt_inst = MockDT.return_value
+            mock_dt_inst.send_trade_signal.return_value = True
+
+            sig_t = {
+                "symbol": "sz002156",
+                "name": "通富微电",
+                "signal_type": "BUY_T",
+                "signal_desc": "正T低吸机会触发",
+                "price": 76.5,
+                "trade_levels": {"target_price": 78.0, "initial_stop": 75.0}
+            }
+            res = nm.send_signal(sig_t, force=True)
+            self.assertTrue(res["dingtalk"])
+
+            # 验证实例化的 Webhook 与 Secret 属于该科技组
+            MockDT.assert_called_with(
+                webhook="https://oapi.dingtalk.com/robot/send?access_token=unit_test_token_999",
+                secret="SEC_UNIT_TEST_SECRET"
+            )
+            self.assertEqual(sig_t.get("group_name"), "自动化测试科技组")
+            print("  -> 分组钉钉路由验证通过: 信号精准派发至该分组独占的 Webhook")
+
+        # 4. 验证禁用分组时自动静默停止该组推送
+        t0_group_manager.save_group({"id": grp_id, "name": "自动化测试科技组", "enabled": False})
+        with patch("notifier.manager.DingTalkNotifier") as MockDT:
+            res_disabled = nm.send_signal(sig_t, force=True)
+            self.assertFalse(res_disabled["dingtalk"])
+            MockDT.assert_not_called()
+            print("  -> 分组启停风控验证通过: 停用分组后阻断推送到该钉钉群")
+
+        # 5. 清理测试产生的分组
+        t0_group_manager.delete_group(grp_id)
+        self.assertIsNone(t0_group_manager.get_group(grp_id))
+        print("  -> 分组安全销毁与股票解绑通过")
+
 if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("      QuantitativeTrading 2.0 全链路自动化单元与回归测试套件")

@@ -66,26 +66,28 @@ class DingTalkNotifier:
         reasons = signal.get("reasons", [])
         levels = signal.get("trade_levels", {})
         advice = signal.get("position_advice", {})
+        group_name = signal.get("group_name", "")
+        group_tag = f"【{group_name}】" if group_name else ""
 
         # 图标与标题定调
         if sig_type in ["FORCE_EXIT", "EOD_FORCE_CLOSE_T"]:
             icon = "🚨"
-            title = f"{icon} 尾盘强平警报: {name} ({symbol})" if sig_type == "EOD_FORCE_CLOSE_T" else f"{icon} 强制平仓警报: {name} ({symbol})"
+            title = f"{icon} {group_tag}尾盘强平警报: {name} ({symbol})" if sig_type == "EOD_FORCE_CLOSE_T" else f"{icon} {group_tag}强制平仓警报: {name} ({symbol})"
         elif sig_type == "EOD_HEDGE_ALERT_T":
             icon = "⚠️"
-            title = f"{icon} 倒T尾盘抉择: {name} ({symbol})"
+            title = f"{icon} {group_tag}倒T尾盘抉择: {name} ({symbol})"
         elif sig_type == "BUY":
             icon = "🚀"
-            title = f"{icon} 波段买入信号: {name} ({desc})"
+            title = f"{icon} {group_tag}波段买入信号: {name} ({desc})"
         elif sig_type == "SELL":
             icon = "⚠️"
-            title = f"{icon} 减仓清仓预警: {name} ({desc})"
+            title = f"{icon} {group_tag}减仓清仓预警: {name} ({desc})"
         elif sig_type in ["SELL_T", "BUY_T"]:
             icon = "⚡" if sig_type == "SELL_T" else "🌟"
-            title = f"{icon} 日内做T机会: {name} ({desc})"
+            title = f"{icon} {group_tag}日内做T机会: {name} ({desc})"
         elif sig_type in ["CLOSE_T", "STOP_T"]:
             icon = "🎯" if sig_type == "CLOSE_T" else "🛑"
-            title = f"{icon} 做T对冲平仓: {name} ({desc})"
+            title = f"{icon} {group_tag}做T对冲平仓: {name} ({desc})"
         elif sig_type == "TAIL_PROFIT_EXIT":
             icon = "🎯"
             title = f"{icon} 2.30战法次日冲高止盈: {name} (+{signal.get('pnl_pct', 0.0):.2f}%)"
@@ -103,11 +105,12 @@ class DingTalkNotifier:
             title = f"{icon} 游资龙虎打板信号: {name} ({signal.get('board_type', '主板涨停')})"
         else:
             icon = "🔔"
-            title = f"{icon} 量化信号: {name} ({desc})"
+            title = f"{icon} {group_tag}量化信号: {name} ({desc})"
 
         lines = [
-            f"### {icon} 【量化2.0】{name} ({symbol})",
+            f"### {icon} {f'【量化2.0 · {group_name}】' if group_name else '【量化2.0】'}{name} ({symbol})",
             f"- **信号类别**: **{desc}** ({sig_type})",
+            *( [f"- **所属做T分组**: **{group_name}**"] if group_name else [] ),
             f"- **当前最新市价**: **{fmt_p(price)} 元**"
         ]
 

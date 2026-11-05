@@ -99,13 +99,19 @@
       <div class="card">
         <div class="card-header">
           <div class="card-title">📋 核心持仓与观察池</div>
-          <button class="btn btn-primary btn-sm" onclick="showAddWatchlistModal()">+ 添加自选股</button>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-secondary btn-sm" onclick="showGroupModal()">🏷️ 做T分组与钉钉群</button>
+            <button class="btn btn-primary btn-sm" onclick="showAddWatchlistModal()">+ 添加自选股</button>
+          </div>
         </div>
+        <!-- 做T分组快捷筛选栏 -->
+        <div id="watchlistGroupFilterBar" class="group-filter-bar" style="margin-bottom: 14px;"></div>
         <div class="data-table-wrapper">
           <table class="data-table">
             <thead>
               <tr>
                 <th>标的名称 / 代码</th>
+                <th>做T分组 (钉钉群)</th>
                 <th>最新现价</th>
                 <th>今日涨跌幅</th>
                 <th>持仓成本</th>
@@ -130,15 +136,18 @@
           <div>
             <div class="card-title">🎯 A股 T+1 底仓日内做T助手 (分时VWAP + 动态布林带)</div>
             <p style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">
-              顺应多头只做正T（负偏离低吸高抛），空头只做倒T；单日单向唯一锁定，冲高回落自动对冲止盈。<strong style="color: var(--c-cyan);">💡 点击下方已添加的任意股票或 ETF，将自动跳转至单股深度诊断与专业 K 线展开全维分析。</strong>
+              顺应多头只做正T（负偏离低吸高抛），空头只做倒T；不同组标的自动分流推送至对应钉钉群，冲高回落自动对冲止盈。<strong style="color: var(--c-cyan);">💡 点击下方已添加的任意股票或 ETF，将自动跳转至单股深度诊断与专业 K 线展开全维分析。</strong>
             </p>
           </div>
-          <div style="display: flex; gap: 8px;">
-            <button class="btn btn-primary btn-sm" onclick="showAddWatchlistModal()">+ 添加做T标的 (股票/ETF)</button>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-primary btn-sm" onclick="showGroupModal()">🏷️ 做T分组与钉钉群管理</button>
+            <button class="btn btn-secondary btn-sm" onclick="showAddWatchlistModal()">+ 添加做T标的 (股票/ETF)</button>
             <button class="btn btn-secondary btn-sm" onclick="resetT0Today()">🔄 重置今日做T状态</button>
           </div>
         </div>
       </div>
+      <!-- 做T分组快捷筛选栏 -->
+      <div id="t0GroupFilterBar" class="group-filter-bar" style="margin-bottom: 16px;"></div>
       <div id="t0CardsContainer" class="screener-grid">
         <!-- 动态填充做T卡片 -->
       </div>
@@ -355,6 +364,22 @@
               <label class="form-label">Token / SendKey / Webhook</label>
               <input id="cfgWxToken" class="form-input" placeholder="填入 PushPlus Token 或 Server酱 SendKey...">
             </div>
+          </div>
+        </div>
+
+        <!-- 做T标的分组与多钉钉群分流推送卡片 -->
+        <div style="margin-top: 20px; background: linear-gradient(135deg, rgba(99, 102, 241, 0.08), rgba(56, 189, 248, 0.08)); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: var(--radius-sm); padding: 18px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+            <div>
+              <div style="font-weight: 700; font-size: 14px; color: var(--c-indigo); display: flex; align-items: center; gap: 8px;">
+                🏷️ 做T标的分组与多钉钉群分流推送配置
+              </div>
+              <p style="font-size: 12px; color: var(--text-muted); margin-top: 4px; line-height: 1.5;">
+                支持将自选与做T标的按板块（如科技芯片组、红利低波ETF组、有色资源组）划分进不同组，每组可配置专属钉钉群机器人 Webhook 与加签密钥，日内做T信号、高抛低吸与尾盘强平指令将精准分流推送到对应群组，避免大群信息过载！
+              </p>
+              <div id="settingsGroupSummary" style="font-size: 12px; color: var(--c-cyan); margin-top: 6px;">正在读取已配置分组...</div>
+            </div>
+            <button class="btn btn-primary" onclick="showGroupModal()">⚙️ 管理做T分组与多群机器人</button>
           </div>
         </div>
 
@@ -673,6 +698,15 @@
         <input id="addShares" class="form-input" type="number" step="100" value="0">
       </div>
       <div class="form-group">
+        <label class="form-label">所属做T分组 (将推送到该组专属钉钉群)</label>
+        <div style="display: flex; gap: 8px;">
+          <select id="addStockGroup" class="form-input" style="flex: 1;">
+            <option value="">未指定 (使用默认钉钉群)</option>
+          </select>
+          <button class="btn btn-secondary btn-sm" type="button" onclick="showGroupModal()">+ 新建组</button>
+        </div>
+      </div>
+      <div class="form-group">
         <label class="form-label">备注标签 (如 核心白马、算力龙头)</label>
         <input id="addNotes" class="form-input" placeholder="个性化备忘">
       </div>
@@ -683,6 +717,129 @@
     </div>
   </div>
 
-  <script src="/static/js/app.js?v=2.2.0"></script>
+  <!-- 做T标的分组与多钉钉群推送管理弹窗 -->
+  <div id="t0GroupModal" class="modal-overlay" style="display: none;">
+    <div class="modal-content" style="max-width: 860px; max-height: 90vh; overflow-y: auto;">
+      <div class="card-header" style="border-bottom: 1px solid var(--border-subtle); padding-bottom: 12px; margin-bottom: 16px;">
+        <div>
+          <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
+            🏷️ 做T股票分组与多钉钉群管理 (分流推送)
+          </div>
+          <p style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">
+            将做T股票分组（如科技组、红利组），每个组绑定对应的钉钉群机器人 Webhook，对应股票信号精准独占推送到该群。
+          </p>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="hideGroupModal()">✕</button>
+      </div>
+
+      <!-- 分组管理两栏布局：左侧现有分组列表，右侧新增/编辑分组 -->
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 18px;">
+        <!-- 左侧：现有分组列表 -->
+        <div>
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <strong style="font-size: 13px; color: var(--text-main);">📋 已有做T分组列表</strong>
+            <button class="btn btn-primary btn-sm" onclick="resetGroupForm()">+ 新建做T组</button>
+          </div>
+          <div id="groupCardsList" style="max-height: 520px; overflow-y: auto; padding-right: 4px;">
+            <!-- 动态填充分组卡片 -->
+          </div>
+        </div>
+
+        <!-- 右侧：新建/编辑分组表单 -->
+        <div style="background: rgba(0,0,0,0.25); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 16px;">
+          <h4 id="groupFormTitle" style="font-size: 13px; color: var(--c-cyan); margin-bottom: 14px; font-weight: 700;">
+            ✨ 新增做T分组
+          </h4>
+          <input type="hidden" id="editGroupId" value="">
+
+          <div class="form-group">
+            <label class="form-label">分组名称 * (如 科技芯片组、低波红利ETF组)</label>
+            <input id="editGroupName" class="form-input" placeholder="输入分组名称，如：科技芯片组">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">对应钉钉群 Webhook 地址 *</label>
+            <input id="editGroupWebhook" class="form-input" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">钉钉加签 Secret (推荐填入)</label>
+            <input id="editGroupSecret" class="form-input" placeholder="SEC... (可选，若群机器人开启加签必填)">
+          </div>
+
+          <div class="form-group" style="display: flex; align-items: center; justify-content: space-between;">
+            <label class="form-label" style="margin-bottom: 0;">启用该组钉钉推送</label>
+            <input type="checkbox" id="editGroupEnabled" checked style="width: 18px; height: 18px; cursor: pointer;">
+          </div>
+
+          <div class="form-group">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label class="form-label" style="margin-bottom: 0;">📡 策略消息推送订阅模块 (使能 / 关闭)</label>
+              <span style="font-size: 11px; color: var(--text-dim);">支持按需勾选推送类型</span>
+            </div>
+            <div class="group-module-grid">
+              <label class="module-check-card">
+                <input type="checkbox" id="editPushT0" checked>
+                <div class="module-check-info">
+                  <span class="module-check-title">🎯 日内做T</span>
+                  <span class="module-check-desc">日内网格与高抛低吸价差信号</span>
+                </div>
+              </label>
+              <label class="module-check-card">
+                <input type="checkbox" id="editPushScreener" checked>
+                <div class="module-check-info">
+                  <span class="module-check-title">💎 多因子选股</span>
+                  <span class="module-check-desc">盘中盘后多因子精选标的</span>
+                </div>
+              </label>
+              <label class="module-check-card">
+                <input type="checkbox" id="editPushTail230" checked>
+                <div class="module-check-info">
+                  <span class="module-check-title">⚡ 尾盘2:30战法</span>
+                  <span class="module-check-desc">尾盘主力抢筹次日冲高兑现</span>
+                </div>
+              </label>
+              <label class="module-check-card">
+                <input type="checkbox" id="editPushLimitup" checked>
+                <div class="module-check-info">
+                  <span class="module-check-title">🚀 游资龙虎打板</span>
+                  <span class="module-check-desc">盘中封板硬度突破打板卡片</span>
+                </div>
+              </label>
+              <label class="module-check-card">
+                <input type="checkbox" id="editPushReview" checked>
+                <div class="module-check-info">
+                  <span class="module-check-title">📊 收盘定制复盘</span>
+                  <span class="module-check-desc">针对本组股票与模块定制复盘</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">备注说明 (可选)</label>
+            <input id="editGroupNotes" class="form-input" placeholder="如：用于推送半导体及算力做T指令">
+          </div>
+
+          <div class="form-group">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label class="form-label" style="margin-bottom: 0;">关联标的 (自选与持仓股票勾选加入本组)</label>
+              <button class="btn btn-secondary btn-sm" type="button" onclick="toggleSelectAllGroupStocks()" style="font-size: 11px; padding: 2px 6px;">全选/取消</button>
+            </div>
+            <div id="groupStockCheckboxes" style="max-height: 150px; overflow-y: auto; background: rgba(0,0,0,0.3); padding: 8px; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle); display: flex; flex-direction: column; gap: 6px;">
+              <!-- 动态填充股票勾选框 -->
+            </div>
+          </div>
+
+          <div style="margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end;">
+            <button class="btn btn-secondary" onclick="resetGroupForm()">清空/重置</button>
+            <button class="btn btn-primary" onclick="submitSaveGroup()">💾 保存分组配置</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js?v=2.2.2"></script>
 </body>
 </html>

@@ -868,4 +868,188 @@ body {
   color: #0f172a;
 }
 
+/* 做T标的分组与多钉钉群推送样式 */
+.group-filter-bar {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.group-filter-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.group-filter-btn:hover {
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--c-cyan);
+  border-color: var(--border-accent);
+}
+
+.group-filter-btn.active {
+  background: var(--c-cyan);
+  color: #070a12;
+  font-weight: 700;
+  border-color: var(--c-cyan);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+}
+
+.pill-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.pill-group.pill-group-default {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.3);
+}
+
+.group-item-card {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  margin-bottom: 12px;
+  transition: all 0.2s;
+  cursor: pointer;
+  position: relative;
+}
+
+.group-item-card:hover {
+  border-color: var(--border-accent);
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.group-item-card.active {
+  border-color: var(--c-cyan) !important;
+  background: rgba(6, 182, 212, 0.08) !important;
+  box-shadow: 0 0 12px rgba(6, 182, 212, 0.25);
+}
+
+.group-item-card.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--c-cyan);
+  border-top-left-radius: var(--radius-sm);
+  border-bottom-left-radius: var(--radius-sm);
+}
+
+.group-stock-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  font-size: 11px;
+  color: var(--text-main);
+  margin: 2px 4px 2px 0;
+}
+
+.group-module-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.module-check-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.module-check-card:hover {
+  border-color: var(--border-accent);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.module-check-card input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--c-cyan);
+  margin-top: 2px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.module-check-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.module-check-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.module-check-desc {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  line-height: 1.3;
+}
+
+.module-check-card:has(input:checked) {
+  border-color: rgba(6, 182, 212, 0.4);
+  background: rgba(6, 182, 212, 0.06);
+}
+
+.module-sub-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  font-size: 10px;
+  border-radius: 4px;
+  margin-right: 4px;
+  margin-top: 4px;
+}
+
+.module-sub-pill.active {
+  background: rgba(6, 182, 212, 0.15);
+  color: var(--c-cyan);
+  border: 1px solid rgba(6, 182, 212, 0.3);
+}
+
+.module-sub-pill.inactive {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  text-decoration: line-through;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 

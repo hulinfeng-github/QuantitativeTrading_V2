@@ -174,6 +174,8 @@ class QuantScheduler2:
                 act = t0_res.get("signal_action")
                 if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
                     sig_payload = t0_smart_engine.build_signal_payload(t0_res)
+                    if item.get("group_id"):
+                        sig_payload["group_id"] = item.get("group_id")
                     notification_manager.send_signal(sig_payload)
             except Exception as e:
                 print(f"[Scheduler 2.0] 巡检个股 {item.get('symbol', '')} 异常: {e}")
@@ -269,7 +271,7 @@ class QuantScheduler2:
                 f"- **操盘指导**：保持空仓或轻仓防守观望，耐心等待大盘情绪回暖与右侧多因子共振买点确立。"
             )
             title = f"💎 收盘多因子选股: 今日严控风控·空仓观望 ({date_str})"
-            notification_manager.send_markdown(title, msg)
+            notification_manager.send_markdown(title, msg, broadcast_groups=True, module_filter="push_screener")
             return
 
         lines = [
@@ -313,7 +315,7 @@ class QuantScheduler2:
         )
 
         title = f"💎 收盘多因子主板精选: {top_picks[0].get('name')}等{len(top_picks)}只 ({date_str})"
-        notification_manager.send_markdown(title, "\n".join(lines))
+        notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_screener")
 
     def run_tail230_scan_and_notify(self):
         """尾盘 14:32 触发『2.30 突袭战法』主板精选标的扫描与推送"""
@@ -329,7 +331,7 @@ class QuantScheduler2:
                 f"> **监测提示**：今日 14:30 市场情绪或量能未达严格主力抢筹标准（要求沪深主板、日内涨幅+2%~+5.5%、量比>1.25、站稳MA5/MA20、小箱体突破形态）。\n\n"
                 f"🛡️ **策略风控提示**：今日无高确定性突袭标的入选，建议尾盘保持空仓观望或仅做好持仓对冲，规避次日低开风险。"
             )
-            notification_manager.send_markdown("⚡ 2:30尾盘主板突袭雷达", msg)
+            notification_manager.send_markdown("⚡ 2:30尾盘主板突袭雷达", msg, broadcast_groups=True, module_filter="push_tail230")
             return
 
         lines = [
@@ -359,7 +361,7 @@ class QuantScheduler2:
         )
 
         title = f"⚡ 2:30尾盘主板突袭精选: {candidates[0].get('name')}等{len(candidates)}只"
-        notification_manager.send_markdown(title, "\n".join(lines))
+        notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_tail230")
 
         # 自动将推荐标的纳入次日卖出与平仓跟踪引擎 (默认前3只)
         cfg = load_config()
@@ -401,7 +403,7 @@ class QuantScheduler2:
         )
 
         title = f"🌅 2.30战法早盘操盘计划: {plans[0].get('name')}等{len(plans)}只"
-        notification_manager.send_markdown(title, "\n".join(lines))
+        notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_tail230")
 
     def run_eod_t0_check(self):
         """尾盘（14:48）检查未对冲做T头寸，发出强制平仓/底仓对冲抉择预警"""
@@ -460,16 +462,67 @@ class QuantScheduler2:
             print(f"[Scheduler 2.0] 盘中打板监控异常: {e}")
 
     def run_post_market_review(self):
-        """执行盘后 15:10 全景复盘与参数自进化（完整富文本推送到钉钉/微信，免网页端）"""
+        """执行盘后 15:10 全景复盘与参数自进化（按分组定制报告内容与模块后精准推送）"""
         now = datetime.now()
         if now.weekday() >= 5:
             return
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动收盘全景复盘与自动调优任务...")
         res = review_engine_v2.run_daily_review(auto_optimize=True)
-        # 直接推送完整的富文本 Markdown 复盘长文报告，手机端直接阅读
-        title = f"📊 A股收盘全景复盘与持仓体检 ({res.get('date')})"
+        date_str = res.get("date", datetime.now().strftime("%Y-%m-%d"))
+
+        # 1. 针对各个开启了 push_review 的分组，生成并推送专属定制复盘
+        from core.t0_group_manager import t0_group_manager
+        from notifier.dingtalk import DingTalkNotifier
+        
+        groups = t0_group_manager.get_groups(include_stocks=True)
+        pushed_group_webhooks = set()
+
+        for grp in groups:
+            if not grp.get("enabled", True):
+                continue
+            if not grp.get("push_review", True):
+                continue
+
+            webhook = grp.get("dingtalk_webhook", "").strip()
+            secret = grp.get("dingtalk_secret", "").strip()
+            if not webhook:
+                continue
+
+            group_name = grp.get("name", "未命名组")
+            group_md = review_engine_v2.build_group_review_report(grp, res)
+            group_title = f"📊 A股收盘复盘 - 【{group_name}】 ({date_str})"
+
+            try:
+                notifier = DingTalkNotifier(webhook, secret)
+                notifier.send_markdown(group_title, group_md)
+                pushed_group_webhooks.add(webhook)
+                print(f"[PostReview] 成功推送定制复盘至分组: {group_name}")
+            except Exception as e:
+                print(f"[PostReview] 推送定制复盘至分组 {group_name} 失败: {e}")
+
+        # 2. 推送全局通用复盘至微信(若启用)以及尚未接收到的全局钉钉配置
         full_report = res.get("report_md", "")
-        notification_manager.send_markdown(title, full_report)
+        global_title = f"📊 A股收盘全景复盘与持仓体检 ({date_str})"
+
+        cfg = load_config()
+        global_webhook = cfg.get("dingtalk_webhook", "").strip()
+
+        # 如果全局 webhook 已经作为某个启用 push_review 的分组发送过定制复盘，则无需重复发送全局复盘
+        if global_webhook and global_webhook not in pushed_group_webhooks and cfg.get("dingtalk_enabled", True):
+            try:
+                notifier = DingTalkNotifier(global_webhook, cfg.get("dingtalk_secret", ""))
+                notifier.send_markdown(global_title, full_report)
+            except Exception as e:
+                print(f"[PostReview] 推送全局钉钉复盘失败: {e}")
+
+        # 微信通知 (若启用)
+        if cfg.get("wechat_enabled"):
+            try:
+                from notifier.wechat import WeChatNotifier
+                wechat_notifier = WeChatNotifier(cfg.get("wechat_corp_id"), cfg.get("wechat_agent_id"), cfg.get("wechat_secret"))
+                wechat_notifier.send_markdown(global_title, full_report)
+            except Exception as e:
+                print(f"[PostReview] 推送微信复盘失败: {e}")
 
     def start(self):
         if self.is_running:
