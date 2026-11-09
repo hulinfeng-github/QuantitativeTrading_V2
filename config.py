@@ -90,7 +90,10 @@ DEFAULT_CONFIG = {
     
     # ---------------- 6. 自动化后台调度 ----------------
     "scheduler_enabled": True,
-    "scan_interval_minutes": 5,          # 盘中自选池与做T巡检间隔 (分钟)
+    "scan_interval_minutes": 5,          # 盘中常态自选池与做T巡检间隔 (分钟)
+    "opening_high_freq_enabled": True,   # 开启早盘开盘脉冲期(09:30-09:40)高频巡检(1分钟高灵敏度)
+    "closing_high_freq_enabled": True,   # 开启尾盘决胜期(14:35-15:00)提频巡检(2分钟)
+    "auction_snapshot_enabled": True,    # 开启集合竞价(09:25:05)定价秒级感知
     "market_review_time": "15:10",       # 收盘后全景复盘与参数自迭代时间
     "market_close_scan_time": "15:30",   # 盘后全市场智能精选时间
     

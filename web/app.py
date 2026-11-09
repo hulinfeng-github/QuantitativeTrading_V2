@@ -7,7 +7,8 @@ import json
 import numpy as np
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Query, Body
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Query, Body, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -28,7 +29,15 @@ from notifier.manager import notification_manager
 from scheduler.task_runner import quant_scheduler2
 from core.t0_group_manager import t0_group_manager
 
-app = FastAPI(title="A-Share Smart Quant System 2.0", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cfg = load_config()
+    if cfg.get("scheduler_enabled", True):
+        quant_scheduler2.start()
+    yield
+    quant_scheduler2.stop()
+
+app = FastAPI(title="A-Share Smart Quant System 2.0", version="2.0.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def add_no_cache_headers(request, call_next):
@@ -43,14 +52,15 @@ async def add_no_cache_headers(request, call_next):
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-# 挂载静态静态前端资源
+# 挂载静态前端资源
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-@app.on_event("startup")
-async def startup_event():
-    cfg = load_config()
-    if cfg.get("scheduler_enabled", True):
-        quant_scheduler2.start()
+@app.get("/favicon.ico", include_in_schema=False)
+def get_favicon():
+    fav = STATIC_DIR / "favicon.ico"
+    if fav.exists():
+        return FileResponse(str(fav), media_type="image/x-icon")
+    return Response(status_code=204)
 
 @app.get("/")
 def read_root():

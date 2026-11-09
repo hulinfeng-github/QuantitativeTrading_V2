@@ -54,6 +54,7 @@ class QuantScheduler2:
             "message": "空闲",
             "last_scan_time": ""
         }
+        self._last_intraday_check: float = 0.0
 
     @staticmethod
     def is_trading_time() -> bool:
@@ -76,10 +77,30 @@ class QuantScheduler2:
                 pass
         return []
 
-    def run_intraday_check(self):
-        """盘中自选股巡检：检查波段信号与日内做T机会"""
+    def run_intraday_check(self, force: bool = False):
+        """盘中自选股巡检：检查波段信号与日内做T机会 (支持开盘脉冲黄金期自适应提频)"""
         if not self.is_trading_time():
             return
+
+        now = datetime.now()
+        curr_hm = now.strftime("%H:%M")
+        cfg = load_config()
+
+        if not force:
+            # 动态感知市场博弈节奏与自适应巡检频控
+            if "09:30" <= curr_hm <= "09:40" and cfg.get("opening_high_freq_enabled", True):
+                step_interval = 60  # 开盘脉冲黄金期：提频至 60 秒高灵敏巡检，捕捉日内高低极值
+            elif "14:35" <= curr_hm <= "15:00" and cfg.get("closing_high_freq_enabled", True):
+                step_interval = 120 # 尾盘决胜决断期：提频至 120 秒，防范尾盘突袭或强平滞后
+            elif "09:25" <= curr_hm < "09:30":
+                step_interval = 180 # 集合竞价等待期：维持 3 分钟
+            else:
+                step_interval = cfg.get("scan_interval_minutes", 5) * 60 # 常态交易时段：默认 5 分钟
+
+            if (time.time() - self._last_intraday_check) < (step_interval - 5):
+                return
+
+        self._last_intraday_check = time.time()
 
         watchlist = self.get_watchlist()
         active_tail_positions = tail_trade_tracker.get_active_positions()
@@ -368,6 +389,19 @@ class QuantScheduler2:
         track_limit = cfg.get("tail230_auto_track_top_n", 3)
         tail_trade_tracker.record_recommendations(candidates, limit=track_limit)
 
+    def run_morning_auction_snapshot(self):
+        """早盘 09:25:05 集合竞价撮合结束，执行官方开盘定价秒级感知与 2.30 战法高开止盈先手挂单"""
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return
+        cfg = load_config()
+        if not cfg.get("auction_snapshot_enabled", True):
+            return
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发 09:25:05 集合竞价秒级开盘定价感知扫描...")
+        # 强制立即执行一次自选股与持仓巡检，利用 09:25 官方撮合价提前锁定止盈/止损点位
+        self.run_intraday_check(force=True)
+
     def run_tail230_morning_plan(self):
         """早盘 09:28 集合竞价结束，触发『2.30 战法昨日持仓早盘操盘作战计划』预警"""
         now = datetime.now()
@@ -530,16 +564,28 @@ class QuantScheduler2:
         cfg = load_config()
         interval = cfg.get("scan_interval_minutes", 5)
 
-        # 1. 盘中巡检任务 (含自选股、持仓波段、日内做T与 2.30 次日卖出监控)
+        # 1. 盘中巡检引擎 (底层以 1 分钟基础心跳驱动，结合时段自适应动态提频至 60 秒或常态平稳巡检)
         self.scheduler.add_job(
             self.run_intraday_check,
             "interval",
-            minutes=interval,
+            minutes=1,
             id="intraday_check",
             replace_existing=True
         )
 
-        # 2. 次日早盘 09:28 集合竞价 2.30 战法操盘作战计划预警
+        # 2. 早盘 09:25:05 集合竞价官方开盘定价秒级感知任务
+        self.scheduler.add_job(
+            self.run_morning_auction_snapshot,
+            "cron",
+            day_of_week="mon-fri",
+            hour=9,
+            minute=25,
+            second=5,
+            id="morning_auction_snapshot",
+            replace_existing=True
+        )
+
+        # 3. 次日早盘 09:28 集合竞价 2.30 战法操盘作战计划预警
         self.scheduler.add_job(
             self.run_tail230_morning_plan,
             "cron",
