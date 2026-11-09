@@ -116,38 +116,41 @@ class BacktestEngineV2:
                 )
 
                 if should_exit:
-                    # 执行卖出 (开盘价或现价 + 滑点)
-                    exec_price = max(round(curr_close * (1.0 - self.slippage_rate), 2), 0.01)
-                    proceeds = shares * exec_price
+                    # 严防流动性幻觉：一字跌停封死时无流动性，现实中无法市价出逃，顺延至次日
+                    is_limit_down = (curr_high == curr_low) and (curr_open <= float(df_calc.iloc[i-1]['close']) * 0.905)
+                    if not is_limit_down:
+                        # 执行卖出 (开盘价或现价 + 滑点)
+                        exec_price = max(round(curr_close * (1.0 - self.slippage_rate), 2), 0.01)
+                        proceeds = shares * exec_price
 
-                    # 交易摩擦：印花税(万5) + 佣金(万2.5最低5元) + 过户费(万0.1)
-                    tax = proceeds * self.stamp_duty_rate
-                    comm = max(proceeds * self.commission_rate, self.min_commission)
-                    trans = proceeds * self.transfer_fee_rate
-                    total_fee = tax + comm + trans
-                    net_proceeds = proceeds - total_fee
+                        # 交易摩擦：印花税(万5) + 佣金(万2.5最低5元) + 过户费(万0.1)
+                        tax = proceeds * self.stamp_duty_rate
+                        comm = max(proceeds * self.commission_rate, self.min_commission)
+                        trans = proceeds * self.transfer_fee_rate
+                        total_fee = tax + comm + trans
+                        net_proceeds = proceeds - total_fee
 
-                    cash += net_proceeds
-                    ret_pct = round((exec_price - entry_price) / entry_price * 100.0, 2)
-                    pnl = net_proceeds - (shares * entry_price)
+                        cash += net_proceeds
+                        ret_pct = round((exec_price - entry_price) / entry_price * 100.0, 2)
+                        pnl = net_proceeds - (shares * entry_price)
 
-                    trades.append({
-                        "entry_date": trades[-1]["date"] if trades else date_str,
-                        "exit_date": date_str,
-                        "action": "SELL",
-                        "shares": shares,
-                        "entry_price": entry_price,
-                        "exit_price": exec_price,
-                        "return_pct": ret_pct,
-                        "pnl": round(pnl, 2),
-                        "fee": round(total_fee, 2),
-                        "reason": exit_reason,
-                        "is_oos": i >= oos_start_idx
-                    })
+                        trades.append({
+                            "entry_date": trades[-1]["date"] if trades else date_str,
+                            "exit_date": date_str,
+                            "action": "SELL",
+                            "shares": shares,
+                            "entry_price": entry_price,
+                            "exit_price": exec_price,
+                            "return_pct": ret_pct,
+                            "pnl": round(pnl, 2),
+                            "fee": round(total_fee, 2),
+                            "reason": exit_reason,
+                            "is_oos": i >= oos_start_idx
+                        })
 
-                    shares = 0
-                    entry_price = 0.0
-                    peak_price = 0.0
+                        shares = 0
+                        entry_price = 0.0
+                        peak_price = 0.0
 
             # ---------------- 2. T-1 日信号在 T 日开盘撮合成交 ----------------
             # 根据昨日收盘分析出的信号在今日开盘撮合

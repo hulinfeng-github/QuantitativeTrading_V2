@@ -513,11 +513,17 @@ class LimitUpEngine:
                         limit_target = round(buy_price * 1.10, 2)
                         is_consecutive = (next_close >= limit_target * 0.995) or (close_pnl >= 9.80)
 
+                        # 量化严谨结算：严格按真实实战盈亏判定，杜绝冲高回落大亏却因盘中微弱脉冲误判为WIN
                         if is_consecutive:
                             status = "WIN"
-                        elif high_pnl >= 2.0 or open_pnl >= 1.0:
+                        elif open_pnl >= 3.0:
+                            # 次日大幅高开，早盘集合竞价可直接全额兑现
                             status = "WIN"
-                        elif close_pnl <= -3.0:
+                        elif close_pnl > 0 and high_pnl >= 2.0:
+                            # 冲高且收盘守住红盘收益
+                            status = "WIN"
+                        elif close_pnl < 0:
+                            # 次日收盘浮亏，严格认定为亏损 (严禁把高开低走/冲高跳水吃大面粉饰为WIN)
                             status = "LOSS"
                         else:
                             status = "FLAT"

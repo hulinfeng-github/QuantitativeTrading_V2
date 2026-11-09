@@ -274,26 +274,38 @@ class TailStrategy230:
                 exit_reason = "次日平仓"
                 is_win = False
 
-                # 1. 优先判定早盘高开或冲高是否触及止盈价
+                # 严格因果时序判定（杜绝先涨后跌/日内乐观未来函数）
+                # 1. 优先判定集合竞价开盘跳空
                 if next_open >= target_p:
                     exit_price = next_open
                     exit_reason = "次日高开止盈"
                     is_win = True
-                elif next_high >= target_p:
-                    exit_price = target_p
-                    exit_reason = "次日冲高止盈"
-                    is_win = True
-                # 2. 判定是否触发硬止损
                 elif next_open <= stop_p:
                     exit_price = next_open
                     exit_reason = "次日低开止损"
                     is_win = False
+                # 2. 盘中波动研判：防未来函数双触及保守检验
+                elif next_high >= target_p and next_low <= stop_p:
+                    # 当日最高与最低均击穿止盈与止损线：基于开盘价位距离进行严谨保守因果研判
+                    # 若开盘离止损线更近，保守判定先触及止损平仓
+                    if (next_open - stop_p) <= (target_p - next_open):
+                        exit_price = stop_p
+                        exit_reason = "次日宽幅震荡先触止损"
+                        is_win = False
+                    else:
+                        exit_price = target_p
+                        exit_reason = "次日冲高止盈"
+                        is_win = True
+                elif next_high >= target_p:
+                    exit_price = target_p
+                    exit_reason = "次日冲高止盈"
+                    is_win = True
                 elif next_low <= stop_p:
                     exit_price = stop_p
                     exit_reason = "次日破位止损"
                     is_win = False
                 else:
-                    # 3. 正常次日平仓
+                    # 3. 正常次日收盘平仓
                     exit_price = next_close
                     exit_reason = "次日收盘平仓"
                     is_win = (exit_price > buy_price)

@@ -147,7 +147,15 @@ class ReviewEngineV2:
         except Exception:
             signals = []
 
-        buy_signals = [s for s in signals if s.get("signal_type") in ["BUY", "BUY_T"]]
+        # 过滤掉测试代码中产生的虚构标的或测试标识，杜绝污染历史实盘胜率统计
+        buy_signals = [
+            s for s in signals 
+            if s.get("signal_type") in ["BUY", "BUY_T"]
+            and not str(s.get("symbol", "")).startswith("sz99")
+            and not str(s.get("symbol", "")).startswith("sh99")
+            and s.get("symbol") != "sz002999"
+            and "test" not in str(s.get("symbol", "")).lower()
+        ]
         if not buy_signals:
             return {"total_signals": 0, "win_rate": 55.0, "avg_return": 1.2, "details": []}
 
@@ -182,9 +190,29 @@ class ReviewEngineV2:
                     hit_target = False
                     hit_stop = False
                     for _, bar in window_bars.iterrows():
+                        b_open = float(bar['open'])
                         b_high = float(bar['high'])
                         b_low = float(bar['low'])
-                        if b_high >= target_p:
+
+                        # 严格因果判定：优先判定集合竞价开盘跳空
+                        if b_open >= target_p:
+                            hit_target = True
+                            cur_p = b_open
+                            break
+                        elif b_open <= stop_p:
+                            hit_stop = True
+                            cur_p = b_open
+                            break
+                        elif b_high >= target_p and b_low <= stop_p:
+                            # 严谨防未来函数：同日双触及时，基于离开盘价位距离保守判定
+                            if (b_open - stop_p) <= (target_p - b_open):
+                                hit_stop = True
+                                cur_p = stop_p
+                            else:
+                                hit_target = True
+                                cur_p = target_p
+                            break
+                        elif b_high >= target_p:
                             hit_target = True
                             cur_p = target_p
                             break
@@ -194,10 +222,10 @@ class ReviewEngineV2:
                             break
 
                     if hit_target:
-                        ret_pct = round((target_p - rec_p) / rec_p * 100.0, 2)
+                        ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
                         is_win = True
                     elif hit_stop:
-                        ret_pct = round((stop_p - rec_p) / rec_p * 100.0, 2)
+                        ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
                         is_win = False
                     else:
                         if len(after_bars) > 5:
@@ -252,22 +280,36 @@ class ReviewEngineV2:
         old_rsrs_buy = cfg.get("rsrs_buy_threshold", 0.70)
         old_atr_stop = cfg.get("atr_stop_multiplier", 2.0)
 
+        # 基准健康锚定值 (用于震荡市弹性回归，彻底消除单向棘轮死锁效应)
+        DEFAULT_RSRS_BUY = 0.70
+        DEFAULT_ATR_STOP = 2.0
+
         new_rsrs_buy = old_rsrs_buy
         new_atr_stop = old_atr_stop
         reasons = []
 
-        # 胜率过低或熊市杀跌：提高门槛防守
+        # 1. 弱势/熊市杀跌或胜率过低：上调买入门槛以过滤假突破，同时严格【收紧止损】以控制单笔最大回撤
         if win_rate < 45.0 or "杀跌" in market_regime or "空头" in market_regime:
             new_rsrs_buy = min(round(old_rsrs_buy + 0.05, 2), 0.85)
-            new_atr_stop = min(round(old_atr_stop + 0.2, 1), 2.5)
-            reasons.append(f"近期胜率({win_rate}%)偏弱且大盘处于{market_regime}，上调买入门槛至 {new_rsrs_buy}，加宽防守缓冲")
-        # 胜率极高且大盘强势多头：适度放宽捕捉主升浪
+            # 量化风控严谨性纠偏：弱市严禁加宽止损抗单！必须收紧 ATR 防守倍数 (1.5 ~ 1.8)
+            new_atr_stop = max(round(old_atr_stop - 0.2, 1), 1.6)
+            reasons.append(f"近期胜率({win_rate}%)偏弱且大盘处于{market_regime}，上调买入门槛至 {new_rsrs_buy} 严防诱多，并收紧ATR止损至 {new_atr_stop}x 保留本金")
+        # 2. 强多头牛市且胜率极高：适度下调买入门槛捕捉起爆主升，适当放宽ATR止损让利润奔跑
         elif win_rate >= 65.0 and ("强多头" in market_regime or "牛市" in market_regime):
             new_rsrs_buy = max(round(old_rsrs_buy - 0.05, 2), 0.65)
-            new_atr_stop = max(round(old_atr_stop - 0.1, 1), 1.8)
-            reasons.append(f"近期胜率高({win_rate}%)且处于强多头环境，下调准入门槛至 {new_rsrs_buy} 激活捕捉起爆机会")
+            new_atr_stop = min(round(old_atr_stop + 0.1, 1), 2.2)
+            reasons.append(f"近期胜率高({win_rate}%)且处于强多头环境，下调买入门槛至 {new_rsrs_buy} 激活追击起爆，放宽ATR止损至 {new_atr_stop}x 顺应主升波段")
+        # 3. 正常震荡市或中性状态：引入均值回归弹性衰减机制 (Mean-Reverting Decay)，打破单向死锁
         else:
-            reasons.append(f"当前市场处于{market_regime}，参数保持稳健适中配置")
+            if abs(old_rsrs_buy - DEFAULT_RSRS_BUY) > 0.01 or abs(old_atr_stop - DEFAULT_ATR_STOP) > 0.05:
+                # 逐步向基准锚点平滑回归 35%
+                new_rsrs_buy = round(old_rsrs_buy + (DEFAULT_RSRS_BUY - old_rsrs_buy) * 0.35, 2)
+                new_atr_stop = round(old_atr_stop + (DEFAULT_ATR_STOP - old_atr_stop) * 0.35, 1)
+                reasons.append(f"当前市场处于{market_regime}，触发弹性衰减均值回归：买入门槛由 {old_rsrs_buy} 回归至 {new_rsrs_buy}，止损倍数回归至 {new_atr_stop}x")
+            else:
+                new_rsrs_buy = DEFAULT_RSRS_BUY
+                new_atr_stop = DEFAULT_ATR_STOP
+                reasons.append(f"当前市场处于{market_regime}，参数保持基准稳健配置 (RSRS={new_rsrs_buy}, ATR={new_atr_stop}x)")
 
         changed = (new_rsrs_buy != old_rsrs_buy) or (new_atr_stop != old_atr_stop)
 

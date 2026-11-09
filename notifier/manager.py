@@ -345,6 +345,13 @@ class NotificationManager:
 
     def _record_signal_history(self, signal: Dict[str, Any]):
         try:
+            sym = str(signal.get("symbol", "")).strip().lower()
+            # 过滤单元测试产生的虚构标的或测试标识，杜绝污染历史实盘胜率统计
+            if not sym or "test" in sym or sym == "sz002999" or sym.startswith("sz99") or sym.startswith("sh99"):
+                return
+            if signal.get("is_test"):
+                return
+
             history = []
             if SIGNALS_FILE.exists():
                 with open(SIGNALS_FILE, "r", encoding="utf-8") as f:

@@ -187,9 +187,9 @@ class T0SmartEngine:
             if len(df_minute) >= 15:
                 prices = df_minute['price'].values
                 std_intraday = float(np.std(prices) / vwap * 100.0)
-                band_offset = max(1.2, min(std_intraday * 1.5, 3.5))
+                band_offset = max(1.0, min(std_intraday * 1.2, 2.5))
                 if is_etf:
-                    band_offset = max(0.6, min(std_intraday * 1.2, 2.0))
+                    band_offset = max(0.5, min(std_intraday * 1.0, 1.8))
                 dyn_lower = round_price_dynamic(vwap * (1.0 - band_offset / 100.0), symbol)
                 dyn_upper = round_price_dynamic(vwap * (1.0 + band_offset / 100.0), symbol)
 
@@ -286,11 +286,11 @@ class T0SmartEngine:
         else:
             # 4. 未开仓状态：研判是否触发新做T买点/卖点
             if bias <= bias_buy_thresh and (current_price <= dyn_lower):
-                # 判定是否为空头强压制 (若负偏离达 1.4 倍买入阈值以上，属于日内急跌恐慌深蹲，允许超跌做正T反弹)
-                is_oversold_bounce = (bias <= bias_buy_thresh * 1.4)
+                # 判定是否为空头强压制 (若负偏离达 1.15 倍买入阈值以上，属于日内急跌恐慌深蹲，允许超跌做正T反弹)
+                is_oversold_bounce = (bias <= bias_buy_thresh * 1.15)
                 if trend_direction == "BEAR" and not is_oversold_bounce:
                     signal_desc = "空头趋势压制·严禁接飞刀"
-                    reasons.append(f"标的处于MA20空头通道且负偏离({bias:.2f}%)未达恐慌超跌线({bias_buy_thresh*1.4:.2f}%)，禁止开仓")
+                    reasons.append(f"标的处于MA20空头通道且负偏离({bias:.2f}%)未达恐慌超跌线({bias_buy_thresh*1.15:.2f}%)，禁止开仓")
                 else:
                     signal_action = "BUY_T"
                     if trend_direction == "BEAR" and is_oversold_bounce:
@@ -322,15 +322,21 @@ class T0SmartEngine:
 
             # 倒T高抛信号：当前价格冲高突破分时均线正偏离阈值
             elif bias >= bias_sell_thresh and (current_price >= dyn_upper):
-                if trend_direction == "BULL":
-                    signal_desc = "多头主升·严禁倒T防抛飞"
-                    reasons.append("标的高处于MA20多头主升通道，倒T高抛极易卖飞强势核心牛股")
+                is_extreme_pulse = (bias >= bias_sell_thresh * 1.35)
+                if trend_direction == "BULL" and not is_extreme_pulse:
+                    signal_desc = "多头主升·严禁盲目倒T防抛飞"
+                    reasons.append(f"标的高处于MA20多头主升通道，正偏离({bias:.2f}%)未达极端冲高脉冲线({bias_sell_thresh*1.35:.2f}%)，防范卖飞牛股")
                 else:
                     signal_action = "SELL_T"
-                    signal_desc = "⚡ 倒T高抛机会触发"
+                    if trend_direction == "BULL" and is_extreme_pulse:
+                        signal_desc = "⚡ 多头极端脉冲·倒T高抛锁定"
+                        reasons.append(f"多头趋势中分时出现极端急拉脉冲，正偏离达 +{bias:.2f}%，触及动态上轨({dyn_upper}元)，适合高抛锁定超额并在回踩时买回")
+                    else:
+                        signal_desc = "⚡ 倒T高抛机会触发"
+                        reasons.append(f"现价冲高偏离分时均价({vwap}元)达 +{bias:.2f}%，触及动态布林上轨({dyn_upper}元)，适合高抛后低吸回补")
+
                     suggested_stop = round_price_dynamic(current_price * (1.0 + stop_pct / 100.0), symbol)
                     suggested_target = round_price_dynamic(min(vwap * 0.995, current_price * (1.0 - take_profit_pct / 100.0)), symbol)
-                    reasons.append(f"现价冲高偏离分时均价({vwap}元)达 +{bias:.2f}%，触及动态布林上轨({dyn_upper}元)，适合高抛后低吸回补")
 
                     active_dir = "SELL_T"
                     active_target = suggested_target
