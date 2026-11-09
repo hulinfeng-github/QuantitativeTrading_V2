@@ -184,13 +184,13 @@ class QuantScheduler2:
         cur_hm = datetime.now().strftime("%H:%M")
         if "14:45" <= cur_hm <= "14:55":
             eod_sigs = t0_smart_engine.check_eod_unclosed_positions()
-            for es in eod_sigs:
-                notification_manager.send_signal(es)
+            if eod_sigs:
+                notification_manager.send_signals_batch(eod_sigs)
 
         # 5. 检查 2.30 战法昨日买入标的的次日卖出与平仓预警 (冲高止盈 / 破位止损 / 早盘衰竭 / 尾盘清仓)
         tail_exits = tail_trade_tracker.check_next_day_exits(quotes)
-        for tx in tail_exits:
-            notification_manager.send_signal(tx)
+        if tail_exits:
+            notification_manager.send_signals_batch(tail_exits)
 
     def run_market_scan_async(self, limit: int = 100, notify: bool = True):
         """异步执行全市场主板智能精选"""
@@ -416,8 +416,8 @@ class QuantScheduler2:
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动尾盘未闭环做T头寸强制平仓/底仓抉择审查...")
         signals = t0_smart_engine.check_eod_unclosed_positions()
-        for sig in signals:
-            notification_manager.send_signal(sig)
+        if signals:
+            notification_manager.send_signals_batch(signals)
 
     def run_limit_up_intraday_scan(self):
         """盘中游资打板量化扫描与精选个股通知推送 (自动记录实战跟踪账本并发送保姆级新手操盘卡片)"""

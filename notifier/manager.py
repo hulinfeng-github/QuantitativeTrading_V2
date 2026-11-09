@@ -133,6 +133,117 @@ class NotificationManager:
 
         return results
 
+    def send_signals_batch(self, signals: List[Dict[str, Any]], force: bool = False) -> Dict[str, Any]:
+        """
+        批量发送一组交易信号
+        - 自动按目标 Webhook 分组聚合为合并卡片发送
+        - 大幅缩减外发请求频次，从根源规避钉钉 20条/分 频控限制与群消息刷屏
+        """
+        if not signals:
+            return {"total": 0, "sent": 0, "skipped": 0, "dingtalk": False, "wechat": False}
+
+        cfg = load_config()
+        today = datetime.now().strftime("%Y-%m-%d")
+        from core.t0_group_manager import t0_group_manager
+
+        # 1. 过滤已发送去重缓存
+        filtered_signals = []
+        skipped_count = 0
+        for s in signals:
+            sym = s.get("symbol", "")
+            st = s.get("signal_type", "")
+            ck = f"{sym}_{st}_{today}"
+            if not force and ck in self._sent_cache:
+                skipped_count += 1
+                continue
+            filtered_signals.append(s)
+
+        if not filtered_signals:
+            return {"total": len(signals), "sent": 0, "skipped": skipped_count, "dingtalk": False, "wechat": False}
+
+        # 2. 按目标钉钉 Webhook 归集信号: (webhook, secret, group_name) -> list of signals
+        dt_targets: Dict[Any, List[Dict[str, Any]]] = {}
+
+        for sig in filtered_signals:
+            sym = sig.get("symbol", "")
+            sig_type = sig.get("signal_type", "")
+            module_key = self._get_signal_module_key(sig_type)
+
+            if sig_type == "LIMIT_UP":
+                subscribed = t0_group_manager.get_groups_subscribed_to("push_limitup")
+                for grp in subscribed:
+                    hook = (grp.get("dingtalk_webhook") or "").strip()
+                    sec = (grp.get("dingtalk_secret") or "").strip()
+                    if hook:
+                        gname = grp.get("name", "")
+                        dt_targets.setdefault((hook, sec, gname), []).append(sig)
+                if cfg.get("dingtalk_enabled") and cfg.get("dingtalk_webhook"):
+                    ghook = cfg.get("dingtalk_webhook").strip()
+                    gsec = cfg.get("dingtalk_secret", "").strip()
+                    if ghook:
+                        dt_targets.setdefault((ghook, gsec, "全局默认"), []).append(sig)
+            else:
+                target_groups = t0_group_manager.get_groups_for_stock(sym) if sym else []
+                if target_groups:
+                    for grp in target_groups:
+                        if not grp.get("enabled", True):
+                            continue
+                        if not grp.get(module_key, True):
+                            continue
+                        hook = (grp.get("dingtalk_webhook") or "").strip()
+                        sec = (grp.get("dingtalk_secret") or "").strip()
+                        if not hook and cfg.get("dingtalk_enabled") and cfg.get("dingtalk_webhook"):
+                            hook = cfg.get("dingtalk_webhook").strip()
+                            sec = cfg.get("dingtalk_secret", "").strip()
+                        if hook:
+                            gname = grp.get("name", "")
+                            dt_targets.setdefault((hook, sec, gname), []).append(sig)
+                else:
+                    if cfg.get("dingtalk_enabled") and cfg.get("dingtalk_webhook"):
+                        ghook = cfg.get("dingtalk_webhook").strip()
+                        gsec = cfg.get("dingtalk_secret", "").strip()
+                        if ghook:
+                            dt_targets.setdefault((ghook, gsec, "全局默认"), []).append(sig)
+
+        # 3. 逐个 Webhook 进行聚合卡片或单卡片推送 (经由滑动时间窗口平滑限流保护)
+        dt_sent = False
+        for (hook, sec, gname), sig_list in dt_targets.items():
+            dt = DingTalkNotifier(webhook=hook, secret=sec)
+            if len(sig_list) == 1:
+                sig_copy = sig_list[0].copy()
+                if gname and gname != "全局默认":
+                    sig_copy["group_name"] = gname
+                if dt.send_trade_signal(sig_copy):
+                    dt_sent = True
+            else:
+                if dt.send_batch_signals(sig_list, group_name=gname if gname != "全局默认" else ""):
+                    dt_sent = True
+
+        # 4. 微信渠道推送
+        wx_sent = False
+        if cfg.get("wechat_enabled") and cfg.get("wechat_token"):
+            wx = WeChatNotifier(provider=cfg.get("wechat_provider", "pushplus"), token=cfg.get("wechat_token"))
+            for s in filtered_signals:
+                if wx.send_trade_signal(s):
+                    wx_sent = True
+
+        # 5. 更新去重缓存与历史持久化
+        for s in filtered_signals:
+            sym = s.get("symbol", "")
+            st = s.get("signal_type", "")
+            if dt_sent or wx_sent:
+                self._sent_cache.add(f"{sym}_{st}_{today}")
+            if st and st not in ["HOLD", "HOLDING", "HOLD_T", "HOLDING_T"]:
+                self._record_signal_history(s)
+
+        return {
+            "total": len(signals),
+            "sent": len(filtered_signals),
+            "skipped": skipped_count,
+            "dingtalk": dt_sent,
+            "wechat": wx_sent
+        }
+
     def send_markdown(
         self,
         title: str,
@@ -192,6 +303,45 @@ class NotificationManager:
             wx = WeChatNotifier(provider=cfg.get("wechat_provider", "pushplus"), token=cfg.get("wechat_token"))
             results["wechat"] = wx.send_markdown(title, text)
         return results
+
+    def get_dingtalk_status(self) -> Dict[str, Any]:
+        """获取系统配置的所有钉钉机器人 Webhook 的实时频控状态与配额数据"""
+        from notifier.dingtalk import dingtalk_rate_limiter
+        from core.t0_group_manager import t0_group_manager
+        cfg = load_config()
+
+        status_list = []
+        seen_keys = set()
+
+        # 全局机器人
+        if cfg.get("dingtalk_webhook"):
+            hook = cfg.get("dingtalk_webhook").strip()
+            st = dingtalk_rate_limiter.get_status(hook)
+            st["name"] = "全局默认机器人"
+            st["enabled"] = bool(cfg.get("dingtalk_enabled", False))
+            status_list.append(st)
+            seen_keys.add(st["key"])
+
+        # 各分组机器人
+        groups = t0_group_manager.get_groups(include_stocks=False)
+        for grp in groups:
+            hook = (grp.get("dingtalk_webhook") or "").strip()
+            if hook:
+                st = dingtalk_rate_limiter.get_status(hook)
+                if st["key"] not in seen_keys:
+                    st["name"] = f"分组: {grp.get('name', '未命名')}"
+                    st["enabled"] = bool(grp.get("enabled", True))
+                    status_list.append(st)
+                    seen_keys.add(st["key"])
+
+        return {
+            "status": "ok",
+            "max_requests_per_minute": dingtalk_rate_limiter.MAX_REQUESTS_PER_MINUTE,
+            "window_seconds": dingtalk_rate_limiter.WINDOW_SECONDS,
+            "min_interval_seconds": dingtalk_rate_limiter.MIN_INTERVAL_SECONDS,
+            "cooldown_on_error_seconds": dingtalk_rate_limiter.COOLDOWN_ON_ERROR,
+            "webhooks": status_list
+        }
 
     def _record_signal_history(self, signal: Dict[str, Any]):
         try:

@@ -116,6 +116,11 @@ def test_notification():
     res = notification_manager.send_signal(test_signal, force=True)
     return {"success": res["dingtalk"] or res["wechat"], "details": res}
 
+@app.get("/api/dingtalk/status")
+def get_dingtalk_status():
+    """获取钉钉推送通道的实时频控状态与配额监控数据"""
+    return notification_manager.get_dingtalk_status()
+
 @app.get("/api/watchlist")
 def get_watchlist():
     """获取自选股清单与实时行情、多因子评分、持仓盈亏"""

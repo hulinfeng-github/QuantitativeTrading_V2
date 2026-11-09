@@ -440,7 +440,7 @@ class TestAStockQuantSystemV2(unittest.TestCase):
             "dingtalk_secret": "SEC_UNIT_TEST_SECRET",
             "enabled": True,
             "notes": "单元测试专用科技组",
-            "stock_symbols": ["sz002156"]
+            "stock_symbols": ["sz002999"]
         }
         saved_grp = t0_group_manager.save_group(grp_data)
         self.assertIsNotNone(saved_grp)
@@ -449,10 +449,10 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         print(f"  -> 做T分组创建通过: ID={grp_id}, 名称={saved_grp['name']}")
 
         # 2. 验证标的分组映射精准性
-        assigned_grp = t0_group_manager.get_group_for_stock("sz002156")
+        assigned_grp = t0_group_manager.get_group_for_stock("sz002999")
         self.assertIsNotNone(assigned_grp)
         self.assertEqual(assigned_grp["id"], grp_id)
-        print("  -> 标的与做T分组精准双向绑定通过 (sz002156 -> 自动化测试科技组)")
+        print("  -> 标的与做T分组精准双向绑定通过 (sz002999 -> 自动化测试科技组)")
 
         # 3. 验证做T信号推送到对应分组的钉钉机器人
         nm = NotificationManager()
@@ -461,7 +461,7 @@ class TestAStockQuantSystemV2(unittest.TestCase):
             mock_dt_inst.send_trade_signal.return_value = True
 
             sig_t = {
-                "symbol": "sz002156",
+                "symbol": "sz002999",
                 "name": "通富微电",
                 "signal_type": "BUY_T",
                 "signal_desc": "正T低吸机会触发",

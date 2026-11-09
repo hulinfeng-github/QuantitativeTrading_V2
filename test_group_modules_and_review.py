@@ -259,6 +259,7 @@ class TestGroupModulesAndReview(unittest.TestCase):
 
     def test_06_overlapping_groups_and_routing(self):
         """测试不同分组股票重合（非互斥）与多群信号路由分流"""
+        t0_group_manager._save_raw_groups([])
         # 准备自选池测试数据
         t0_group_manager._save_watchlist([
             {"symbol": "sz002156", "name": "通富微电", "holding_cost": 22.0, "holding_shares": 1000},
