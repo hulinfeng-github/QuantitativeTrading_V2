@@ -1,5 +1,8 @@
 fastapi>=0.100.0
 uvicorn>=0.22.0
+watchfiles>=0.20.0
+httpx>=0.25.0
+pillow>=10.0.0
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0

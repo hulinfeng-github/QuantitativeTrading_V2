@@ -237,6 +237,54 @@ def add_to_watchlist(item: Dict[str, Any]):
 
     return {"success": True, "message": f"成功添加 {name} 至自选池", "item": new_item}
 
+@app.put("/api/watchlist/{symbol}")
+@app.post("/api/watchlist/{symbol}")
+def update_watchlist_item(symbol: str, data: Dict[str, Any] = Body(...)):
+    """更新自选股持仓成本、持股数量、所属做T分组及备注信息"""
+    sym = data_engine.format_symbol(symbol)
+    if not WATCHLIST_FILE.exists():
+        raise HTTPException(status_code=404, detail="自选池为空")
+
+    try:
+        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+            items = json.load(f)
+
+        found = False
+        target_item = None
+        for it in items:
+            if it.get("symbol") == sym:
+                found = True
+                if "holding_cost" in data:
+                    it["holding_cost"] = max(0.0, float(data["holding_cost"]))
+                if "holding_shares" in data:
+                    it["holding_shares"] = max(0, int(data["holding_shares"]))
+                if "notes" in data:
+                    it["notes"] = str(data["notes"]).strip()
+                if "group_id" in data:
+                    gid = str(data["group_id"]).strip()
+                    it["group_id"] = gid
+                    t0_group_manager.set_stock_group(sym, gid)
+                if "t0_enabled" in data:
+                    it["t0_enabled"] = bool(data["t0_enabled"])
+                target_item = it
+                break
+
+        if not found:
+            raise HTTPException(status_code=404, detail=f"自选池中未找到标的 {sym}")
+
+        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+
+        return {
+            "success": True,
+            "message": f"已成功更新 {target_item.get('name', sym)} 的持仓信息",
+            "item": target_item
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/api/watchlist/{symbol}")
 def delete_from_watchlist(symbol: str):
     sym = data_engine.format_symbol(symbol)

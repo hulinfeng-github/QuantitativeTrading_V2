@@ -406,12 +406,13 @@ function renderWatchlistTable(items) {
         <td>${groupDisplay}</td>
         <td>${formatStockPrice(it.current_price)}</td>
         <td>${formatPct(it.change_pct)}</td>
-        <td>${it.holding_cost > 0 ? formatStockPrice(it.holding_cost) : '-'}</td>
-        <td>${it.holding_shares > 0 ? it.holding_shares : '-'}</td>
+        <td style="cursor: pointer;" onclick="openEditWatchlistModal('${it.symbol}')" title="点击快速修改持仓成本与股数">${it.holding_cost > 0 ? formatStockPrice(it.holding_cost) : '<span style="color: var(--text-dim); font-size: 12px;">未设 ✏️</span>'}</td>
+        <td style="cursor: pointer;" onclick="openEditWatchlistModal('${it.symbol}')" title="点击快速修改持仓成本与股数">${it.holding_shares > 0 ? it.holding_shares : '<span style="color: var(--text-dim); font-size: 12px;">0 ✏️</span>'}</td>
         <td>${it.holding_cost > 0 ? formatPct(it.pnl_pct) : '-'}</td>
         <td>${it.holding_cost > 0 ? `<span class="${it.pnl_val >= 0 ? 'text-up' : 'text-down'}">${it.pnl_val > 0 ? '+' : ''}${it.pnl_val.toFixed(2)}元</span>` : '-'}</td>
         <td>
           <button class="btn btn-secondary btn-sm" onclick="openStockDiagnose('${it.symbol}')">诊断</button>
+          <button class="btn btn-primary btn-sm" onclick="openEditWatchlistModal('${it.symbol}')" title="修改持仓成本与持股数">✏️ 修改</button>
           <button class="btn btn-secondary btn-sm" style="color: #ef4444;" onclick="deleteWatchlist('${it.symbol}')">删除</button>
         </td>
       </tr>
@@ -479,6 +480,56 @@ async function submitAddWatchlist() {
     }
   } catch (e) {
     alert("提交异常: " + e);
+  }
+}
+
+function openEditWatchlistModal(symbol) {
+  const item = (cachedWatchlistRaw || []).find(x => (x.symbol || "").toLowerCase() === (symbol || "").toLowerCase());
+  if (!item) return;
+
+  document.getElementById("editWatchSymbol").value = item.symbol;
+  document.getElementById("editWatchTitle").innerHTML = `✏️ 修改持仓 - <strong>${item.name}</strong> <span style="font-size: 13px; color: var(--text-dim);">(${item.symbol})</span>`;
+  document.getElementById("editWatchCost").value = (item.holding_cost && item.holding_cost > 0) ? item.holding_cost : "";
+  document.getElementById("editWatchShares").value = (item.holding_shares && item.holding_shares > 0) ? item.holding_shares : "";
+  document.getElementById("editWatchNotes").value = item.notes || "";
+
+  updateGroupSelectDropdowns(item.group_id);
+  document.getElementById("editWatchModal").style.display = "flex";
+}
+
+function hideEditWatchlistModal() {
+  document.getElementById("editWatchModal").style.display = "none";
+}
+
+async function submitEditWatchlist() {
+  const symbol = document.getElementById("editWatchSymbol").value;
+  const cost = parseFloat(document.getElementById("editWatchCost").value) || 0.0;
+  const shares = parseInt(document.getElementById("editWatchShares").value) || 0;
+  const groupId = document.getElementById("editWatchGroup") ? document.getElementById("editWatchGroup").value : "";
+  const notes = document.getElementById("editWatchNotes").value.trim();
+
+  try {
+    const res = await fetch(`/api/watchlist/${symbol}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        holding_cost: cost,
+        holding_shares: shares,
+        group_id: groupId,
+        notes: notes
+      })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      hideEditWatchlistModal();
+      await loadGroups();
+      await loadWatchlist();
+      await loadT0Monitor();
+    } else {
+      alert("保存持仓失败: " + (data.detail || "未知错误"));
+    }
+  } catch (e) {
+    alert("请求异常: " + e);
   }
 }
 
@@ -668,14 +719,24 @@ function updateSettingsGroupSummary() {
   el.innerHTML = `已配置 <strong>${cachedGroups.length}</strong> 个做T分组（<strong>${enabledCount}</strong> 个启用），共覆盖 <strong>${totalStocks}</strong> 只标的。`;
 }
 
-function updateGroupSelectDropdowns() {
-  const sel = document.getElementById("addStockGroup");
-  if (!sel) return;
-  let html = `<option value="">未指定 (使用默认钉钉群)</option>`;
-  cachedGroups.forEach(g => {
-    html += `<option value="${g.id}">${g.name} (${g.stock_count || 0}只标的)</option>`;
-  });
-  sel.innerHTML = html;
+function updateGroupSelectDropdowns(selectedEditGid = "") {
+  const selAdd = document.getElementById("addStockGroup");
+  if (selAdd) {
+    let html = `<option value="">未指定 (使用默认钉钉群)</option>`;
+    (cachedGroups || []).forEach(g => {
+      html += `<option value="${g.id}">${g.name} (${g.stock_count || 0}只标的)</option>`;
+    });
+    selAdd.innerHTML = html;
+  }
+  const selEdit = document.getElementById("editWatchGroup");
+  if (selEdit) {
+    let html = `<option value="">未指定 (使用默认钉钉群)</option>`;
+    (cachedGroups || []).forEach(g => {
+      const selected = (g.id === selectedEditGid) ? "selected" : "";
+      html += `<option value="${g.id}" ${selected}>${g.name} (${g.stock_count || 0}只标的)</option>`;
+    });
+    selEdit.innerHTML = html;
+  }
 }
 
 function renderGroupFilterBars() {

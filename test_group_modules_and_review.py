@@ -354,5 +354,31 @@ class TestGroupModulesAndReview(unittest.TestCase):
         self.assertIn("洛阳钼业", report_b)
         self.assertNotIn("洛阳钼业", report_a)
 
+    def test_07_edit_watchlist_cost_and_shares(self):
+        """测试在 Web API 中手动修改持股数与持仓成本功能"""
+        from web.app import update_watchlist_item, get_watchlist
+        t0_group_manager._save_watchlist([
+            {"symbol": "sh600519", "name": "贵州茅台", "holding_cost": 1600.0, "holding_shares": 100, "notes": "老底仓"}
+        ])
+
+        # 1. 模拟用户通过界面将成本修改为 1750.50，持股数修改为 300
+        res = update_watchlist_item("sh600519", {
+            "holding_cost": 1750.50,
+            "holding_shares": 300,
+            "notes": "加仓后成本"
+        })
+        self.assertTrue(res["success"])
+        self.assertEqual(res["item"]["holding_cost"], 1750.50)
+        self.assertEqual(res["item"]["holding_shares"], 300)
+        self.assertEqual(res["item"]["notes"], "加仓后成本")
+
+        # 2. 读取自选池检验数据持久化与实时盈亏计算
+        wl = get_watchlist()
+        target = next((x for x in wl if x["symbol"] == "sh600519"), None)
+        self.assertIsNotNone(target)
+        self.assertEqual(target["holding_cost"], 1750.50)
+        self.assertEqual(target["holding_shares"], 300)
+        self.assertEqual(target["notes"], "加仓后成本")
+
 if __name__ == "__main__":
     unittest.main()
