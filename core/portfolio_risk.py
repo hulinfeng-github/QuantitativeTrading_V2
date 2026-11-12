@@ -84,6 +84,26 @@ class PortfolioRiskManager:
             "scope": "watchlist holdings only"
         }
 
+    @staticmethod
+    def resolve_available_shares(item: Dict[str, Any]) -> int:
+        """
+        解析「当日可卖股数」：
+        - 显式填写 available_shares 时采用其值（限制在 0~总持仓之间）；
+        - 未填该字段时默认等于总持仓，视为前日持仓可全部卖出；
+        - 当日新买入的标的请显式把 available_shares 设为可卖数量（T+1 锁定部分填 0）。
+        """
+        try:
+            holding = max(0, int(item.get("holding_shares") or item.get("shares") or 0))
+        except (TypeError, ValueError):
+            holding = 0
+        if "available_shares" in item and item.get("available_shares") is not None:
+            try:
+                avail = max(0, int(item.get("available_shares")))
+            except (TypeError, ValueError):
+                return holding
+            return min(avail, holding)
+        return holding
+
     def calculate_position_size(
         self,
         symbol: str,

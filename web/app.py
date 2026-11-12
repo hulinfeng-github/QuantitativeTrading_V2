@@ -29,6 +29,18 @@ from notifier.manager import notification_manager
 from scheduler.task_runner import quant_scheduler2
 from core.t0_group_manager import t0_group_manager
 
+
+def _resolve_available_from_payload(raw_value, holding_shares):
+    """写入时解析当日可卖股数：未提供(None)默认等于总持仓，否则限制在 [0, 总持仓]。"""
+    holding = max(0, int(holding_shares or 0))
+    if raw_value is None:
+        return holding
+    try:
+        return min(max(0, int(raw_value)), holding)
+    except (TypeError, ValueError):
+        return holding
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = load_config()
@@ -171,7 +183,7 @@ def get_watchlist():
             "name": name,
             "holding_cost": cost,
             "holding_shares": shares,
-            "available_shares": int(it.get('available_shares') or 0),
+            "available_shares": portfolio_risk.resolve_available_shares(it),
             "current_price": cur_p,
             "change_pct": chg_pct,
             "turnover": q.get('turnover', 0.0),
@@ -213,10 +225,10 @@ def add_to_watchlist(item: Dict[str, Any]):
         if it.get("symbol") == sym:
             it["holding_cost"] = float(item.get("holding_cost", it.get("holding_cost", 0.0)))
             it["holding_shares"] = int(item.get("holding_shares", it.get("holding_shares", 0)))
-            it["available_shares"] = min(
-                int(item.get("available_shares", it.get("available_shares", 0)) or 0),
-                max(0, it["holding_shares"])
-            )
+            raw_avail = item.get("available_shares")
+            if raw_avail is None:
+                raw_avail = it.get("available_shares")
+            it["available_shares"] = _resolve_available_from_payload(raw_avail, it["holding_shares"])
             it["notes"] = item.get("notes", it.get("notes", ""))
             if "group_id" in item:
                 it["group_id"] = group_id
@@ -232,9 +244,8 @@ def add_to_watchlist(item: Dict[str, Any]):
         "name": name,
         "holding_cost": float(item.get("holding_cost", 0.0)),
         "holding_shares": int(item.get("holding_shares", 0)),
-        "available_shares": min(
-            max(0, int(item.get("available_shares", 0) or 0)),
-            max(0, int(item.get("holding_shares", 0) or 0))
+        "available_shares": _resolve_available_from_payload(
+            item.get("available_shares"), item.get("holding_shares", 0)
         ),
         "notes": item.get("notes", ""),
         "group_id": group_id,
@@ -269,6 +280,9 @@ def update_watchlist_item(symbol: str, data: Dict[str, Any] = Body(...)):
                     it["holding_shares"] = max(0, int(data["holding_shares"]))
                 if "available_shares" in data:
                     it["available_shares"] = max(0, int(data["available_shares"]))
+                elif it.get("available_shares") is None:
+                    # 未显式填写过可卖数量时，默认沿用总持仓
+                    it["available_shares"] = it.get("holding_shares", 0)
                 it["available_shares"] = min(
                     max(0, int(it.get("available_shares", 0) or 0)),
                     max(0, int(it.get("holding_shares", 0) or 0))
@@ -355,7 +369,7 @@ def get_t0_monitor():
         name = it.get('name', sym)
         cost = float(it.get('holding_cost') or it.get('entry_price') or 0.0)
         shares = int(it.get('holding_shares') or it.get('shares') or 0)
-        available_shares = min(int(it.get('available_shares') or 0), shares)
+        available_shares = portfolio_risk.resolve_available_shares(it)
 
         q = quotes.get(sym, {})
         cur_p = q.get('price', 0.0)

@@ -23,6 +23,7 @@ from core.multi_factor_strategy import multi_factor_strategy
 from core.t0_smart_engine import t0_smart_engine
 from core.review_engine_v2 import review_engine_v2
 from core.strategy_tail_230 import tail_strategy_230, tail_trade_tracker
+from core.portfolio_risk import portfolio_risk
 from notifier.manager import notification_manager
 
 def set_windows_sleep_prevention(enable: bool = True):
@@ -132,7 +133,7 @@ class QuantScheduler2:
                 name = item.get('name', sym)
                 cost = float(item.get('holding_cost') or item.get('entry_price') or 0.0)
                 shares = int(item.get('holding_shares') or item.get('shares') or 0)
-                available_shares = min(int(item.get('available_shares') or 0), shares)
+                available_shares = portfolio_risk.resolve_available_shares(item)
 
                 q = quotes.get(sym)
                 if not q:
