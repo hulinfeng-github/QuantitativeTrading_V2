@@ -115,7 +115,7 @@ class QuantScheduler2:
 
         t0_market_exposure = None
         if load_config().get("t0_monitor_enabled", True) and any(
-            item.get("t0_enabled", True) and data_engine.is_main_board_equity(item.get("symbol", ""))
+            item.get("t0_enabled", True) and data_engine.is_main_board(item.get("symbol", ""))
             for item in watchlist
         ):
             try:
@@ -198,9 +198,10 @@ class QuantScheduler2:
                         notification_manager.send_signal(analysis_res)
 
                 # T0仅推送通过持仓、趋势与分时质量过滤的研究信号，不会自动下单。
+                # 做T同时支持主板个股与场内ETF，故使用 is_main_board 而非 is_main_board_equity
                 if (load_config().get("t0_monitor_enabled", True)
                         and item.get("t0_enabled", True)
-                        and data_engine.is_main_board_equity(sym)):
+                        and data_engine.is_main_board(sym)):
                     t0_res = t0_smart_engine.analyze_t0(
                         symbol=sym,
                         name=name,

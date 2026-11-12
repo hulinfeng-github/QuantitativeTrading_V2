@@ -564,7 +564,7 @@ function renderT0Cards(items) {
     container.innerHTML = `
       <div style="grid-column: 1 / -1; text-align: center; color: var(--text-dim); padding: 50px 20px; background: rgba(0,0,0,0.15); border: 1px dashed var(--border-subtle); border-radius: var(--radius-md);">
         <div style="font-size: 28px; margin-bottom: 10px;">🎯</div>
-        <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px;">T0 自动监控已开启。请添加主板股并填写总持仓和券商核对的当日可卖股数；未满足数据、趋势或可卖数量条件时不会发出入场信号。</p>
+        <p style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px;">T0 自动监控已开启。请添加主板股票或场内ETF，并填写总持仓与券商核对的当日可卖股数；未满足数据、趋势或可卖数量条件时不会发出入场信号。</p>
         <button class="btn btn-secondary btn-sm" onclick="showAddWatchlistModal()">管理自选标的</button>
       </div>`;
     return;

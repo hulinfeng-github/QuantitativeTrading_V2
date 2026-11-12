@@ -333,7 +333,8 @@ def get_t0_monitor():
     symbols = [
         x['symbol'] for x in watchlist
         if x.get('symbol') and x.get('t0_enabled', True)
-        and data_engine.is_main_board_equity(x['symbol'])
+        # 做T需同时支持主板个股与场内ETF（如 51x/56x/58x/15x/16x），不能用仅限个股的 is_main_board_equity
+        and data_engine.is_main_board(x['symbol'])
     ]
     quotes = data_engine.get_realtime_quotes(symbols)
     market_state = sentiment_radar.analyze_market_regime()
@@ -349,7 +350,7 @@ def get_t0_monitor():
 
     for it in watchlist:
         sym = it.get('symbol', '')
-        if not it.get('t0_enabled', True) or not data_engine.is_main_board_equity(sym):
+        if not it.get('t0_enabled', True) or not data_engine.is_main_board(sym):
             continue
         name = it.get('name', sym)
         cost = float(it.get('holding_cost') or it.get('entry_price') or 0.0)
