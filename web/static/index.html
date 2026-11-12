@@ -72,7 +72,7 @@
         <button class="tab-btn active" data-tab="screener">💎 今日多因子波段选股雷达</button>
         <button class="tab-btn" data-tab="watchlist">📋 盘中自选与持仓实时监控</button>
         <button class="tab-btn" data-tab="t0">🎯 A股T+1日内做T助手</button>
-        <button class="tab-btn" data-tab="tail230">⚡ 尾盘 2:30 突袭战法</button>
+        <button class="tab-btn" data-tab="tail230">⚡ 尾盘规则研究</button>
         <button class="tab-btn" data-tab="limitup">⚡ 游资龙虎打板</button>
         <button class="tab-btn" data-tab="diagnose">🔍 单股深度诊断与专业K线</button>
         <button class="tab-btn" data-tab="backtest">📈 组合因果回测对比 (vs 沪深300)</button>
@@ -85,7 +85,7 @@
     <!-- 1. 选股雷达面板 -->
     <section id="pane-screener" class="tab-pane" style="display: block;">
       <div class="card" style="background: rgba(56, 189, 248, 0.04); border-color: rgba(56, 189, 248, 0.2); margin-bottom: 20px;">
-        <h3 style="font-size: 14px; color: var(--c-cyan); margin-bottom: 4px;">🎯 2.0 策略核心机制（融合 GitHub 顶级 A 股量化与财报分析算法）</h3>
+        <h3 style="font-size: 14px; color: var(--c-cyan); margin-bottom: 4px;">🎯 2.0 策略核心机制（启发式筛选与风险提示）</h3>
         <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6;">
           融合<strong>偏度修正 RSRS 机构模型</strong>（残差偏度过滤假突破）、<strong>Qlib Alpha158 动量量价</strong>、<strong>高精度 CYQ 主力筹码集中度</strong>，以及<strong>深度财报排雷雷达（杜邦三因子拆解 · 皮氏 F-Score 9分制 · 六维财务排雷 · 经营状况画像）</strong>；严格聚焦沪深主板高流动性标的，辅以 ATR 动态止盈止损。
         </p>
@@ -117,6 +117,7 @@
                 <th>今日涨跌幅</th>
                 <th>持仓成本</th>
                 <th>持股数</th>
+                <th>当日可卖数</th>
                 <th>持仓盈亏比例</th>
                 <th>持仓浮动盈亏</th>
                 <th>操作</th>
@@ -137,12 +138,12 @@
           <div>
             <div class="card-title">🎯 A股 T+1 底仓日内做T助手 (分时VWAP + 动态布林带)</div>
             <p style="font-size: 12px; color: var(--text-dim); margin-top: 4px;">
-              顺应多头只做正T（负偏离低吸高抛），空头只做倒T；不同组标的自动分流推送至对应钉钉群，冲高回落自动对冲止盈。<strong style="color: var(--c-cyan);">💡 点击下方已添加的任意股票或 ETF，将自动跳转至单股深度诊断与专业 K 线展开全维分析。</strong>
+              T0研究监控默认开启：至少30条新鲜分时、60个完成日线bar、趋势与反转确认，并需录入券商核对的当日可卖股数。模型不会自动下单。<strong style="color: var(--c-cyan);">💡 点击主板股票可跳转至单股深度诊断。</strong>
             </p>
           </div>
           <div style="display: flex; gap: 8px; flex-wrap: wrap;">
             <button class="btn btn-primary btn-sm" onclick="showGroupModal()">🏷️ 做T分组与钉钉群管理</button>
-            <button class="btn btn-secondary btn-sm" onclick="showAddWatchlistModal()">+ 添加做T标的 (股票/ETF)</button>
+            <button class="btn btn-secondary btn-sm" onclick="showAddWatchlistModal()">+ 添加做T主板股</button>
             <button class="btn btn-secondary btn-sm" onclick="resetT0Today()">🔄 重置今日做T状态</button>
           </div>
         </div>
@@ -189,7 +190,10 @@
             <label style="font-size: 13px; color: var(--text-muted);">回测天数:</label>
             <input id="backtestDays" class="form-input" type="number" style="width: 100px;" value="600">
           </div>
-          <button id="btnRunBacktest" class="btn btn-primary" onclick="triggerBacktest()">⚡ 运行严格防过拟合因果回测</button>
+          <button id="btnRunBacktest" class="btn btn-primary" onclick="triggerBacktest()">⚡ 运行日线策略回测</button>
+        </div>
+        <div class="text-muted" style="margin-top: 10px; font-size: 12px;">
+          回测按前一日信号、次日开盘和日线止损近似成交；未逐日还原 ST、新股、停牌、复权及盘口队列，末段收益也不是独立盲测。请将结果作为研究参考。
         </div>
       </div>
 
@@ -247,7 +251,7 @@
               <tr>
                 <th>演进时间</th>
                 <th>大盘环境</th>
-                <th>近期实盘胜率</th>
+                <th>近期信号跟踪命中率</th>
                 <th>参数微调动作</th>
                 <th>演进理由</th>
               </tr>
@@ -398,12 +402,12 @@
         <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px;">
           <div>
             <h3 style="font-size: 16px; color: var(--c-gold); display: flex; align-items: center; gap: 8px;">
-              ⚡ A股主板尾盘 2:30 突袭战法 (Tail Hunter 2.30)
+              ⚡ A股主板尾盘日线规则研究
               <span id="tailWindowBadge" class="badge" style="font-size: 11px; background: rgba(245, 158, 11, 0.2); color: #fbbf24;">窗口检测中...</span>
             </h3>
             <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6; margin-top: 6px;">
-              <strong>算法灵感来自 GitHub 顶级 A 股实战开源库</strong>（<code>songxiaoyan/stock-picker</code> 8步选股法 与 <code>hyan1985/stock-predict</code> 尾盘分时量价模型）：<br>
-              A 股在 14:30 之后全天多空搏杀基本定型，假突破概率最低。模型在 <strong>14:30 - 14:50 黄金抢筹窗口</strong>，筛选主板 <strong>涨幅在 +2.0%~+5.5% 黄金区间、量比 ≥ 1.25、站稳 MA5/MA20、分时持续运行在 VWAP 均价上方</strong> 的突破标的；结合 <strong>T+1 一夜持股法</strong>，次日早盘 9:30-9:45 冲高即兑现溢价（目标 +2.5%），坚决防守止损（-1.8%），快进快出，回避全天市场系统性风险！
+              这是基于日线和行情接口字段的规则筛选，指标是启发式代理值，不代表主力资金识别或低风险信号。<br>
+              日线不能还原 14:30 的实际成交、次日 09:30-09:45 的价格路径、涨跌停排队与滑点；此策略自动扫描开启，结果仅供研究。
             </p>
           </div>
           <div style="display: flex; gap: 8px; align-items: center;">
@@ -413,7 +417,7 @@
               <option value="250">回测近 250 天(年)</option>
             </select>
             <button class="btn btn-primary btn-sm" onclick="recalculateTail230()">
-              🔄 独立重新测算胜率
+              🔄 重算日线代理样本
             </button>
           </div>
         </div>
@@ -422,9 +426,9 @@
       <!-- 独立胜率与四大核心指标看板 -->
       <div class="macro-strip" style="margin-bottom: 24px;">
         <div class="macro-card">
-          <div class="macro-title">🎯 2.30 战法全周期实战胜率</div>
+          <div class="macro-title">🎯 2.30 战法日线代理样本胜率</div>
           <div id="tailWinRate" class="macro-val text-up" style="font-size: 26px;">--%</div>
-          <div id="tailTradesCount" class="macro-sub">已完成 0 笔历史实战因果回测</div>
+          <div id="tailTradesCount" class="macro-sub">日线代理估算样本</div>
         </div>
         <div class="macro-card">
           <div class="macro-title">🛡️ 叠加宏观大盘滤网增强胜率</div>
@@ -437,9 +441,9 @@
           <div id="tailAvgWinLoss" class="macro-sub">平均盈 +0.0% / 平均亏 -0.0%</div>
         </div>
         <div class="macro-card">
-          <div class="macro-title">🌅 次日早盘平均最高冲高溢价</div>
+          <div class="macro-title">模拟卖出日最高价平均幅度 (T+2)</div>
           <div id="tailMorningPrem" class="macro-val" style="font-size: 26px; color: #a78bfa;">+--%</div>
-          <div class="macro-sub">次日 9:30-9:45 冲高止盈窗口空间</div>
+          <div class="macro-sub">日线无法定位到早盘具体时段</div>
         </div>
       </div>
 
@@ -454,27 +458,27 @@
         </div>
       </div>
 
-      <!-- 📋 次日卖出监控池 (T+1 极速离场监控看板) -->
+      <!-- 📋 用户确认的实际买入成交监控 -->
       <div class="card" style="margin-bottom: 24px; border-color: rgba(99, 102, 241, 0.3);">
         <div class="card-header">
           <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
-            <span>📋 2.30 战法次日卖出监控池 (T+1 极速离场引擎)</span>
+            <span>📋 用户确认买入成交的行情提醒</span>
             <span id="tailHoldingBadge" class="badge" style="font-size: 11px; background: rgba(99, 102, 241, 0.2); color: #818cf8;">实时监控中</span>
           </div>
-          <button class="btn btn-secondary btn-sm" onclick="loadTailTrades()">🔄 刷新卖出监控</button>
+          <button class="btn btn-secondary btn-sm" onclick="loadTailTrades()">🔄 刷新记录</button>
         </div>
         <div class="data-table-wrapper">
           <table class="data-table">
             <thead>
               <tr>
                 <th>标的名称 / 代码</th>
-                <th>买入日期 / 时间</th>
-                <th>尾盘买入价</th>
-                <th>冲高止盈线 (+2.5%)</th>
-                <th>防守止损线 (-1.8%)</th>
+                <th>实际买入成交日期 / 时间</th>
+                <th>实际买入成交价</th>
+                <th>模型目标观察线</th>
+                <th>模型止损观察线</th>
                 <th>当前状态</th>
-                <th>离场价格 / 最终结算</th>
-                <th>离场原因与指引</th>
+                <th>人工确认的卖出成交价 / 价格变化</th>
+                <th>行情提醒 / 成交记录</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -488,26 +492,26 @@
       <!-- 历史实战/因果回测交易明细记录 -->
       <div class="card">
         <div class="card-header">
-          <div class="card-title">📜 2.30 战法独立历史因果回测明细 (近 30 笔交易)</div>
-          <span style="font-size: 12px; color: var(--text-muted);">严格扣除印花税/双边佣金/真实滑点 摩擦费用</span>
+          <div class="card-title">📜 2.30 战法日线代理估算明细 (近 30 笔)</div>
+          <span style="font-size: 12px; color: var(--text-muted);">按固定 0.20% 成本假设；不含真实盘口滑点与成交约束</span>
         </div>
         <div class="data-table-wrapper">
           <table class="data-table">
             <thead>
               <tr>
                 <th>标的名称 / 代码</th>
-                <th>买入日期 (14:30)</th>
-                <th>尾盘买入价</th>
-                <th>次日早盘冲高</th>
-                <th>平仓离场价</th>
-                <th>单笔净收益率</th>
-                <th>大盘环境</th>
-                <th>离场原因</th>
-                <th>实战胜负</th>
+                <th>信号日期 → 入场日期</th>
+                <th>T+1开盘入场参考价</th>
+                <th>T+2最高价参考变动</th>
+                <th>T+2模拟退出参考价</th>
+                <th>估算价格变化（含假设成本）</th>
+                <th>信号日大盘环境</th>
+                <th>离场代理规则</th>
+                <th>估算结果</th>
               </tr>
             </thead>
             <tbody id="tailTradesTableBody">
-              <tr><td colspan="9" style="text-align:center; color: var(--text-dim); padding: 20px;">正在加载 2.30 战法历史因果回测战绩...</td></tr>
+              <tr><td colspan="9" style="text-align:center; color: var(--text-dim); padding: 20px;">正在加载日线代理估算样本...</td></tr>
             </tbody>
           </table>
         </div>
@@ -521,12 +525,12 @@
         <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 10px;">
           <div>
             <h3 style="font-size: 15px; color: #f87171; margin-bottom: 4px; display: flex; align-items: center; gap: 8px;">
-              <span>⚡ 游资龙虎打板量化与自动流水账本引擎 (LimitUp 2.0)</span>
-              <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 11px;">自动维护 · 每日结算</span>
+              <span>⚡ 涨停候选筛选与信号跟踪 (LimitUp)</span>
+              <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 11px;">信号跟踪</span>
             </h3>
             <p style="font-size: 12px; color: var(--text-muted); line-height: 1.6; max-width: 900px; margin: 0;">
-              结合 GitHub 顶级 A 股游资实战战法与量化研报：锁定主板<strong>首板突破、1进2接力、2进3空间板、弱转强反包</strong>；量化分时<strong>封板时间、封成比、炸板回封次数与封板硬度得分 (0~100)</strong>。<br>
-              <strong>复盘自动维护</strong>：每日收盘全自动归档并导出实战流水账本至 <code>storage/limit_up_ledger.csv</code> (UTF-8 with BOM，Excel/WPS秒开)；次日收盘自动 T+1 真实回访结算，单独追踪高开溢价率、冲高胜率、连板晋级率与盈亏比！
+              根据日线涨幅和成交量估算主板形态分类与技术规则分；此页面不获取分时封板时间、封成比或炸板回封次数。<br>
+              <strong>信号跟踪台账</strong>：每日收盘可记录推荐信号并根据次日行情更新字段；记录不代表真实买入、成交价或账户盈亏。评分仅基于日线规则，不含封单队列、封板时间或炸板次数。
             </p>
           </div>
           <div style="display: flex; gap: 8px;">
@@ -543,11 +547,11 @@
             <span style="font-size: 20px;">📖</span>
             <div>
               <h4 style="font-size: 15px; color: var(--c-gold); margin: 0; display: flex; align-items: center; gap: 8px;">
-                <span>新手小白打板实战保姆级指南：在什么点？具体怎么操作？</span>
-                <span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; font-size: 11px;">新手必读实战口诀</span>
+                <span>涨停候选信号的适用边界</span>
+                <span class="badge" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; font-size: 11px;">研究用途</span>
               </h4>
               <div style="font-size: 12px; color: var(--text-muted); margin-top: 3px;">
-                抓首板突破 · 扫板打确认 · 次日 09:30~09:45 冲高止盈不恋战 · 破位 -3% 坚决斩仓留青山
+                日线规则分不是封板强度；候选信号和后续行情不等于真实成交或盈利记录。
               </div>
             </div>
           </div>
@@ -555,54 +559,38 @@
         </div>
 
         <div id="beginnerGuideBody" style="display: block; margin-top: 16px; border-top: 1px dashed rgba(245, 158, 11, 0.25); padding-top: 14px;">
-          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; font-size: 13px;">
-            <div style="background: rgba(15, 23, 42, 0.6); padding: 14px; border-radius: 8px; border-left: 3px solid var(--c-cyan);">
-              <h5 style="color: var(--c-cyan); margin: 0 0 8px 0; font-size: 14px;">🎯 一、 应该在什么点买？具体怎么操作？</h5>
-              <ul style="padding-left: 18px; margin: 0; line-height: 1.7; color: var(--text-muted);">
-                <li><strong style="color: #fff;">扫板买点 (主选)</strong>：股价分时脉冲至 <strong>+9.5% ~ +9.8%</strong>、卖一涨停价剩余挂单即将被大资金扫光一瞬间，交易软件选【限价买入】，输入涨停价直接下单扫板。</li>
-                <li><strong style="color: #fff;">排板买点 (次选)</strong>：封死后以涨停价挂单排队。<strong>【撤单关键】</strong>若盘中封单大幅减少至 5000 手以下或万手砸盘即将开板，<strong>必须立刻点击【撤单】</strong>，严禁开板下杀无脑接飞刀！</li>
-                <li><strong style="color: #fff;">仓位纪律</strong>：建议单笔控制在总资金 <strong>10% ~ 15%</strong>，小白严禁满仓一把梭！</li>
-              </ul>
-            </div>
-
-            <div style="background: rgba(15, 23, 42, 0.6); padding: 14px; border-radius: 8px; border-left: 3px solid #f87171;">
-              <h5 style="color: #f87171; margin: 0 0 8px 0; font-size: 14px;">🚀 二、 次日 (T+1) 应该在什么点卖？(三大剧本实战对策)</h5>
-              <ul style="padding-left: 18px; margin: 0; line-height: 1.7; color: var(--text-muted);">
-                <li><strong style="color: #fff;">剧本 A · 正常早盘冲高止盈 (最常见利润来源)</strong>：次日早盘 <strong>09:30 ~ 09:45</strong> 惯性脉冲上攻触及 <strong>+3.0% ~ +5.0%</strong> 目标或分时跌破黄线滞涨时，<strong>不要贪心，立即以市价全部卖出止盈</strong>，锁定利润！</li>
-                <li><strong style="color: #fff;">剧本 B · 大高开秒板连板 (享受主升加速)</strong>：若 09:25 集合竞价大幅高开 <strong>>+4%</strong> 或开盘 3 分钟内秒封死涨停，<strong>持股不动</strong>；若中途开板 1 分钟未回封，立即市价全额卖出！</li>
-                <li><strong style="color: #fff;">剧本 C · 低开低走破位止损 (风控底线)</strong>：若大幅低开 <strong><-2%</strong> 或跌破防守止损线 <strong>-3.0%</strong>，<strong>绝不心存侥幸！绝不补仓！立即以市价挂单止损离场</strong>！</li>
-              </ul>
-            </div>
-          </div>
+          <p style="font-size: 13px; color: var(--text-muted); line-height: 1.7; margin: 0;">
+            该模块使用日线规则推断涨停候选，不读取真实封单队列、封板时间或炸板次数，也不会检查您的账户持仓。涨停排队可能无法成交，次日也可能无法按目标价或止损价卖出。系统不提供确定买入价、固定仓位或收益承诺；请勿将评分当成交易指令。
+          </p>
         </div>
       </div>
 
       <!-- 核心战绩与胜率 KPI 指标看板 -->
       <div class="macro-strip" style="margin-bottom: 20px;">
         <div class="macro-card">
-          <div class="macro-title">打板样本总量</div>
+          <div class="macro-title">候选信号总量</div>
           <div id="luTotalCount" class="macro-val">--</div>
-          <div id="luSettledSub" class="macro-sub">已结算 -- 笔 · 待决 -- 笔</div>
+          <div id="luSettledSub" class="macro-sub">已跟踪 -- 条 · 待后续行情 -- 条</div>
         </div>
         <div class="macro-card">
-          <div class="macro-title">次日高开溢价胜率</div>
+          <div class="macro-title">次日开盘上涨占比</div>
           <div id="luOpenWinRate" class="macro-val text-gold">--%</div>
-          <div class="macro-sub">开盘竞价直接红盘概率</div>
+          <div class="macro-sub">信号收盘价至次日开盘价</div>
         </div>
         <div class="macro-card">
-          <div class="macro-title">盘中冲高止盈胜率</div>
+          <div class="macro-title">次日最高涨幅≥2%占比</div>
           <div id="luPeakWinRate" class="macro-val text-up">--%</div>
-          <div class="macro-sub">次日最高冲高 ≥ +2.0% 概率</div>
+          <div class="macro-sub">日线最高价触及比例，不含成交</div>
         </div>
         <div class="macro-card">
-          <div class="macro-title">连板晋级成功率</div>
+          <div class="macro-title">次日继续涨停占比</div>
           <div id="luConsecutiveRate" class="macro-val text-cyan">--%</div>
-          <div class="macro-sub">成功实现二连板/三连板进阶</div>
+          <div class="macro-sub">按日线涨幅估算，非实际买入收益</div>
         </div>
         <div class="macro-card">
-          <div class="macro-title">风控盈亏比 / 大面率</div>
+          <div class="macro-title">信号涨跌比 / 大幅下跌占比</div>
           <div id="luPlRatio" class="macro-val">--:1</div>
-          <div id="luBigLossSub" class="macro-sub text-down">大面率 (跌幅≥4%): --%</div>
+          <div id="luBigLossSub" class="macro-sub text-down">次日收盘跌幅≤-4%占比: --%</div>
         </div>
       </div>
 
@@ -610,13 +598,13 @@
       <div class="card" style="margin-bottom: 20px; padding: 14px 20px; background: rgba(15, 23, 42, 0.4);">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
           <div style="display: flex; align-items: center; gap: 20px; font-size: 13px;">
-            <span style="font-weight: 600; color: #fff;">📊 板型冲高胜率细分:</span>
+            <span style="font-weight: 600; color: #fff;">📊 信号样本后续行情统计:</span>
             <span id="luTypeBreakdown" style="color: var(--text-muted);">正在加载板型分布...</span>
           </div>
           <div style="display: flex; align-items: center; gap: 15px; font-size: 12px; color: var(--text-dim);">
             <span>次日开盘均值: <strong id="luAvgOpenPnl" class="text-gold">--%</strong></span>
-            <span>盘中冲高均值: <strong id="luAvgPeakPnl" class="text-up">--%</strong></span>
-            <span>收盘收益均值: <strong id="luAvgClosePnl">--%</strong></span>
+            <span>次日全日最高均值: <strong id="luAvgPeakPnl" class="text-up">--%</strong></span>
+            <span>次日收盘均值 (未扣成本): <strong id="luAvgClosePnl">--%</strong></span>
           </div>
         </div>
       </div>
@@ -625,11 +613,11 @@
       <div class="card" style="margin-bottom: 24px;">
         <div class="card-header">
           <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
-            <span>⚡ 今日主板涨停板雷达 (分时封板硬度评估)</span>
-            <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 11px;">主板精选</span>
+            <span>⚡ 今日主板涨停候选 (日线规则筛选)</span>
+            <span class="badge" style="background: rgba(239, 68, 68, 0.2); color: #f87171; font-size: 11px;">研究用途</span>
           </div>
           <div style="display: flex; gap: 8px;">
-            <button class="btn btn-secondary btn-sm" onclick="autoRecordTopLimitUp()">⚡ 一键录入前3只至实战账本</button>
+            <button class="btn btn-secondary btn-sm" onclick="autoRecordTopLimitUp()">记录前3只信号</button>
             <button class="btn btn-secondary btn-sm" onclick="loadLimitUpRadar()">🔄 刷新涨停雷达</button>
           </div>
         </div>
@@ -638,15 +626,15 @@
         </div>
       </div>
 
-      <!-- 自动维护的打板实战流水账本 (单独追踪记录) -->
+      <!-- Daily-bar candidate signal tracking ledger -->
       <div class="card">
         <div class="card-header">
           <div class="card-title" style="display: flex; align-items: center; gap: 8px;">
-            <span>📜 游资打板实战流水账本 (自动维护·单独记录成功率及收益)</span>
+            <span>📜 涨停候选信号跟踪台账 (不代表实际成交)</span>
             <span class="badge" style="background: rgba(16, 185, 129, 0.2); color: #34d399; font-size: 11px;">storage/limit_up_ledger.csv 同步更新</span>
           </div>
           <div style="display: flex; gap: 8px;">
-            <button class="btn btn-primary btn-sm" onclick="triggerManualSettlement()">🛠️ 立即执行 T+1 真实复盘结算</button>
+            <button class="btn btn-primary btn-sm" onclick="triggerManualSettlement()">更新次日行情跟踪字段</button>
             <button class="btn btn-secondary btn-sm" onclick="loadLimitUpLedger()">🔄 刷新账本明细</button>
           </div>
         </div>
@@ -658,20 +646,20 @@
                 <th>标的名称 / 代码</th>
                 <th>板型结构</th>
                 <th>连板数</th>
-                <th>封板价格</th>
-                <th>首次封板时间</th>
-                <th>封板硬度</th>
-                <th>封成比</th>
-                <th>次日高开溢价</th>
-                <th>次日冲高溢价</th>
-                <th>次日收盘收益</th>
-                <th>连板晋级</th>
-                <th>结算状态</th>
-                <th>打板量化归因</th>
+                <th>信号日收盘价</th>
+                <th>封板时间 (日线无此数据)</th>
+                <th>日线技术规则分</th>
+                <th>封成比 (无盘口数据)</th>
+                <th>信号至次日开盘变动</th>
+                <th>信号至次日最高变动</th>
+                <th>信号至次日收盘变动</th>
+                <th>次日继续涨停 (日线估算)</th>
+                <th>行情跟踪状态</th>
+                <th>日线规则依据</th>
               </tr>
             </thead>
             <tbody id="limitupLedgerTableBody">
-              <tr><td colspan="14" style="text-align:center; color: var(--text-dim); padding: 25px;">正在加载打板实战流水账本...</td></tr>
+              <tr><td colspan="14" style="text-align:center; color: var(--text-dim); padding: 25px;">正在加载候选信号跟踪台账...</td></tr>
             </tbody>
           </table>
         </div>
@@ -697,6 +685,10 @@
       <div class="form-group">
         <label class="form-label">当前持仓股数 (股，若仅观察可填 0)</label>
         <input id="addShares" class="form-input" type="number" step="100" value="0">
+      </div>
+      <div class="form-group">
+        <label class="form-label">当日可卖股数 (请按券商账户填写；不确定填 0，T+1 需排除当日买入)</label>
+        <input id="addAvailableShares" class="form-input" type="number" step="100" value="0">
       </div>
       <div class="form-group">
         <label class="form-label">所属做T分组 (将推送到该组专属钉钉群)</label>
@@ -739,6 +731,10 @@
           <input id="editWatchShares" class="form-input" type="number" step="100" style="flex: 1;" placeholder="0">
           <button class="btn btn-secondary btn-sm" type="button" onclick="document.getElementById('editWatchShares').value='0';" title="设为0股(仅观察)">置0</button>
         </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">当日可卖股数 (按券商账户刷新；不得高于当前持仓)</label>
+        <input id="editAvailableShares" class="form-input" type="number" step="100" placeholder="0">
       </div>
       <div class="form-group">
         <label class="form-label">所属做T分组 (将推送到该组专属钉钉群)</label>

@@ -32,18 +32,35 @@ class SentimentRadar:
         sh_df = data_engine.get_daily_kline("sh000001", count=100)
         hs300_df = data_engine.get_daily_kline("sh000300", count=100)
 
-        if sh_df is None or len(sh_df) < 15:
+        if sh_df is None or len(sh_df) < 60:
+            return self._default_regime(live_price=live_price, live_pct=live_pct)
+
+        if not {"date", "close"}.issubset(sh_df.columns):
+            return self._default_regime(live_price=live_price, live_pct=live_pct)
+
+        # Stale index bars can produce plausible but unsafe moving averages.
+        # Allow short weekends/holidays; reject data more than a week old.
+        try:
+            latest_bar_date = pd.to_datetime(sh_df.iloc[-1]["date"]).date()
+            age_days = (pd.Timestamp.now().date() - latest_bar_date).days
+            if age_days < 0 or age_days > 7:
+                return self._default_regime(live_price=live_price, live_pct=live_pct)
+        except (KeyError, TypeError, ValueError):
+            return self._default_regime(live_price=live_price, live_pct=live_pct)
+
+        close_series = pd.to_numeric(sh_df["close"], errors="coerce")
+        if close_series.tail(60).isna().any() or not np.isfinite(close_series.tail(60)).all():
             return self._default_regime(live_price=live_price, live_pct=live_pct)
 
         # 计算上证指数关键技术指标
-        close = live_price if live_price > 0 else float(sh_df.iloc[-1]['close'])
-        prev_close = float(sh_df.iloc[-2]['close'])
+        close = live_price if live_price > 0 else float(close_series.iloc[-1])
+        prev_close = float(close_series.iloc[-2])
         sh_pct = live_pct if live_price > 0 else round((close - prev_close) / prev_close * 100.0, 2)
 
-        ma5 = float(sh_df['close'].rolling(5).mean().iloc[-1])
-        ma20 = float(sh_df['close'].rolling(20).mean().iloc[-1])
-        prev_ma20 = float(sh_df['close'].rolling(20).mean().iloc[-2])
-        ma60 = float(sh_df['close'].rolling(60).mean().iloc[-1]) if len(sh_df) >= 60 else ma20
+        ma5 = float(close_series.rolling(5).mean().iloc[-1])
+        ma20 = float(close_series.rolling(20).mean().iloc[-1])
+        prev_ma20 = float(close_series.rolling(20).mean().iloc[-2])
+        ma60 = float(close_series.rolling(60).mean().iloc[-1]) if len(sh_df) >= 60 else ma20
 
         ma20_slope = (ma20 - prev_ma20) / prev_ma20 * 100.0 if prev_ma20 > 0 else 0.0
 
@@ -106,27 +123,33 @@ class SentimentRadar:
             "cycle_phase": cycle_phase,
             "regime": regime,
             "target_exposure": target_exposure,
-            "action_guide": action_guide
+            "action_guide": action_guide,
+            "data_available": True,
+            "can_open_new_positions": True
         }
         self._last_sentiment = result
         return result
 
     def _default_regime(self, live_price: float = 0.0, live_pct: float = 0.0) -> Dict[str, Any]:
-        p = live_price if live_price > 0 else 3697.52
+        # Missing index history is a risk event: never invent an index level or
+        # permit fresh exposure based on stale/default values.
+        p = live_price if live_price > 0 else 0.0
         return {
             "index_price": round(p, 2),
             "index_pct": live_pct,
-            "ma5": round(p, 2),
-            "ma20": round(p, 2),
-            "ma60": round(p, 2),
+            "ma5": None,
+            "ma20": None,
+            "ma60": None,
             "ma20_slope": 0.0,
-            "above_ma20": True,
-            "above_ma60": True,
-            "temp_score": 50.0,
-            "cycle_phase": "震荡中性期",
-            "regime": "震荡整理",
-            "target_exposure": 0.50,
-            "action_guide": "保持稳健仓位，顺应波段纪律"
+            "above_ma20": False,
+            "above_ma60": False,
+            "temp_score": 0.0,
+            "cycle_phase": "行情数据不足",
+            "regime": "数据不可用·防守",
+            "target_exposure": 0.0,
+            "action_guide": "大盘历史行情不足，暂停新增仓位，待数据恢复后重新评估",
+            "data_available": False,
+            "can_open_new_positions": False
         }
 
 sentiment_radar = SentimentRadar()

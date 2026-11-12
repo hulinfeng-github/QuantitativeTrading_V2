@@ -58,6 +58,12 @@ class DataEngine:
         return False
 
     @classmethod
+    def is_main_board_equity(cls, code: str) -> bool:
+        """仅识别沪深主板普通股；ETF 等场内基金不进入个股选股池。"""
+        digits = cls.clean_code(code)
+        return len(digits) == 6 and digits.startswith(("600", "601", "603", "605", "000", "001", "002", "003"))
+
+    @classmethod
     def format_symbol(cls, code: str) -> str:
         """格式化为标准市场前缀代码，如 sh600519, sz000001, sh000300"""
         c = str(code).strip().lower()
@@ -267,9 +273,9 @@ class DataEngine:
         except Exception:
             pass
 
-        # 3. 腾讯受阻时备选新浪通道
+        # 3. 腾讯受阻时备选新浪通道 (新浪个股通道同样支持 datalen 大额拉取，勿截断到120)
         try:
-            sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={min(count, 120)}"
+            sina_url = f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={count}"
             resp = self.session.get(sina_url, timeout=3)
             if resp.status_code == 200:
                 raw_items = resp.json()
@@ -395,11 +401,21 @@ class DataEngine:
         if not force_refresh and STOCK_LIST_CACHE.exists():
             try:
                 mtime = STOCK_LIST_CACHE.stat().st_mtime
-                if time.time() - mtime < 7 * 86400:
+                cache_day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+                today = datetime.now().strftime("%Y-%m-%d")
+                # turnover 是当日行情字段，跨日即失效，需每日刷新一次
+                if cache_day == today:
                     with open(STOCK_LIST_CACHE, "r", encoding="utf-8") as f:
                         cached_stocks = json.load(f)
                         if len(cached_stocks) > 500:
-                            return cached_stocks
+                            # Legacy caches may contain ETFs because the older
+                            # generic board predicate also accepted fund codes.
+                            return [
+                                stock for stock in cached_stocks
+                                if self.is_main_board_equity(stock.get("code") or stock.get("symbol", ""))
+                                and "ST" not in str(stock.get("name", "")).upper()
+                                and "退" not in str(stock.get("name", ""))
+                            ]
             except Exception:
                 pass
 
@@ -412,7 +428,7 @@ class DataEngine:
             }
             # 沪深A股共约 5000 只标的，每页 100 只，35 页即可全覆盖主板合规标的
             for p in range(1, 40):
-                url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={p}&num=100&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page"
+                url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={p}&num=100&sort=symbol&asc=1&node=hs_a&symbol=&_s_r_a=page"
                 r = self.session.get(url, headers=sina_headers, timeout=4)
                 if r.status_code == 200:
                     text = r.content.decode('gbk', errors='ignore')
@@ -422,7 +438,7 @@ class DataEngine:
                     for it in items:
                         code = str(it.get('code', '')).strip()
                         name = str(it.get('name', '')).strip()
-                        if not self.is_main_board(code):
+                        if not self.is_main_board_equity(code):
                             continue
                         if 'ST' in name.upper() or '退' in name:
                             continue
@@ -463,7 +479,7 @@ class DataEngine:
                     for item in diff:
                         code = str(item.get("f12", ""))
                         name = str(item.get("f14", ""))
-                        if not self.is_main_board(code):
+                        if not self.is_main_board_equity(code):
                             continue
                         if "ST" in name.upper() or "退" in name:
                             continue

@@ -88,10 +88,11 @@ def calculate_rsrs_skew(
     rsrs_mod = z_beta * r2_scores
     data['rsrs_mod'] = rsrs_mod
 
-    # 4. 偏度修正因子 (过滤诱多与脉冲假阳线)
+    # 4. 偏度修正因子 (过滤诱多虚高引线、急拉杀跌等极端残差)
     if use_skew:
-        # 当偏度为负或过低时，说明存在大量向下的异常突兀残差，施加平滑惩罚
-        skew_penalty = np.clip(1.0 + skews * 0.25, 0.5, 1.3)
+        # 残差出现极端正偏(虚高引线/诱多拉高)或极端负偏(急拉杀跌)都会削弱信号可靠性，
+        # 双向惩罚且永不放大幅值。
+        skew_penalty = np.clip(1.0 - np.abs(skews) * 0.25, 0.5, 1.0)
         data['rsrs_norm'] = np.round(rsrs_mod * skew_penalty, 3)
     else:
         data['rsrs_norm'] = np.round(rsrs_mod, 3)

@@ -9,6 +9,7 @@ import base64
 import urllib.parse
 import threading
 import logging
+import math
 from collections import deque
 from typing import Dict, Any, List, Tuple, Optional
 import requests
@@ -21,6 +22,17 @@ def fmt_p(p) -> str:
         return f"{val:.3f}" if val < 10.0 else f"{val:.2f}"
     except (ValueError, TypeError):
         return str(p)
+
+
+def fmt_metric(value, suffix: str = "", signed: bool = False, decimals: int = 1) -> str:
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return "未知"
+    if not math.isfinite(number):
+        return "未知"
+    formatted = f"{number:+.{decimals}f}" if signed else f"{number:.{decimals}f}"
+    return f"{formatted}{suffix}"
 
 
 class DingTalkRateLimiter:
@@ -204,10 +216,10 @@ dingtalk_rate_limiter = DingTalkRateLimiter()
 def format_batch_signals_markdown(signals: List[Dict[str, Any]], group_name: str = "") -> Tuple[str, str]:
     """将多个交易信号格式化为单条聚合 Markdown 卡片内容"""
     gtag = f"【{group_name}】" if group_name else "【量化2.0】"
-    title = f"⚡ {gtag}多标的量化交易指令聚合 ({len(signals)} 只)"
+    title = f"⚡ {gtag}多标的规则信号摘要 ({len(signals)} 只)"
     blocks = [
-        f"### ⚡ {gtag}量化交易指令聚合预警 ({len(signals)} 只标的)",
-        f"> 监测到以下 **{len(signals)}** 只标的触发量化策略指令，已启用聚合通道合并推送，防刷屏并确保通道稳定：",
+        f"### ⚡ {gtag}量化规则信号摘要 ({len(signals)} 只标的)",
+        f"> 以下标的触发规则筛选条件。信号不代表实际成交、交易指令或可执行委托：",
         "---"
     ]
 
@@ -248,31 +260,21 @@ def format_batch_signals_markdown(signals: List[Dict[str, Any]], group_name: str
         ]
 
         if sig_type == "FORCE_EXIT":
-            item_lines.append(f"- **🚨 操盘指令**: **建议立即挂单全部清仓止损卖出！** (成本: {fmt_p(cost)}元, 浮亏: {pnl_pct:+.2f}%)")
+            item_lines.append(f"- **风险提醒**: 触发模型风控条件；请核对实时行情、实际持仓和可卖数量。系统未提交委托。 (成本: {fmt_p(cost)}元, 价格变化: {pnl_pct:+.2f}%)")
         elif sig_type == "BUY":
-            item_lines.append(f"- **🚀 买入建议**: 区间 {price:.2f}~{price*1.01:.2f}元 | 止盈: **{levels.get('target_price', '-')}元** | 止损: **{levels.get('initial_stop', '-')}元**")
+            item_lines.append(f"- **多因子研究候选**: 当前价 {price:.2f}元；模型目标/止损参考 {levels.get('target_price', '-')}元 / {levels.get('initial_stop', '-')}元。不是买入指令或可成交价格；系统未提交委托。")
         elif sig_type == "SELL":
-            item_lines.append(f"- **⚠️ 减仓建议**: 建议减仓 50%~100% 锁定利润/波段防守 | 建议卖出价: **{fmt_p(price)}元**")
-        elif sig_type == "BUY_T":
-            item_lines.append(f"- **做T指令**: **【正T低吸】建议买入价: {fmt_p(price)}元** | 目标: {levels.get('target_price', '-')}元 | 止损: {levels.get('initial_stop', '-')}元")
-        elif sig_type == "SELL_T":
-            item_lines.append(f"- **做T指令**: **【倒T高抛】建议卖出价: {fmt_p(price)}元** | 回补目标: {levels.get('target_price', '-')}元 | 止损: {levels.get('initial_stop', '-')}元")
-        elif sig_type == "CLOSE_T":
-            t0_dir = signal.get("t0_direction", "")
-            act_desc = "倒T买回回补" if t0_dir == "SELL_T" else "正T冲高卖平"
-            item_lines.append(f"- **做T指令**: **【🎯 {act_desc}】达成差价目标，请立即操作平仓！**")
-        elif sig_type == "STOP_T":
-            t0_dir = signal.get("t0_direction", "")
-            act_desc = "倒T买回防飞" if t0_dir == "SELL_T" else "正T防守卖平"
-            item_lines.append(f"- **做T指令**: **【🛑 {act_desc}】触及做T防守线，请立即平仓归位！**")
+            item_lines.append(f"- **策略退出提醒**: 参考价 {fmt_p(price)}元。请结合实际持仓和可成交价格判断；不是委托指令。")
+        elif sig_type in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
+            item_lines.append(f"- **做T模型提醒**: 参考价 {fmt_p(price)}元，模型目标/风控线 {levels.get('target_price', '-')}元 / {levels.get('initial_stop', '-')}元。请核对可用底仓、T+1可卖数量与成交状态；系统未下单。")
         elif sig_type == "EOD_FORCE_CLOSE_T":
-            item_lines.append(f"- **尾盘强平**: **【🚨 必须在 14:55 前以市价卖出老底仓】** 严禁日内正T演变为被动留仓过夜！")
+            item_lines.append("- **尾盘风险提醒**: 请核对当日买入数量、可卖底仓和实际委托；模型提醒不等于必须交易或已成交。")
         elif sig_type == "EOD_HEDGE_ALERT_T":
-            item_lines.append(f"- **尾盘抉择**: **【⚠️ 自主抉择：买回底仓 vs 顺势保留现金】**")
+            item_lines.append("- **尾盘情景提醒**: 模型列出对冲情景供核对；需结合真实持仓和交易限制判断，不构成买卖指令。")
         elif sig_type in ["TAIL_PROFIT_EXIT", "TAIL_STOP_EXIT", "TAIL_TIMED_EXIT", "TAIL_EOD_EXIT"]:
-            item_lines.append(f"- **2.30战法卖出**: **现价 {fmt_p(price)}元** (浮盈: {pnl_pct:+.2f}%)，执行极速兑现纪律")
+            item_lines.append(f"- **尾盘策略行情提醒**: 当前价 {fmt_p(price)}元，价格变化 {pnl_pct:+.2f}%（未扣费用）。提醒不代表委托或成交，请核对实际持仓。")
         elif sig_type == "LIMIT_UP":
-            item_lines.append(f"- **打板建议**: 封板买入价: **{fmt_p(price)}元** | 封板硬度: **{signal.get('hardness_score', 80)}分** | 连板数: **{signal.get('ladder_count', 1)}板**")
+            item_lines.append(f"- **日线涨停候选**: 参考价 {fmt_p(price)}元 | 日线规则分 {signal.get('hardness_score', '不可用')} | 不是交易指令或盘口强度判断。")
 
         reasons = signal.get("reasons", [])
         if reasons:
@@ -411,7 +413,7 @@ class DingTalkNotifier:
             title = f"{icon} 2.30战法早盘动能衰竭: {name} ({signal.get('pnl_pct', 0.0):+.2f}%)"
         elif sig_type == "TAIL_EOD_EXIT":
             icon = "🚨"
-            title = f"{icon} 2.30战法次日尾盘坚决清仓: {name}"
+            title = f"{icon} 2.30战法次日尾盘行情提醒: {name}"
         elif sig_type == "LIMIT_UP":
             icon = "⚡"
             title = f"{icon} 游资龙虎打板信号: {name} ({signal.get('board_type', '主板涨停')})"
@@ -436,10 +438,10 @@ class DingTalkNotifier:
             gw = fin.get("growth", {})
             rf = fin.get("red_flags", {})
             lines.append(
-                f"- **📊 财报深度体检**: **{fin.get('fundamental_score')}分** | {fin.get('persona')}\n"
-                f"  - 杜邦拆解: ROE {dp.get('roe')}% (净利率 {dp.get('net_margin')}% × 周转 {dp.get('asset_turnover')}) · {dp.get('driver_type')}\n"
-                f"  - 核心景气: 扣非YoY **{gw.get('deduct_profit_yoy', 0):+.1f}%** | 营收YoY {gw.get('revenue_yoy', 0):+.1f}% | 毛利率 {gw.get('gross_margin')}%\n"
-                f"  - 财务排雷: {rf.get('risk_summary')}"
+                f"- **📊 财报数据**: **{fmt_metric(fin.get('fundamental_score'), '分')}** | {fin.get('persona') or '画像未知'}\n"
+                f"  - 杜邦拆解: ROE {fmt_metric(dp.get('roe'), '%')} (净利率 {fmt_metric(dp.get('net_margin'), '%')} × 周转 {fmt_metric(dp.get('asset_turnover'), decimals=2)}) · {dp.get('driver_type') or '未知'}\n"
+                f"  - 核心景气: 扣非YoY **{fmt_metric(gw.get('deduct_profit_yoy'), '%', signed=True)}** | 营收YoY {fmt_metric(gw.get('revenue_yoy'), '%', signed=True)} | 毛利率 {fmt_metric(gw.get('gross_margin'), '%')}\n"
+                f"  - 财务排雷: {rf.get('risk_summary') or '风险状态未知'}"
             )
 
         lines.append("---")
@@ -453,22 +455,19 @@ class DingTalkNotifier:
             stop_line = levels.get("initial_stop", cost * 0.92)
 
             lines.extend([
-                f"- **🚨 操盘指令**: **建议立即以市价挂单【全部清仓卖出】**",
-                f"- **建议卖出执行价**: **{fmt_p(price)} 元**",
+                f"- **风险提醒**: 模型风控条件触发；请核对实时行情、实际持仓和可卖数量。系统未提交委托。",
+                f"- **当前行情参考价**: **{fmt_p(price)} 元**",
                 f"- **持仓买入成本**: **{fmt_p(cost)} 元** (持仓: {shares} 股)",
                 f"- **当前累计亏损**: <font color=\"#10b981\">**{pnl_pct:+.2f}%** ({pnl_amt:+.2f} 元)</font>",
                 f"- **账户止损红线**: **{stop_line:.2f} 元** (已严重击穿)",
-                f"- **风控纪律**: **已触及账户硬止损保护线，严禁侥幸扛单，务必果断平仓保留本金！**"
+                f"- **说明**: 价格变化不等于账户盈亏；请核对实际成交和交易限制。"
             ])
 
         # 2. 波段买入信号 (BUY)
         elif sig_type == "BUY":
             lines.extend([
-                f"- **建议买入价格区间**: **{price:.2f} ~ {price * 1.01:.2f} 元**",
-                f"- **防守止损价 (必须执行)**: **{levels.get('initial_stop')} 元** (-{levels.get('stop_pct')}%)",
-                f"- **第一目标止盈价**: **{levels.get('target_price')} 元** (+{levels.get('target_pct')}%)",
-                f"- **保本触发线**: {levels.get('breakeven_trigger')} 元 (盈利超6%后自动保本)",
-                f"- **建议建仓仓位**: **{advice.get('position_pct', 15)}%** (约 {advice.get('suggested_shares', 100)} 股，半凯利+波动率平价)"
+                f"- **多因子研究候选**: 当前价 {fmt_p(price)}元；目标/止损模型参考 {levels.get('target_price', '-')}元 / {levels.get('initial_stop', '-')}元。",
+                "- 未提供经验证的仓位建议；上述参考线不是可成交价格或收益预测，系统未提交委托。"
             ])
 
         # 3. 波段减仓/清仓信号 (SELL)
@@ -478,8 +477,7 @@ class DingTalkNotifier:
             pnl_pct = signal.get("pnl_pct")
 
             lines.extend([
-                f"- **建议卖出执行价**: **{fmt_p(price)} 元** (逢盘中反抽果断挂单卖出)",
-                f"- **建议减仓比例**: **建议减仓 50% ~ 100% (波段破位清仓)**",
+                f"- **策略退出提醒**: 当前行情参考价 {fmt_p(price)} 元；不是委托指令。",
                 f"- **生命线破位参考**: MA20 ({signal.get('ma20', price):.2f}元)"
             ])
             if cost > 0:
@@ -488,19 +486,16 @@ class DingTalkNotifier:
 
         # 4. 日内做T信号 (BUY_T / SELL_T / CLOSE_T / STOP_T)
         elif sig_type in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
+            t0_strength = signal.get("t0_score") or signal.get("t0_strength")
+            if t0_strength:
+                lines.append(f"- **做T信号强度**: **{int(t0_strength)} 分** (规则启发式，非校准概率)")
             if sig_type == "SELL_T":
                 lines.extend([
-                    f"- **做T指令**: **【倒T高抛】先卖出已有底仓**",
-                    f"- **建议卖出高抛价**: **{fmt_p(price)} 元** (已达布林上轨正偏离)",
-                    f"- **日内回补买回目标价**: **{levels.get('target_price')} 元**",
-                    f"- **做T防守止损价**: **{levels.get('initial_stop')} 元**"
+                    f"- **倒T模型观察**: 参考价 {fmt_p(price)} 元；目标/风控线 {levels.get('target_price')} / {levels.get('initial_stop')} 元。请核对可卖底仓；系统未下单。"
                 ])
             elif sig_type == "BUY_T":
                 lines.extend([
-                    f"- **做T指令**: **【正T低吸】逢低买入底仓做T**",
-                    f"- **建议买入低吸价**: **{fmt_p(price)} 元** (负偏离均线支撑)",
-                    f"- **日内冲高卖出目标价**: **{levels.get('target_price')} 元**",
-                    f"- **正T防守止损价**: **{levels.get('initial_stop')} 元**"
+                    f"- **正T模型观察**: 参考价 {fmt_p(price)} 元；目标/风控线 {levels.get('target_price')} / {levels.get('initial_stop')} 元。请核对可用资金与T+1限制；系统未下单。"
                 ])
             elif sig_type == "CLOSE_T":
                 t0_dir = signal.get("t0_direction", "")
@@ -508,17 +503,11 @@ class DingTalkNotifier:
                 shares = signal.get("holding_shares") or signal.get("shares", 100)
                 if t0_dir == "SELL_T" or close_act == "BUY_BACK":
                     lines.extend([
-                        f"- **做T指令**: **【🎯 倒T平仓买入回补】请立即买回等量底仓！**",
-                        f"- **建议回补买入价**: **{fmt_p(price)} 元** (触达低吸目标线)",
-                        f"- **建议买回数量**: **{shares} 股**",
-                        f"- **操盘指引**: 价格已回踩达成预期差价，请立即在交易软件中买回等量股份，收复底仓并锁定日内差价利润！"
+                        f"- **倒T行情提醒**: 回补观察价 {fmt_p(price)} 元，模型数量参考 {shares} 股；请核对实际仓位与委托，系统未下单。"
                     ])
                 else:
                     lines.extend([
-                        f"- **做T指令**: **【🎯 正T冲高卖出平仓】请立即高抛卖出等量底仓！**",
-                        f"- **建议平仓卖出价**: **{fmt_p(price)} 元** (触达冲高目标线)",
-                        f"- **建议卖出数量**: **{shares} 股**",
-                        f"- **操盘指引**: 冲高达成预期对冲目标，请立即卖出等量底仓，锁定做T利润，保持总持仓不变！"
+                        f"- **正T行情提醒**: 卖出观察价 {fmt_p(price)} 元，模型数量参考 {shares} 股；请核对实际可卖数量与委托，系统未下单。"
                     ])
             elif sig_type == "STOP_T":
                 t0_dir = signal.get("t0_direction", "")
@@ -526,17 +515,11 @@ class DingTalkNotifier:
                 shares = signal.get("holding_shares") or signal.get("shares", 100)
                 if t0_dir == "SELL_T" or "BUY_BACK" in close_act:
                     lines.extend([
-                        f"- **做T指令**: **【🛑 倒T紧急买回止损】防止底仓抛飞**",
-                        f"- **紧急买回参考价**: **{fmt_p(price)} 元** (突破压力防守线)",
-                        f"- **买回归位股数**: **{shares} 股**",
-                        f"- **风控说明**: 价格反抽突破倒T防守线，请立即以市价买回归位底仓，避免踏空后续主升"
+                        f"- **倒T风险提醒**: 行情触及模型防守线，参考价 {fmt_p(price)} 元，数量参考 {shares} 股；请核对实际持仓和委托。"
                     ])
                 else:
                     lines.extend([
-                        f"- **做T指令**: **【🛑 正T防守卖出止损】平仓避险**",
-                        f"- **止损卖出参考价**: **{fmt_p(price)} 元** (跌破下轨支撑防守线)",
-                        f"- **止损平仓股数**: **{shares} 股**",
-                        f"- **风控说明**: 跌破做T防守底线，请立即卖出加仓股份止损，今日停止该标的正T开仓"
+                        f"- **正T风险提醒**: 行情触及模型防守线，参考价 {fmt_p(price)} 元，数量参考 {shares} 股；请核对T+1可卖数量和委托。"
                     ])
 
         # 5. 尾盘未对冲做T强制平仓与对冲抉择提醒
@@ -546,11 +529,11 @@ class DingTalkNotifier:
             pnl_pct = signal.get("pnl_pct", 0.0)
             pnl_amt = signal.get("pnl_amt", 0.0)
             lines.extend([
-                f"- **🚨 操盘指令**: **【必须在 14:55 前以市价卖出原有老底仓】**",
-                f"- **建议卖出执行价**: **{fmt_p(price)} 元**",
-                f"- **建议卖出股数**: **{shares} 股 (对冲今早做T加仓股份)**",
+                f"- **尾盘风险提醒**: 请核对日内买入数量、可卖底仓与实际委托；系统未提交委托。",
+                f"- **当前行情参考价**: **{fmt_p(price)} 元**",
+                f"- **数量参考**: **{shares} 股** (非成交验证)",
                 f"- **今早低吸做T价**: {fmt_p(entry_p)} 元 (日内盈亏: {pnl_pct:+.2f}%, {pnl_amt:+.0f}元)",
-                f"- **紧急风控纪律**: **严禁日内正T演变为被动加仓过夜！14:55 集合竞价前必须卖出老底仓恢复原有仓位！**"
+                f"- **说明**: 规则提示不等于必须交易或已成交，请以实际账户持仓和委托为准。"
             ])
         elif sig_type == "EOD_HEDGE_ALERT_T":
             entry_p = signal.get("holding_cost", price)
@@ -558,11 +541,10 @@ class DingTalkNotifier:
             diff_pct = signal.get("pnl_pct", 0.0)
             diff_amt = signal.get("pnl_amt", 0.0)
             lines.extend([
-                f"- **⚠️ 操盘建议**: **【尾盘自主抉择：买回底仓 vs 顺势保留现金】**",
+                f"- **⚠️ 尾盘情景提醒**: 根据行情估算的对冲参考，不构成买卖指令。",
                 f"- **当前参考市价**: **{fmt_p(price)} 元**",
                 f"- **早盘高抛卖出价**: {fmt_p(entry_p)} 元 (相对节省: {diff_pct:+.2f}%, {diff_amt:+.0f}元)",
-                f"- **方案 A (维持底仓)**: 如需维持原股数，请在 14:55 前以市价买回 {shares} 股",
-                f"- **方案 B (顺势防守)**: 如大盘偏弱或个股走熊，可顺势保留现金过夜，明日更低位再接回"
+                f"- **模型数量参考**: {shares} 股；请核对实际持仓、可用资金与委托状态。"
             ])
 
         # 6. 2.30 尾盘突袭战法次日卖出与平仓指令
@@ -575,48 +557,33 @@ class DingTalkNotifier:
             buy_d = signal.get("buy_date", "")
 
             if sig_type == "TAIL_PROFIT_EXIT":
-                action_text = f"**【🎯 市价挂单止盈卖出】** 达成预设 +2.5% 止盈目标线({fmt_p(target_p)}元)"
+                action_text = f"行情触及模型止盈观察线 {fmt_p(target_p)} 元"
             elif sig_type == "TAIL_STOP_EXIT":
-                action_text = f"**【🛑 市价挂单止损卖出】** 击穿 -1.8% 防守底线({fmt_p(stop_p)}元)"
+                action_text = f"行情触及模型止损观察线 {fmt_p(stop_p)} 元"
             elif sig_type == "TAIL_TIMED_EXIT":
-                action_text = f"**【⏳ 择机分批卖出离场】** 09:45后早盘冲高动能衰竭，建议现价锁定利润"
+                action_text = "时段规则提醒；不代表卖出指令"
             else:
-                action_text = f"**【🚨 尾盘市价全额卖出】** 已达T+1持股极限，绝不二次留仓过夜"
+                action_text = "模型观察期限提醒；不代表卖出指令"
 
             lines.extend([
-                f"- **操盘指令**: {action_text}",
-                f"- **建议卖出执行价**: **{fmt_p(price)} 元**",
-                f"- **昨日买入成本**: {fmt_p(buy_p)} 元 (买入日期: {buy_d})",
-                f"- **单笔结算盈亏**: **{pnl_pct:+.2f}%** (今早最高冲至 +{peak_pct:+.2f}%)",
-                f"- **量化风控纪律**: **2.30战法遵循一夜持股极速兑现机制，次日坚决落袋，严禁深套变长线！**"
+                f"- **行情说明**: {action_text}",
+                f"- **当前行情参考价**: **{fmt_p(price)} 元**",
+                f"- **记录买入成交价**: {fmt_p(buy_p)} 元 (日期: {buy_d})",
+                f"- **价格变化**: **{pnl_pct:+.2f}%** (盘中高点变化 {peak_pct:+.2f}%，未扣费用)",
+                "- 请核对实际持仓、可卖数量与委托成交；本提醒不会下单或记录卖出成交。"
             ])
 
-        # 7. 游资龙虎打板专属新手小白保姆级操盘指南 (LIMIT_UP)
+        # 7. Daily-bar limit-up candidate research summary (LIMIT_UP)
         elif sig_type == "LIMIT_UP":
-            seal_p = float(signal.get("seal_price") or price)
-            target_p = float(levels.get("target_price") or round(seal_p * 1.045, 2))
-            stop_p = float(levels.get("stop_loss") or round(seal_p * 0.97, 2))
             b_type = signal.get("board_type", "首板突破")
             ladder = signal.get("ladder_count", 1)
-            h_score = signal.get("hardness_score", 80.0)
-            st_ratio = signal.get("seal_turnover_ratio", 15.0)
-
-            sweep_point = round(seal_p * 0.995, 2)
             lines.extend([
                 f"- **🎯 板型结构**: **{b_type}** (当前连板数: **{ladder}板**)",
-                f"- **封板硬度评估**: **{h_score} 分** | 封成比: **{st_ratio}%** | 炸板次数: **{signal.get('open_count', 0)}次**",
-                f"- **今日建议封板买入价**: **{fmt_p(seal_p)} 元** (以今日涨停价申报)",
-                f"- **新手仓位纪律**: **建议单笔总资金 10% ~ 15% (新手严禁满仓，轻仓试错)**",
+                f"- **日线技术规则分**: **{signal.get('hardness_score', '不可用')} 分** (非封板硬度或盘口数据)",
+                f"- **候选参考价**: **{fmt_p(price)} 元** (不代表可成交价格)",
                 "",
-                "#### 📖 【新手小白保姆级具体实操指南】",
-                "**一、 应该在什么点买？具体怎么操作？**",
-                f"1. **【扫板买点 (主选)】**：当个股快速脉冲至 **{sweep_point:.2f}元 (+9.5%~+9.8%)**、盘口卖一涨停价剩余挂单即将被大资金扫光的一瞬间，立即在交易软件中选择【限价买入】，价格直接输入今日涨停价 **{fmt_p(seal_p)}元**，点击买入；",
-                f"2. **【排板买点 (次选)】**：若股票已封死涨停，直接输入 **{fmt_p(seal_p)}元** 挂单排队。**【防守关键撤单指令】**：如果盘中封单迅速减少或万手大单持续砸盘即将开板，**必须立即点击【撤单】**，严禁在开板下杀过程中无脑接飞刀！",
-                "",
-                "**二、 次日 (T+1) 应该在什么点卖？具体怎么操作？(三大剧本实战对策)**",
-                f"1. **【剧本 A · 正常早盘冲高止盈 (最常见核心利润来源)】**：次日早盘 **09:30 ~ 09:45** 惯性脉冲上攻触及 **+{target_p:.2f}元 (+3.0%~+5.0%)** 目标区间或分时跌破黄线滞涨时，**不要贪心，立即以市价全部卖出止盈**，锁定隔日利润！",
-                f"2. **【剧本 B · 超预期大高开/秒板连板 (享受主升加速)】**：若次日 09:25 集合竞价大幅高开 **+4.0% 以上** 或开盘 3 分钟内直接秒封涨停板，**持股不动**，享受二连板/三连板龙头溢价；若封板后开板且 1 分钟内未能迅速回封，立即市价全额卖出！",
-                f"3. **【剧本 C · 不及预期/大幅低开破位 (绝不扛单严格止损)】**：若次日大幅低开低于 -2.0%，或盘中跌破防守止损线 **{fmt_p(stop_p)}元 (-3.0%)**，**绝不心存侥幸！绝不补仓！立即以市价挂单止损卖出**，防止深套吃大面！"
+                "仅使用日线数据生成的候选信号。系统没有封单队列、真实封板时间、炸板次数、实际成交和涨跌停排队信息。",
+                "该信号不是买卖指令；历史后续行情跟踪不代表本账户成交或策略净收益。请自行核对交易规则和风险。"
             ])
 
         if reasons:

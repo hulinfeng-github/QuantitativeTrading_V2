@@ -103,27 +103,24 @@ def calculate_alpha_features(df: pd.DataFrame) -> pd.DataFrame:
     data['rsi_14'] = 100.0 - (100.0 / (1.0 + rs))
 
     # 9. 综合 Alpha 得分向量计算 (0 ~ 100)
+    # 说明：趋势类因子(均线)由 multi_factor_strategy 的 s_trend 单独计权，
+    # 此处 alpha_score 只统计动量/量价/位置/波动，避免趋势被重复计权。
     score = np.zeros(len(data))
 
-    # 趋势得分 (0~25)
-    score += np.where(close > data['ma20'], 10, 0)
-    score += np.where(close > data['ma60'], 10, 0)
-    score += np.where(data['ma_align_bull'] == 1, 5, 0)
-
-    # 动量得分 (0~25)
-    score += np.clip(data['roc_20'].fillna(0) * 1.2, 0, 15)
+    # 动量得分 (0~30)
+    score += np.clip(data['roc_20'].fillna(0) * 1.5, 0, 20)
     score += np.where(data['roc_accel'].fillna(0) > 0, 10, 0)
 
-    # 量价配合 (0~20)
-    score += np.where(data['vol_ratio_5'].fillna(1.0) >= 1.2, 10, 0)
-    score += np.where(data['vp_corr_20'].fillna(0) > 0.2, 10, 0)
+    # 量价配合 (0~25)
+    score += np.where(data['vol_ratio_5'].fillna(1.0) >= 1.2, 12, 0)
+    score += np.where(data['vp_corr_20'].fillna(0) > 0.2, 13, 0)
 
-    # 区间位置与形态 (0~20)
-    score += np.where(data['high_low_pos_20'].fillna(0.5) >= 0.7, 10, 0)
-    score += np.where((data['dif'] > data['dea']) & (data['macd_bar'] > 0), 10, 0)
+    # 区间位置与形态 (0~25)
+    score += np.where(data['high_low_pos_20'].fillna(0.5) >= 0.7, 12, 0)
+    score += np.where((data['dif'] > data['dea']) & (data['macd_bar'] > 0), 13, 0)
 
-    # 波动率健康度 (0~10)
-    score += np.where((data['norm_atr'].fillna(3) >= 1.5) & (data['norm_atr'].fillna(3) <= 6.0), 10, 5)
+    # 波动率健康度 (0~20)
+    score += np.where((data['norm_atr'].fillna(3) >= 1.5) & (data['norm_atr'].fillna(3) <= 6.0), 20, 8)
 
     data['alpha_score'] = np.clip(score, 0, 100).round(1)
 

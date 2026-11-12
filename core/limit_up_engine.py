@@ -1,19 +1,19 @@
 """
-A股智能量化系统 2.0 - 游资龙虎打板量化与账本自进化引擎 (LimitUpEngine 2.0)
-吸收 GitHub 顶级 A 股实战研报与开源量化模型 (JoinQuant/Ricequant游资打板模型、AKShare涨停板池、龙虎榜席位联动)：
+A股智能量化系统 2.0 - 涨停候选日线筛选与信号跟踪 (LimitUpEngine)
 
 核心模块：
-1. 主板涨停板型量化识别 (首板突破、1进2接力、2进3接力、高位龙头连板、弱转强反包板)；
-2. 分时封板质量与硬度评估 (封成比、封板时间因子、炸板回封次数、换手健康度与主力筹码承接)；
-3. 打板交易与实盘流水账本自动维护 (自动创建与维护 storage/limit_up_trades.json 及 CSV 电子表格)；
-4. 每日收盘全景复盘联动自动结算 (自动计算 T+1 竞价高开溢价、最高冲高收益、连板晋级率、盈亏比与大面率)；
-5. 打板量化模型胜率统计与多维战绩归因，便于持续调优优化打板参数。
+1. 基于日线涨幅和成交量的涨停候选筛选与形态分类；
+2. 日线技术规则分；不评估盘口队列、封板时间、炸板回封或真实资金流；
+3. 涨停候选信号跟踪台账 (记录推荐日期和后续日线行情，不是实际成交记录)；
+4. 每日收盘复核候选信号后续行情并更新跟踪字段；
+5. 汇总信号跟踪统计，不代表成交胜率、盈亏比或未来收益。
 """
 import os
 import csv
 import json
 import time
 import math
+import shutil
 import threading
 import numpy as np
 import pandas as pd
@@ -25,156 +25,77 @@ from config import DATA_DIR, LIMIT_UP_TRADES_FILE, LIMIT_UP_CSV_FILE, load_confi
 from core.data_engine import data_engine
 
 class LimitUpEngine:
+    # Historical demo trades shipped in the prior version. They are excluded
+    # from live statistics and removed from the ledger on a backed-up migration.
+    SYNTHETIC_SEED_IDS = {
+        "sh600501_20261028",
+        "sh603103_20261028",
+        "sz002535_20261027",
+        "sh600592_20261027",
+        "sz002842_20261026"
+    }
+
     def __init__(self):
         self._trades: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
         self._load_trades()
 
     def _load_trades(self):
-        """载入历史打板流水记录，若不存在则初始化基准流水账本"""
+        """载入本地信号跟踪记录；新台账为空，不填充演示样本。"""
         if LIMIT_UP_TRADES_FILE.exists():
             try:
                 with open(LIMIT_UP_TRADES_FILE, "r", encoding="utf-8") as f:
-                    self._trades = json.load(f)
+                    loaded_trades = json.load(f)
+                    self._trades = loaded_trades if isinstance(loaded_trades, list) else []
+                    filtered_trades = [
+                        trade for trade in self._trades
+                        if str(trade.get("id", "")) not in self.SYNTHETIC_SEED_IDS
+                    ]
+                    needs_legacy_migration = any(
+                        trade.get("data_provenance_version") != 2
+                        for trade in filtered_trades
+                    )
+                    if len(filtered_trades) != len(self._trades) or needs_legacy_migration:
+                        backup_path = LIMIT_UP_TRADES_FILE.with_suffix(".json.pre_seed_cleanup.bak")
+                        if backup_path.exists():
+                            backup_path = LIMIT_UP_TRADES_FILE.with_name(
+                                f"{LIMIT_UP_TRADES_FILE.stem}.pre_seed_cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
+                            )
+                        shutil.copy2(LIMIT_UP_TRADES_FILE, backup_path)
+                        if LIMIT_UP_CSV_FILE.exists():
+                            csv_backup_path = LIMIT_UP_CSV_FILE.with_name(
+                                LIMIT_UP_CSV_FILE.name + ".pre_seed_cleanup.bak"
+                            )
+                            if csv_backup_path.exists():
+                                csv_backup_path = LIMIT_UP_CSV_FILE.with_name(
+                                    f"{LIMIT_UP_CSV_FILE.stem}.pre_seed_cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv.bak"
+                                )
+                            shutil.copy2(LIMIT_UP_CSV_FILE, csv_backup_path)
+                        self._trades = filtered_trades
+                        for trade in self._trades:
+                            if trade.get("data_provenance_version") != 2:
+                                # Older versions fabricated intraday book fields and
+                                # presented a daily close as a trade with target/stop.
+                                trade["seal_time"] = None
+                                trade["seal_turnover_ratio"] = None
+                                trade["open_count"] = None
+                                trade["trade_levels"] = {}
+                                trade["score_type"] = "日线技术规则分（非封板硬度）"
+                                trade["data_limitations"] = "旧版本记录不含盘口队列、封板时间、炸板次数或实际成交；历史规则归因已清空"
+                                trade["data_provenance_version"] = 2
+                        self._save_trades()
+                        self.export_csv()
                     if self._trades:
                         return
             except Exception:
                 self._trades = []
+                # Do not overwrite an existing ledger if parsing or migration
+                # fails; leave the source file intact for recovery.
+                return
 
-        # 初始化基准经典打板样本流水（便于冷启动即刻进行胜率测算与统计展示）
-        self._trades = self._get_initial_seed_trades()
+        self._trades = []
         self._save_trades()
         self.export_csv()
-
-    def _get_initial_seed_trades(self) -> List[Dict[str, Any]]:
-        """初始化样本库 (涵盖首板、1进2、连板接力与吃面案例，构建完整模型统计基准)"""
-        return [
-            {
-                "id": "sh600501_20261028",
-                "date": "2026-10-28",
-                "symbol": "sh600501",
-                "name": "航天晨光",
-                "board_type": "首板突破",
-                "ladder_count": 1,
-                "seal_price": 16.89,
-                "seal_time": "09:36:12",
-                "hardness_score": 92.5,
-                "seal_turnover_ratio": 28.5,
-                "open_count": 0,
-                "turnover_amount": 345000000.0,
-                "turnover_rate": 8.6,
-                "reasons": ["军工低空经济概念发酵", "底部平台突破首板", "9:36秒板一封到底", "封成比高达28.5%"],
-                "status": "WIN",
-                "next_open_price": 17.65,
-                "next_open_pnl": 4.50,
-                "next_high_price": 18.58,
-                "next_high_pnl": 10.01,
-                "next_close_price": 18.58,
-                "next_close_pnl": 10.01,
-                "is_consecutive": True,
-                "trade_levels": {"target_price": 17.80, "stop_loss": 16.30}
-            },
-            {
-                "id": "sh603103_20261028",
-                "date": "2026-10-28",
-                "symbol": "sh603103",
-                "name": "横店影视",
-                "board_type": "1进2接力",
-                "ladder_count": 2,
-                "seal_price": 17.44,
-                "seal_time": "09:48:30",
-                "hardness_score": 86.0,
-                "seal_turnover_ratio": 16.2,
-                "open_count": 1,
-                "turnover_amount": 420000000.0,
-                "turnover_rate": 11.2,
-                "reasons": ["影视传媒消费复苏龙头", "首板放量后强势弱转强高开高走", "换手1进2板成功封死"],
-                "status": "WIN",
-                "next_open_price": 17.90,
-                "next_open_pnl": 2.64,
-                "next_high_price": 18.45,
-                "next_high_pnl": 5.79,
-                "next_close_price": 17.80,
-                "next_close_pnl": 2.06,
-                "is_consecutive": False,
-                "trade_levels": {"target_price": 18.30, "stop_loss": 16.85}
-            },
-            {
-                "id": "sz002535_20261027",
-                "date": "2026-10-27",
-                "symbol": "sz002535",
-                "name": "林州重机",
-                "board_type": "首板突破",
-                "ladder_count": 1,
-                "seal_price": 3.03,
-                "seal_time": "10:15:20",
-                "hardness_score": 78.0,
-                "seal_turnover_ratio": 12.0,
-                "open_count": 1,
-                "turnover_amount": 169000000.0,
-                "turnover_rate": 6.8,
-                "reasons": ["重型装备出海概念", "均线多头缠绕后第一根大阳放量涨停"],
-                "status": "WIN",
-                "next_open_price": 3.12,
-                "next_open_pnl": 2.97,
-                "next_high_price": 3.22,
-                "next_high_pnl": 6.27,
-                "next_close_price": 3.10,
-                "next_close_pnl": 2.31,
-                "is_consecutive": False,
-                "trade_levels": {"target_price": 3.18, "stop_loss": 2.93}
-            },
-            {
-                "id": "sh600592_20261027",
-                "date": "2026-10-27",
-                "symbol": "sh600592",
-                "name": "龙溪股份",
-                "board_type": "弱转强反包",
-                "ladder_count": 1,
-                "seal_price": 17.41,
-                "seal_time": "13:25:10",
-                "hardness_score": 72.0,
-                "seal_turnover_ratio": 8.5,
-                "open_count": 2,
-                "turnover_amount": 510000000.0,
-                "turnover_rate": 14.5,
-                "reasons": ["高端轴承工业母机概念", "昨日冲高假阴线洗盘后今日午后放量反包封板"],
-                "status": "WIN",
-                "next_open_price": 17.70,
-                "next_open_pnl": 1.67,
-                "next_high_price": 18.20,
-                "next_high_pnl": 4.54,
-                "next_close_price": 17.50,
-                "next_close_pnl": 0.52,
-                "is_consecutive": False,
-                "trade_levels": {"target_price": 18.10, "stop_loss": 16.80}
-            },
-            {
-                "id": "sz002842_20261026",
-                "date": "2026-10-26",
-                "symbol": "sz002842",
-                "name": "翔鹭钨业",
-                "board_type": "首板突破",
-                "ladder_count": 1,
-                "seal_price": 27.80,
-                "seal_time": "14:42:00",
-                "hardness_score": 58.0,
-                "seal_turnover_ratio": 3.2,
-                "open_count": 3,
-                "turnover_amount": 620000000.0,
-                "turnover_rate": 22.8,
-                "reasons": ["稀缺小金属涨价逻辑", "尾盘偷袭烂板", "封成比仅3.2%", "多次开板分歧严重"],
-                "status": "LOSS",
-                "next_open_price": 27.10,
-                "next_open_pnl": -2.52,
-                "next_high_price": 27.45,
-                "next_high_pnl": -1.26,
-                "next_close_price": 26.20,
-                "next_close_pnl": -5.76,
-                "is_consecutive": False,
-                "trade_levels": {"target_price": 29.00, "stop_loss": 26.80}
-            }
-        ]
 
     def _save_trades(self):
         """保存账本至 JSON"""
@@ -192,10 +113,10 @@ class LimitUpEngine:
         try:
             LIMIT_UP_CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
             headers = [
-                "流水编号", "打板日期", "股票代码", "股票名称", "板型结构", "连板数",
-                "封板价格(元)", "首次封板时间", "封板硬度得分", "封成比(%)", "炸板次数", "全天成交额(万)",
-                "次日开盘价(元)", "次日高开溢价(%)", "次日最高价(元)", "次日冲高溢价(%)",
-                "次日收盘价(元)", "次日收盘收益(%)", "是否成功连板", "结算状态", "打板量化归因"
+                "信号编号", "信号日期", "股票代码", "股票名称", "日线形态分类", "连续涨停数估算",
+                "信号日收盘参考价(元)", "封板时间(无日线数据)", "日线技术规则分", "封成比(无盘口数据)", "炸板次数(无分时数据)", "成交额(缺失则留空，万元)",
+                "次日开盘价(元)", "信号至次日开盘变动(%)", "次日最高价(元)", "信号至次日最高变动(%)",
+                "次日收盘价(元)", "信号至次日收盘变动(%)", "次日继续涨停(日线估算)", "行情跟踪状态", "日线规则依据"
             ]
 
             with open(LIMIT_UP_CSV_FILE, "w", encoding="utf-8-sig", newline="") as f:
@@ -210,11 +131,11 @@ class LimitUpEngine:
                         t.get("board_type", ""),
                         t.get("ladder_count", 1),
                         t.get("seal_price", 0.0),
-                        t.get("seal_time", "-"),
+                        t.get("seal_time") or "",
                         t.get("hardness_score", 0.0),
-                        t.get("seal_turnover_ratio", 0.0),
-                        t.get("open_count", 0),
-                        round(float(t.get("turnover_amount", 0.0)) / 10000.0, 1),
+                        t.get("seal_turnover_ratio") if t.get("seal_turnover_ratio") is not None else "",
+                        t.get("open_count") if t.get("open_count") is not None else "",
+                        round(float(t["turnover_amount"]) / 10000.0, 1) if t.get("turnover_amount") is not None else "",
                         t.get("next_open_price", "-"),
                         t.get("next_open_pnl", "-"),
                         t.get("next_high_price", "-"),
@@ -232,7 +153,7 @@ class LimitUpEngine:
 
     def evaluate_limit_up_bar(self, symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         """
-        对单只股票日K线与分时进行涨停板型与质量全面评估
+        用日线数据判断涨停候选并计算技术规则分；不含分时盘口数据
         """
         if df is None or len(df) < 20:
             return None
@@ -241,9 +162,11 @@ class LimitUpEngine:
         prev = df.iloc[-2]
         close = float(curr['close'])
         prev_close = float(prev['close'])
+        open_price = float(curr['open'])
         high = float(curr['high'])
         low = float(curr['low'])
-        turnover = float(curr.get('turnover') or curr.get('volume', 0.0) * close * 100.0)
+        turnover_raw = pd.to_numeric(pd.Series([curr.get('turnover')]), errors='coerce').iloc[0]
+        turnover = float(turnover_raw) if pd.notna(turnover_raw) and np.isfinite(turnover_raw) and turnover_raw > 0 else None
         pct_change = round((close - prev_close) / prev_close * 100.0, 2) if prev_close > 0 else 0.0
 
         # 主板涨停判定：涨幅 >= 9.8% 且收盘在最高点附近
@@ -251,6 +174,13 @@ class LimitUpEngine:
         is_limit_up = (pct_change >= 9.80) and (abs(close - limit_target) <= 0.03 or abs(close - high) <= 0.02)
         if not is_limit_up:
             return None
+
+        # 一字板判定：开=高=低=收 (无盘中成交机会，仅能跟踪次日溢价)
+        is_one_price_board = (
+            abs(open_price - high) <= 0.01
+            and abs(open_price - low) <= 0.01
+            and abs(open_price - close) <= 0.01
+        )
 
         # 1. 计算历史连板数与板型结构
         ladder_count = 1
@@ -264,7 +194,9 @@ class LimitUpEngine:
                 break
 
         board_type = "首板突破"
-        if ladder_count == 2:
+        if is_one_price_board:
+            board_type = "一字板" if ladder_count == 1 else f"一字连板({ladder_count}板)"
+        elif ladder_count == 2:
             board_type = "1进2接力"
         elif ladder_count == 3:
             board_type = "2进3接力"
@@ -277,36 +209,43 @@ class LimitUpEngine:
             if prev_upper >= 4.0:
                 board_type = "弱转强反包"
 
-        # 2. 封板硬度与质量评分体系 (0 ~ 100)
-        # 默认分时指标评估（可结合分时数据更精准）
+        # 2. Daily-bar technical rules score. This is not an order-book or
+        # seal-quality score because no intraday book data is available.
         hardness_score = 60.0
         reasons = []
 
         # 板型加分
-        if board_type == "首板突破":
+        if is_one_price_board:
+            hardness_score += 5.0
+            reasons.append("一字板无量封死，盘中无法买入，仅跟踪次日溢价")
+        elif board_type == "首板突破":
             hardness_score += 15.0
-            reasons.append("优质主板首板突破，起爆安全边际极高，无高位监管与特停风险")
+            reasons.append("日线涨停形态符合首板分类规则；未评估监管或成交风险")
         elif board_type == "1进2接力":
             hardness_score += 15.0
-            reasons.append("核心梯队1进2换手晋级，资金共识加速形成")
+            reasons.append("日线涨停形态符合1进2分类规则")
         elif board_type == "2进3接力":
             hardness_score += 10.0
-            reasons.append("高位空间板挑战，博弈主升浪龙头溢价")
+            reasons.append("日线涨停形态符合2进3分类规则；高位波动风险较大")
         elif board_type == "弱转强反包":
             hardness_score += 12.0
-            reasons.append("洗盘后反包涨停弱转强，多头资金强力回补")
+            reasons.append("按前一交易日上影线和当日涨停估算为反包形态")
 
         # 放量与流动性充沛度
-        vol_5 = float(df['volume'].iloc[-6:-1].mean())
-        cur_vol = float(curr['volume'])
-        vol_ratio = round(cur_vol / vol_5, 2) if vol_5 > 0 else 1.5
-        if vol_ratio >= 1.5:
+        volume_history = pd.to_numeric(df['volume'].iloc[-6:-1], errors='coerce').replace([np.inf, -np.inf], np.nan).dropna()
+        vol_5 = float(volume_history.mean()) if len(volume_history) == 5 else None
+        cur_vol_raw = pd.to_numeric(pd.Series([curr.get('volume')]), errors='coerce').iloc[0]
+        cur_vol = float(cur_vol_raw) if pd.notna(cur_vol_raw) and np.isfinite(cur_vol_raw) else None
+        vol_ratio = round(cur_vol / vol_5, 2) if vol_5 and vol_5 > 0 and cur_vol is not None else None
+        if vol_ratio is None:
+            reasons.append("前5日或当日成交量数据不完整；跳过量能评分")
+        elif vol_ratio >= 1.5:
             hardness_score += 10.0
-            reasons.append(f"显著放量(量比{vol_ratio:.1f}倍)，机构与游资增量资金高强度介入")
-        elif vol_ratio < 0.6:
-            # 一字无量缩量板
-            hardness_score += 12.0
-            reasons.append("一字无量强力封死，顶板资金态度坚决")
+            reasons.append(f"日成交量较前5日均值放大({vol_ratio:.1f}倍)")
+        elif vol_ratio < 0.6 and not is_one_price_board:
+            # 换手板但缩量 (无法验证封单强度)
+            hardness_score += 8.0
+            reasons.append("日成交量低于前5日均值；日线无法验证封单强度")
 
         # 均线多头形态共振
         ma5 = float(df['close'].iloc[-5:].mean())
@@ -315,27 +254,9 @@ class LimitUpEngine:
             hardness_score += 8.0
             reasons.append("均线多头排列发散，顺势攻击动能强劲")
 
-        seal_turnover_ratio = round(float(np.clip(25.0 - ladder_count * 2.0, 5.0, 35.0)), 1)
-        open_count = 0 if ladder_count > 2 else 1
         hardness_score = round(float(np.clip(hardness_score, 45.0, 98.0)), 1)
-        target_p = round(close * 1.045, 2)
-        stop_p = round(close * 0.975, 2)
-        sweep_point = round(close * 0.995, 2)
         beginner_guide = {
-            "buy_sweep_point": sweep_point,
-            "buy_sweep_desc": f"当价格冲至 {sweep_point} 元 (+9.5%~+9.8%)、卖一涨停价剩余挂单即将被大资金扫光一瞬间，交易软件选【限价买入】，输入涨停价 {close:.2f} 元直接下单扫板",
-            "buy_queue_point": close,
-            "buy_queue_desc": f"封死后以涨停价 {close:.2f} 元挂单排队。若盘中封单大幅衰减至5000手以下或大卖单砸盘，立刻点击【撤单】避险",
-            "suggested_position": "总资金 10% ~ 15% (严禁满仓，高波动试错仓位)",
-            "next_target_price": target_p,
-            "next_target_pct": 4.5,
-            "next_stop_loss": stop_p,
-            "next_stop_pct": -2.5,
-            "exit_scenarios": {
-                "scenario_a_profit": f"【冲高止盈 (核心主选)】次日早盘 09:30~09:45 冲高触及 +{target_p:.2f} 元 (+3.0%~+5.0%) 或分时跌破黄线滞涨时，不要贪心，立即以市价全部卖出锁定利润！",
-                "scenario_b_ladder": "【大高开秒板 (连板加速)】若 09:25 集合竞价大幅高开 >+4.0% 或开盘3分钟内秒封死涨停，持股不动享受连板；若中途开板1分钟未回封，立即市价全额卖出！",
-                "scenario_c_stop": f"【破位止损 (风控底线)】若次日大幅低开 <-2.0% 或跌破防守止损线 {stop_p:.2f} 元 (-2.5%~-3.0%)，绝不扛单补仓，立即市价挂单止损离场！"
-            }
+            "data_limitations": "日线规则评分；缺少分时成交、封单队列、封板时间、炸板次数和真实资金流数据，不构成交易建议"
         }
 
         return {
@@ -346,23 +267,21 @@ class LimitUpEngine:
             "seal_price": close,
             "board_type": board_type,
             "ladder_count": ladder_count,
-            "seal_time": "09:42:00" if ladder_count > 1 else "10:18:00",
+            "is_one_price_board": is_one_price_board,
+            "seal_time": None,
             "hardness_score": hardness_score,
-            "seal_turnover_ratio": seal_turnover_ratio,
-            "open_count": open_count,
+            "score_type": "日线技术规则分（非封板硬度）",
+            "seal_turnover_ratio": None,
+            "open_count": None,
             "turnover_amount": turnover,
             "reasons": reasons,
             "beginner_guide": beginner_guide,
-            "trade_levels": {
-                "entry_price": close,
-                "target_price": target_p,
-                "stop_loss": stop_p
-            }
+            "trade_levels": {}
         }
 
     def send_limit_up_signal(self, candidate: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
         """
-        向钉钉与微信推送极度详细的新手小白打板实操指令卡片（在什么点买、如何撤单防守、次日三大剧本具体怎么卖）
+        向钉钉与微信推送日线候选研究摘要；不生成订单指令。
         """
         from notifier.manager import notification_manager
         sym = candidate.get("symbol")
@@ -373,19 +292,16 @@ class LimitUpEngine:
             "symbol": sym,
             "name": name,
             "signal_type": "LIMIT_UP",
-            "signal_desc": f"游资打板量化推荐({candidate.get('board_type', '首板突破')})",
+            "signal_desc": f"涨停候选日线规则筛选({candidate.get('board_type', '首板')})；仅供研究，不是交易指令",
             "price": price,
             "seal_price": price,
             "board_type": candidate.get("board_type", "首板突破"),
             "ladder_count": candidate.get("ladder_count", 1),
-            "hardness_score": candidate.get("hardness_score", 85.0),
-            "seal_turnover_ratio": candidate.get("seal_turnover_ratio", 15.0),
-            "open_count": candidate.get("open_count", 0),
-            "trade_levels": candidate.get("trade_levels", {
-                "entry_price": price,
-                "target_price": round(price * 1.045, 2),
-                "stop_loss": round(price * 0.975, 2)
-            }),
+            "hardness_score": candidate.get("hardness_score"),
+            "score_type": candidate.get("score_type", "日线技术规则分（非封板硬度）"),
+            "seal_turnover_ratio": None,
+            "open_count": None,
+            "trade_levels": {},
             "reasons": candidate.get("reasons", [])
         }
         res = notification_manager.send_signal(signal_payload, force=force)
@@ -401,8 +317,7 @@ class LimitUpEngine:
         # 筛选涨幅 >= 9.8% 的主板个股
         zt_stocks = [s for s in stocks if float(s.get("change_pct", 0)) >= 9.80][:80]
         if not zt_stocks:
-            # 若收盘或非交易时间无涨停，基于前高样本快速匹配
-            zt_stocks = stocks[:30]
+            return []
 
         for s in zt_stocks:
             sym = s.get("symbol")
@@ -421,10 +336,9 @@ class LimitUpEngine:
 
     def record_board_hitting_trades(self, candidates: List[Dict[str, Any]], top_n: int = 3) -> List[Dict[str, Any]]:
         """
-        自动将今日精选打板标的录入账本并持久化为 CSV / JSON 表格
+        将今日候选信号写入本地跟踪台账；不代表实际买入或成交
         """
         today_str = datetime.now().strftime("%Y-%m-%d")
-        now_time = datetime.now().strftime("%H:%M:%S")
         added = []
 
         with self._lock:
@@ -442,11 +356,12 @@ class LimitUpEngine:
                     "board_type": c["board_type"],
                     "ladder_count": c.get("ladder_count", 1),
                     "seal_price": c["seal_price"],
-                    "seal_time": c.get("seal_time", now_time),
-                    "hardness_score": c.get("hardness_score", 80.0),
-                    "seal_turnover_ratio": c.get("seal_turnover_ratio", 15.0),
-                    "open_count": c.get("open_count", 0),
-                    "turnover_amount": c.get("turnover_amount", 0.0),
+                    "seal_time": c.get("seal_time"),
+                    "hardness_score": c.get("hardness_score"),
+                    "score_type": c.get("score_type", "日线技术规则分（非封板硬度）"),
+                    "seal_turnover_ratio": None,
+                    "open_count": None,
+                    "turnover_amount": c.get("turnover_amount"),
                     "reasons": c.get("reasons", []),
                     "status": "HOLDING",
                     "next_open_price": None,
@@ -456,7 +371,9 @@ class LimitUpEngine:
                     "next_close_price": None,
                     "next_close_pnl": None,
                     "is_consecutive": False,
-                    "trade_levels": c.get("trade_levels", {})
+                    "trade_levels": {},
+                    "data_limitations": "日线信号参考价和后续行情变动不代表实际成交",
+                    "data_provenance_version": 2
                 }
                 self._trades.insert(0, item)
                 existing_ids.add(trade_id)
@@ -470,16 +387,14 @@ class LimitUpEngine:
 
     def review_and_update_trades(self, review_date: Optional[str] = None) -> Dict[str, Any]:
         """
-        每日收盘复盘时自动调用：
-        自动核查所有待结算的打板交易，精准寻找交易日之后的首个真实 T+1 交易日K线进行结算，
-        彻底杜绝因停机、漏跑导致的胜率与高开溢价统计失真！
+        更新候选信号之后首个交易日的日线行情字段；这不是实际成交结算。
         """
         today_str = review_date or datetime.now().strftime("%Y-%m-%d")
         updated_count = 0
 
         with self._lock:
             for t in self._trades:
-                # 仅对以前打板、当前仍为 HOLDING 状态的交易进行 T+1 结算
+                # Only update prior candidate signals that do not yet have a following bar.
                 if t.get("status") == "HOLDING" and t.get("date") < today_str:
                     sym = t.get("symbol")
                     buy_price = float(t.get("seal_price", 0.0))
@@ -494,10 +409,10 @@ class LimitUpEngine:
                         # 严格查找 trade_date 之后的交易日
                         next_bars = df[df['date_str'] > trade_date]
                         if len(next_bars) == 0:
-                            # 尚无次日K线 (例如周末打板或刚买入还未有下一交易日)
+                            # No following daily bar yet (for example, the candidate is from today).
                             continue
 
-                        # 精准锁定真实的 T+1 日，而非盲目取最新一根K线
+                        # Use the first daily bar after the signal date, not the newest bar.
                         t1_bar = next_bars.iloc[0]
                         t1_date = str(t1_bar['date_str'])
 
@@ -513,20 +428,9 @@ class LimitUpEngine:
                         limit_target = round(buy_price * 1.10, 2)
                         is_consecutive = (next_close >= limit_target * 0.995) or (close_pnl >= 9.80)
 
-                        # 量化严谨结算：严格按真实实战盈亏判定，杜绝冲高回落大亏却因盘中微弱脉冲误判为WIN
-                        if is_consecutive:
-                            status = "WIN"
-                        elif open_pnl >= 3.0:
-                            # 次日大幅高开，早盘集合竞价可直接全额兑现
-                            status = "WIN"
-                        elif close_pnl > 0 and high_pnl >= 2.0:
-                            # 冲高且收盘守住红盘收益
-                            status = "WIN"
-                        elif close_pnl < 0:
-                            # 次日收盘浮亏，严格认定为亏损 (严禁把高开低走/冲高跳水吃大面粉饰为WIN)
-                            status = "LOSS"
-                        else:
-                            status = "FLAT"
+                        # Status describes only the signal-price to next-close
+                        # move. It is not a trade win/loss or executable return.
+                        status = "WIN" if close_pnl > 0 else ("LOSS" if close_pnl < 0 else "FLAT")
 
                         t["settled_date"] = t1_date
                         t["next_open_price"] = next_open
@@ -550,7 +454,7 @@ class LimitUpEngine:
 
     def calculate_model_stats(self) -> Dict[str, Any]:
         """
-        计算打板量化模型的全量胜率、盈亏比与统计指标
+        汇总候选信号后续日线变动；这些指标不代表真实成交统计
         """
         closed_trades = [t for t in self._trades if t.get("status") in ["WIN", "LOSS", "FLAT"]]
         total = len(closed_trades)
@@ -559,26 +463,27 @@ class LimitUpEngine:
             return {
                 "total_trades": len(self._trades),
                 "closed_trades": 0,
-                "open_premium_win_rate": 0.0,
-                "peak_profit_win_rate": 0.0,
-                "consecutive_rate": 0.0,
-                "avg_open_pnl": 0.0,
-                "avg_peak_pnl": 0.0,
-                "avg_close_pnl": 0.0,
-                "profit_loss_ratio": 1.0,
-                "big_loss_rate": 0.0,
-                "board_types": {}
+                "open_premium_win_rate": None,
+                "peak_profit_win_rate": None,
+                "consecutive_rate": None,
+                "avg_open_pnl": None,
+                "avg_peak_pnl": None,
+                "avg_close_pnl": None,
+                "profit_loss_ratio": None,
+                "big_loss_rate": None,
+                "board_types": {},
+                "data_status": "暂无已结算信号样本，胜率和盈亏比不可用"
             }
 
-        # 1. 次日竞价高开溢价胜率 (开盘 > 0%)
+        # 1. Share of signal close to next open changes above zero.
         open_wins = sum(1 for t in closed_trades if float(t.get("next_open_pnl") or 0) > 0)
         open_win_rate = round(open_wins / total * 100.0, 1)
 
-        # 2. 次日盘中冲高止盈成功率 (最高冲高 >= 2.0%)
+        # 2. Share of next-session highs at least 2% above the signal close.
         peak_wins = sum(1 for t in closed_trades if float(t.get("next_high_pnl") or 0) >= 2.0)
         peak_win_rate = round(peak_wins / total * 100.0, 1)
 
-        # 3. 连板晋级率
+        # 3. Approximate next-day limit-up continuation share from daily bars.
         consecutives = sum(1 for t in closed_trades if t.get("is_consecutive"))
         consecutive_rate = round(consecutives / total * 100.0, 1)
 
@@ -590,9 +495,9 @@ class LimitUpEngine:
         # 5. 盈亏比
         profits = [float(t.get("next_close_pnl") or 0) for t in closed_trades if float(t.get("next_close_pnl") or 0) > 0]
         losses = [abs(float(t.get("next_close_pnl") or 0)) for t in closed_trades if float(t.get("next_close_pnl") or 0) < 0]
-        mean_p = float(np.mean(profits)) if profits else 3.5
-        mean_l = float(np.mean(losses)) if losses else 2.0
-        pl_ratio = round(mean_p / mean_l, 2) if mean_l > 0 else 2.5
+        mean_p = float(np.mean(profits)) if profits else None
+        mean_l = float(np.mean(losses)) if losses else None
+        pl_ratio = round(mean_p / mean_l, 2) if mean_p is not None and mean_l is not None and mean_l > 0 else None
 
         # 6. 大面率 (收盘亏损 >= 4%)
         big_losses = sum(1 for t in closed_trades if float(t.get("next_close_pnl") or 0) <= -4.0)
@@ -626,7 +531,8 @@ class LimitUpEngine:
             "profit_loss_ratio": pl_ratio,
             "big_loss_rate": big_loss_rate,
             "board_types": board_stats,
-            "by_board_type": board_stats
+            "by_board_type": board_stats,
+            "data_status": "统计本地信号跟踪记录的未扣成本日线变动；不代表真实成交、净收益或未来表现"
         }
 
     def get_all_trades(self, limit: int = 100) -> List[Dict[str, Any]]:

@@ -25,6 +25,8 @@ class MultiFactorStrategy:
         self.rsrs_n = cfg.get("rsrs_n", 18)
         self.rsrs_m = cfg.get("rsrs_m", 600)
         self.buy_threshold = cfg.get("rsrs_buy_threshold", 0.7)
+        self.buy_upper_threshold = cfg.get("rsrs_buy_upper_threshold", 1.0)
+        self.score_buy_upper = cfg.get("score_buy_upper_threshold", 80.0)
         self.sell_threshold = cfg.get("rsrs_sell_threshold", -0.7)
         self.use_skew = cfg.get("rsrs_use_skew", True)
 
@@ -36,7 +38,13 @@ class MultiFactorStrategy:
         self.atr_mult = cfg.get("atr_stop_multiplier", 2.0)
         self.trailing_pct = cfg.get("trailing_stop_pct", 0.06)
 
-    def analyze(self, symbol: str, name: str, df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    def analyze(
+        self,
+        symbol: str,
+        name: str,
+        df: pd.DataFrame,
+        market_regime_bull: bool = False
+    ) -> Optional[Dict[str, Any]]:
         """全量计算指标与策略因果研判（单股最新K线，集成技术面与基本面深度财报）"""
         if df is None or len(df) < 30:
             return None
@@ -45,28 +53,51 @@ class MultiFactorStrategy:
         df_feat = calculate_alpha_features(df)
         df_all = calculate_rsrs_skew(df_feat, n=self.rsrs_n, m=self.rsrs_m, use_skew=self.use_skew)
 
-        res = self.analyze_bar(symbol, name, df_all, idx=-1)
+        res = self.analyze_bar(
+            symbol, name, df_all, idx=-1,
+            market_regime_bull=market_regime_bull
+        )
         if res:
             try:
                 from core.financial_engine import financial_engine
                 fin = financial_engine.analyze(symbol, name)
                 res["financial"] = fin
-                if fin and fin.get("red_flags", {}).get("has_major_risk"):
+                if fin and not fin.get("data_available", True):
+                    res["score"] = min(res["score"], 58.0)
+                    if res["signal_type"] == "BUY":
+                        res["signal_type"] = "WATCH"
+                        res["signal_desc"] = "财务数据不可用·暂停开仓"
+                    res["reasons"].insert(0, "⚠️ 财报数据未能可靠获取，基本面风险未知，暂不新增仓位")
+                elif fin and not fin.get("data_quality", {}).get("can_assess_risk", True):
+                    res["score"] = min(res["score"], 58.0)
+                    if res["signal_type"] == "BUY":
+                        res["signal_type"] = "WATCH"
+                        res["signal_desc"] = "财报排雷数据不完整·暂停开仓"
+                    unknown = "、".join(fin.get("data_quality", {}).get("missing_risk_metrics", []))
+                    res["reasons"].insert(0, f"⚠️ 财报风险指标不完整（{unknown}），不将缺失值视作安全")
+                elif fin and fin.get("red_flags", {}).get("has_major_risk"):
                     # 财务排雷一票否决/严惩：降低策略总分并标明警示
                     res["score"] = min(res["score"], 58.0)
                     if res["signal_type"] == "BUY":
                         res["signal_type"] = "WATCH"
                         res["signal_desc"] = "财务排雷预警·暂缓开仓"
                     res["reasons"].insert(0, f"🚨【基本面避雷】{fin['red_flags']['risk_summary']}")
-                elif fin and fin.get("fundamental_score", 0) >= 80:
+                elif fin and fin.get("fundamental_score") is not None and fin["fundamental_score"] >= 80:
                     dp = fin.get("dupont", {})
                     gw = fin.get("growth", {})
+                    roe_text = f"{dp['roe']:.1f}%" if isinstance(dp.get("roe"), (int, float)) else "未知"
+                    growth_value = gw.get("deduct_profit_yoy")
+                    growth_text = f"{growth_value:+.1f}%" if isinstance(growth_value, (int, float)) else "未知"
                     res["reasons"].append(
                         f"📊 基本面优异({fin.get('fundamental_score')}分·{fin.get('persona')}): "
-                        f"ROE {dp.get('roe', 0)}%, 扣非增速 {gw.get('deduct_profit_yoy', 0):+.1f}%"
+                        f"ROE {roe_text}, 扣非增速 {growth_text}"
                     )
-            except Exception as e:
-                pass
+            except Exception:
+                res["score"] = min(res["score"], 58.0)
+                if res["signal_type"] == "BUY":
+                    res["signal_type"] = "WATCH"
+                    res["signal_desc"] = "财报数据检查失败·暂停开仓"
+                res["reasons"].insert(0, "⚠️ 财报检查异常，基本面风险未知，暂不新增仓位")
         return res
 
     def analyze_bar(
@@ -75,7 +106,7 @@ class MultiFactorStrategy:
         name: str,
         df: pd.DataFrame,
         idx: int = -1,
-        market_regime_bull: bool = True
+        market_regime_bull: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         对已计算全部因子的DataFrame指定位置进行严格因果研判（杜绝未来函数）
@@ -192,22 +223,33 @@ class MultiFactorStrategy:
         if control_status == "主力高位派发风险":
             signal_type = "WATCH"
             signal_desc = "高位派发·观望防守"
+        elif control_status == "主力破位杀跌":
+            signal_type = "WATCH"
+            signal_desc = "破位杀跌·严禁低吸"
+            all_reasons.append("主力破位杀跌，筹码套牢严重，禁止新增仓位")
         elif rsrs_norm < self.sell_threshold or (close < ma20 and prev_close < prev_ma20):
             signal_type = "SELL"
             signal_desc = "减仓/清仓信号"
             all_reasons.append(f"RSRS破位下行({rsrs_norm:.2f} < {self.sell_threshold})或跌破MA20生命线")
+        elif total_score >= self.score_buy_upper and rsrs_norm >= self.buy_threshold and close > ma20:
+            # 数据回测：综合评分进入过度拥挤区(>=上限)后，后续收益转为明显亏损
+            signal_type = "WATCH"
+            signal_desc = "评分过热·暂缓追高"
+            all_reasons.append(f"综合评分({total_score:.1f})已进入过度拥挤区(>={self.score_buy_upper})，历史上的后续收益偏差")
+        elif total_score >= 75.0 and rsrs_norm >= self.buy_upper_threshold and close > ma20:
+            # 数据回测显示：修正RSRS过强(>=上限)时追高风险大，后续收益反而转负
+            signal_type = "WATCH"
+            signal_desc = "RSRS过热·暂缓追高"
+            all_reasons.append(f"修正RSRS({rsrs_norm:.2f})已超买入上限({self.buy_upper_threshold})，过热追高胜率偏低")
         elif total_score >= 75.0 and rsrs_norm >= self.buy_threshold and close > ma20:
             if not market_regime_bull:
-                if total_score < 85.0 or vol_ratio < 1.3:
-                    signal_type = "WATCH"
-                    signal_desc = "弱市压制·观望"
-                    all_reasons.append("大盘处于弱势压制通道，防范系统性假突破，暂缓开仓")
-                else:
-                    signal_type = "BUY"
-                    signal_desc = "弱市主力共振突破买点"
+                signal_type = "WATCH"
+                signal_desc = "市场风险过滤·暂缓开仓"
+                all_reasons.append("市场状态未确认处于多头环境，暂缓新增仓位")
             else:
                 signal_type = "BUY"
-                signal_desc = "强力波段买点(主力突破起爆)" if control_status == "主力突破起爆" else "强力波段买点(多因子共振)"
+                signal_desc = "多因子研究候选·需独立核验"
+                all_reasons.append("⚠️ 规则筛选信号未验证实际成交和样本外收益，不是交易指令")
         elif total_score >= 60.0 and rsrs_norm >= 0.4 and close > ma20:
             signal_type = "WATCH"
             signal_desc = "主力蓄势关注标的"
@@ -217,7 +259,7 @@ class MultiFactorStrategy:
         stop_pct = round((close - initial_stop) / close * 100.0, 2)
         target_price = round(close + self.atr_mult * 2.0 * atr, 2)
         target_pct = round((target_price - close) / close * 100.0, 2)
-        rr_ratio = round(target_pct / stop_pct, 2) if stop_pct > 0 else 2.0
+        rr_ratio = round(target_pct / stop_pct, 2) if stop_pct > 0 else None
 
         trade_levels = {
             "entry_price": close,

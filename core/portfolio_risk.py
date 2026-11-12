@@ -1,15 +1,15 @@
 """
-A股智能量化系统 2.0 - 现代组合风控与动态仓位优化引擎 (PortfolioRisk 2.0)
-结合 Barra 风险模型与桥水全天候风险平价理论：
-1. 波动率平价 (Volatility Parity)：个股仓位与自身真实波动率反比加权，平滑净值波动；
-2. 半凯利公式 (Half-Kelly Criterion)：基于前瞻胜率与盈亏比动态配置头寸；
+A股智能量化系统 2.0 - 组合风险预算与动态仓位限制 (PortfolioRisk)
+1. ATR止损距离约束单笔账户风险；
+2. 半凯利公式仅作为基于已结算样本估计的仓位上限；
 3. 大盘宏观自适应风险敞口 (Market Regime Exposure Control)；
-4. 单只个股集中度上限与全天候自适应 ATR 硬止损、保本止损与最高价回撤止盈。
+4. 单只个股集中度、总敞口和持仓数量上限。
 """
 import math
+import json
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple
-from config import load_config
+from config import WATCHLIST_FILE, load_config
 
 class PortfolioRiskManager:
     def __init__(self):
@@ -24,6 +24,65 @@ class PortfolioRiskManager:
         self.osc_exposure = cfg.get("oscillation_max_exposure", 0.55)
         self.bear_exposure = cfg.get("bear_market_max_exposure", 0.20)
         self.trailing_pct = cfg.get("trailing_stop_pct", 0.06)
+        self.risk_per_trade_pct = cfg.get("risk_per_trade_pct", 0.5)
+        self.atr_stop_multiplier = cfg.get("atr_stop_multiplier", 2.0)
+
+    def get_watchlist_portfolio_state(self, total_equity: Optional[float] = None) -> Dict[str, Any]:
+        """Estimate current exposure from manually maintained watchlist holdings.
+
+        This is only as complete as the user's watchlist and live quotes; a
+        missing quote with open holdings is treated as fully exposed.
+        """
+        equity = float(total_equity or self.initial_capital)
+        try:
+            if not WATCHLIST_FILE.exists():
+                return {"holdings_count": 0, "exposure_pct": 0.0, "available": True}
+            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            if not isinstance(items, list):
+                return {"holdings_count": 0, "exposure_pct": 100.0, "available": False}
+        except Exception:
+            return {"holdings_count": 0, "exposure_pct": 100.0, "available": False}
+
+        holdings = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                shares = int(item.get("holding_shares") or item.get("shares") or 0)
+            except (TypeError, ValueError):
+                shares = 0
+            if shares > 0 and item.get("symbol"):
+                holdings.append((str(item["symbol"]), shares))
+
+        if not holdings:
+            return {"holdings_count": 0, "exposure_pct": 0.0, "available": True}
+        if equity <= 0:
+            return {"holdings_count": len(holdings), "exposure_pct": 100.0, "available": False}
+
+        try:
+            from core.data_engine import data_engine as market_data_engine
+            quotes = market_data_engine.get_realtime_quotes([item[0] for item in holdings])
+        except Exception:
+            market_data_engine = None
+            quotes = {}
+
+        market_value = 0.0
+        for symbol, shares in holdings:
+            quote_symbol = market_data_engine.format_symbol(symbol) if market_data_engine else symbol
+            quote = quotes.get(quote_symbol, {}) if quotes else {}
+            price = float(quote.get("price") or 0.0)
+            if price <= 0:
+                # Unknown current value is not treated as zero exposure.
+                return {"holdings_count": len(holdings), "exposure_pct": 100.0, "available": False}
+            market_value += price * shares
+
+        return {
+            "holdings_count": len(holdings),
+            "exposure_pct": round(market_value / equity * 100.0, 2),
+            "available": True,
+            "scope": "watchlist holdings only"
+        }
 
     def calculate_position_size(
         self,
@@ -33,21 +92,25 @@ class PortfolioRiskManager:
         total_equity: float,
         current_holdings_count: int,
         market_regime: str = "多头震荡市",
-        win_rate: float = 0.55,
-        profit_loss_ratio: float = 2.0
+        win_rate: Optional[float] = None,
+        profit_loss_ratio: Optional[float] = None,
+        current_exposure_pct: float = 0.0,
+        performance_sample_size: int = 0
     ) -> Dict[str, Any]:
         """
-        结合半凯利公式与波动率平价计算单只标的的建议建仓股数与资金比例
+        按样本校验、ATR风险预算和组合上限计算参考股数；样本不足时拒绝给仓位建议
         """
         self.reload_config()
 
-        # 1. 确定宏观大盘总敞口上限
+        # 1. 确定宏观大盘总敞口上限。未知市场状态按防守处理。
         if "强多头" in market_regime or "牛市" in market_regime:
             max_total_exposure = self.bull_exposure
         elif "空头" in market_regime or "杀跌" in market_regime:
             max_total_exposure = self.bear_exposure
-        else:
+        elif "震荡" in market_regime or "中性" in market_regime:
             max_total_exposure = self.osc_exposure
+        else:
+            max_total_exposure = 0.0
 
         # 检查是否已达持仓只数上限
         if current_holdings_count >= self.max_positions:
@@ -59,27 +122,88 @@ class PortfolioRiskManager:
                 "position_pct": 0.0
             }
 
-        # 2. 半凯利公式基准比例测算: f = 0.5 * (p * b - q) / b
-        b = max(profit_loss_ratio, 1.0)
-        p = min(max(win_rate, 0.3), 0.8)
+        if total_equity <= 0 or price <= 0 or atr <= 0:
+            return {
+                "allowed": False,
+                "reason": "净值、价格或 ATR 数据无效，禁止计算仓位",
+                "suggested_shares": 0,
+                "suggested_capital": 0.0,
+                "position_pct": 0.0
+            }
+        if max_total_exposure <= 0:
+            return {
+                "allowed": False,
+                "reason": "市场状态未知或风险敞口为零，暂停新增仓位",
+                "suggested_shares": 0,
+                "suggested_capital": 0.0,
+                "position_pct": 0.0,
+                "max_total_exposure": 0.0
+            }
+
+        if win_rate is None or profit_loss_ratio is None or performance_sample_size < 30:
+            return {
+                "allowed": False,
+                "reason": "缺少至少30笔已结算、非重复的策略样本；不使用假设胜率/盈亏比计算凯利仓位",
+                "suggested_shares": 0,
+                "suggested_capital": 0.0,
+                "position_pct": 0.0,
+                "performance_sample_size": performance_sample_size
+            }
+
+        # 2. 半凯利公式作为仓位上限；负期望或零期望不建仓。
+        b = float(profit_loss_ratio)
+        p = min(max(float(win_rate), 0.0), 1.0)
+        if b <= 0:
+            return {
+                "allowed": False,
+                "reason": "盈亏比无效，无法证明策略具有正期望",
+                "suggested_shares": 0,
+                "suggested_capital": 0.0,
+                "position_pct": 0.0
+            }
         q = 1.0 - p
         kelly_f = max(0.0, (p * b - q) / b)
         half_kelly_pct = min(kelly_f * 0.5, self.max_single_pct)
+        if half_kelly_pct <= 0:
+            return {
+                "allowed": False,
+                "reason": "按输入胜率与盈亏比估算的期望收益不为正，暂不开仓",
+                "suggested_shares": 0,
+                "suggested_capital": 0.0,
+                "position_pct": 0.0
+            }
 
-        # 3. 波动率平价调整 (以日波幅 2.5% 为基准)
-        norm_vol = (atr / price * 100.0) if price > 0 else 3.0
-        vol_factor = np.clip(2.5 / max(norm_vol, 0.5), 0.5, 1.5)
-
-        # 综合单股目标配比
-        target_single_pct = min(half_kelly_pct * vol_factor, self.max_single_pct)
-
-        # 结合大盘总敞口缩放
-        effective_pct = target_single_pct * (max_total_exposure / 0.8)
-        effective_pct = min(max(effective_pct, 0.05), self.max_single_pct)
+        # 3. 用 ATR 止损距离控制单笔账户风险；再以等额槽位限制总敞口。
+        norm_vol = atr / price * 100.0
+        stop_distance_pct = max(norm_vol * self.atr_stop_multiplier, 0.1)
+        risk_budget_pct = max(self.risk_per_trade_pct, 0.0)
+        risk_limited_pct = risk_budget_pct / stop_distance_pct * 100.0
+        remaining_exposure_pct = max(max_total_exposure * 100.0 - max(float(current_exposure_pct), 0.0), 0.0)
+        remaining_slots = max(self.max_positions - current_holdings_count, 1)
+        per_slot_exposure_pct = min(
+            max_total_exposure / max(self.max_positions, 1) * 100.0,
+            remaining_exposure_pct / remaining_slots
+        )
+        target_single_pct = min(
+            half_kelly_pct * 100.0,
+            self.max_single_pct * 100.0,
+            per_slot_exposure_pct,
+            remaining_exposure_pct
+        )
+        effective_pct = min(target_single_pct, risk_limited_pct)
+        if effective_pct <= 0:
+            return {
+                "allowed": False,
+                "reason": "风险预算计算结果为零，暂不开仓",
+                "suggested_shares": 0,
+                "suggested_capital": 0.0,
+                "position_pct": 0.0,
+                "risk_budget_pct": risk_budget_pct
+            }
 
         suggested_capital = total_equity * effective_pct
         # A股买入整手 (100股整数倍)
-        raw_shares = int(suggested_capital / price) if price > 0 else 0
+        raw_shares = int(suggested_capital / (price * 1.001))
         suggested_shares = (raw_shares // 100) * 100
 
         if suggested_shares < 100:
@@ -101,7 +225,10 @@ class PortfolioRiskManager:
             "position_pct": actual_pct,
             "norm_volatility_pct": round(norm_vol, 2),
             "max_total_exposure": round(max_total_exposure * 100.0, 0),
-            "reason": f"半凯利({actual_pct}%)结合波动率平价配比"
+            "risk_budget_pct": risk_budget_pct,
+            "risk_at_stop_pct": round(actual_pct * stop_distance_pct / 100.0, 3),
+            "current_exposure_pct": round(max(float(current_exposure_pct), 0.0), 2),
+            "reason": f"半凯利上限、ATR止损风险预算({risk_budget_pct}%)与组合敞口槽位共同约束"
         }
 
     def check_exit_signals(

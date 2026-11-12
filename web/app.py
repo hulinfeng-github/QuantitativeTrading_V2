@@ -171,6 +171,7 @@ def get_watchlist():
             "name": name,
             "holding_cost": cost,
             "holding_shares": shares,
+            "available_shares": int(it.get('available_shares') or 0),
             "current_price": cur_p,
             "change_pct": chg_pct,
             "turnover": q.get('turnover', 0.0),
@@ -212,6 +213,10 @@ def add_to_watchlist(item: Dict[str, Any]):
         if it.get("symbol") == sym:
             it["holding_cost"] = float(item.get("holding_cost", it.get("holding_cost", 0.0)))
             it["holding_shares"] = int(item.get("holding_shares", it.get("holding_shares", 0)))
+            it["available_shares"] = min(
+                int(item.get("available_shares", it.get("available_shares", 0)) or 0),
+                max(0, it["holding_shares"])
+            )
             it["notes"] = item.get("notes", it.get("notes", ""))
             if "group_id" in item:
                 it["group_id"] = group_id
@@ -227,6 +232,10 @@ def add_to_watchlist(item: Dict[str, Any]):
         "name": name,
         "holding_cost": float(item.get("holding_cost", 0.0)),
         "holding_shares": int(item.get("holding_shares", 0)),
+        "available_shares": min(
+            max(0, int(item.get("available_shares", 0) or 0)),
+            max(0, int(item.get("holding_shares", 0) or 0))
+        ),
         "notes": item.get("notes", ""),
         "group_id": group_id,
         "t0_enabled": t0_enabled
@@ -258,6 +267,12 @@ def update_watchlist_item(symbol: str, data: Dict[str, Any] = Body(...)):
                     it["holding_cost"] = max(0.0, float(data["holding_cost"]))
                 if "holding_shares" in data:
                     it["holding_shares"] = max(0, int(data["holding_shares"]))
+                if "available_shares" in data:
+                    it["available_shares"] = max(0, int(data["available_shares"]))
+                it["available_shares"] = min(
+                    max(0, int(it.get("available_shares", 0) or 0)),
+                    max(0, int(it.get("holding_shares", 0) or 0))
+                )
                 if "notes" in data:
                     it["notes"] = str(data["notes"]).strip()
                 if "group_id" in data:
@@ -304,6 +319,9 @@ def delete_from_watchlist(symbol: str):
 @app.get("/api/t0/monitor")
 def get_t0_monitor():
     """获取所有自选持仓股的日内做T动态偏离与布林通道"""
+    if not load_config().get("t0_monitor_enabled", True):
+        return []
+
     watchlist = []
     if WATCHLIST_FILE.exists():
         try:
@@ -312,8 +330,18 @@ def get_t0_monitor():
         except Exception:
             pass
 
-    symbols = [x['symbol'] for x in watchlist if x.get('symbol')]
+    symbols = [
+        x['symbol'] for x in watchlist
+        if x.get('symbol') and x.get('t0_enabled', True)
+        and data_engine.is_main_board_equity(x['symbol'])
+    ]
     quotes = data_engine.get_realtime_quotes(symbols)
+    market_state = sentiment_radar.analyze_market_regime()
+    market_exposure = (
+        float(market_state.get("target_exposure"))
+        if market_state.get("data_available") and market_state.get("target_exposure") is not None
+        else None
+    )
 
     results = []
     groups_list = t0_group_manager.get_groups(include_stocks=False)
@@ -321,29 +349,35 @@ def get_t0_monitor():
 
     for it in watchlist:
         sym = it.get('symbol', '')
+        if not it.get('t0_enabled', True) or not data_engine.is_main_board_equity(sym):
+            continue
         name = it.get('name', sym)
         cost = float(it.get('holding_cost') or it.get('entry_price') or 0.0)
-        shares = int(it.get('holding_shares') or it.get('shares') or 100)
+        shares = int(it.get('holding_shares') or it.get('shares') or 0)
+        available_shares = min(int(it.get('available_shares') or 0), shares)
 
         q = quotes.get(sym, {})
         cur_p = q.get('price', 0.0)
         if cur_p <= 0:
             continue
 
-        df_kline = data_engine.get_daily_kline(sym, count=60)
+        df_kline = data_engine.get_daily_kline(sym, count=61)
         t0_res = t0_smart_engine.analyze_t0(
             symbol=sym,
             name=name,
             current_price=cur_p,
             daily_kline=df_kline,
             holding_cost=cost,
-            holding_shares=shares
+            holding_shares=shares,
+            available_shares=available_shares,
+            market_exposure=market_exposure
         )
         gid = it.get('group_id', '')
         gname = groups_map.get(gid, "默认做T组" if gid == "group_default" else "未分组") if gid else "未分组"
 
         t0_res["holding_cost"] = cost
         t0_res["holding_shares"] = shares
+        t0_res["available_shares"] = available_shares
         t0_res["change_pct"] = q.get('change_pct', 0.0)
         t0_res["group_id"] = gid
         t0_res["group_name"] = gname
@@ -364,6 +398,11 @@ def get_t0_monitor():
 def reset_t0():
     t0_smart_engine.tracker.reset_today()
     return {"success": True, "message": "已重置今日全部做T持仓状态与流水"}
+
+@app.get("/api/t0/stats")
+def get_t0_stats():
+    """获取日内做T历史已平仓样本的绩效统计 (信号代理口径，未含费用)"""
+    return t0_smart_engine.get_stats()
 
 # ==================== 做T分组与钉钉群管理专属 API ====================
 
@@ -422,7 +461,7 @@ def get_stock_minute(symbol: str):
 def diagnose_stock(symbol: str):
     """单只标的多因子深度量化诊断"""
     resolved = data_engine.resolve_symbol(symbol)
-    if not resolved:
+    if not resolved or not data_engine.is_main_board_equity(resolved.get("symbol", symbol)):
         raise HTTPException(status_code=400, detail="未找到该标的或非合规主板股票")
 
     sym = resolved["symbol"]
@@ -431,18 +470,27 @@ def diagnose_stock(symbol: str):
     if df is None or len(df) < 30:
         raise HTTPException(status_code=400, detail="历史K线数据不足")
 
-    res = multi_factor_strategy.analyze(sym, name, df)
+    market = sentiment_radar.analyze_market_regime()
+    res = multi_factor_strategy.analyze(
+        sym, name, df,
+        market_regime_bull=bool(market.get("data_available") and market.get("target_exposure", 0) >= 0.65)
+    )
     if not res:
         raise HTTPException(status_code=500, detail="策略指标计算失败")
 
     # 附带计算仓位建议
+    portfolio_state = portfolio_risk.get_watchlist_portfolio_state(portfolio_risk.initial_capital)
     eq_advice = portfolio_risk.calculate_position_size(
         symbol=sym,
         price=res["price"],
         atr=res["atr"],
-        total_equity=100000.0,
-        current_holdings_count=1
+        total_equity=portfolio_risk.initial_capital,
+        current_holdings_count=portfolio_state["holdings_count"],
+        market_regime=market.get("regime", "数据不可用·防守"),
+        current_exposure_pct=portfolio_state["exposure_pct"]
     )
+    eq_advice["portfolio_scope"] = "watchlist holdings only"
+    eq_advice["portfolio_data_available"] = portfolio_state["available"]
     res["position_advice"] = eq_advice
     return res
 
@@ -554,7 +602,7 @@ def get_review_history():
 @app.post("/api/review/run")
 def run_review_now():
     res = review_engine_v2.run_daily_review(auto_optimize=True)
-    return {"success": True, "message": "收盘量化复盘与参数自迭代执行完成", "data": res}
+    return {"success": True, "message": "收盘量化复盘完成；自动调参默认开启，已结算样本不足30笔时只记录、不修改参数", "data": res}
 
 @app.get("/api/optimization/log")
 def get_optimization_log():
@@ -588,7 +636,7 @@ def get_tail230_candidates(force_refresh: bool = False):
 
 @app.get("/api/tail230/performance")
 def get_tail230_performance(force_refresh: bool = False):
-    """获取 2.30 战法独立历史实战胜率与各项量化指标"""
+    """获取尾盘规则的日线代理回放统计，不是实盘胜率"""
     return tail_strategy_230.get_cached_or_run_backtest(force_refresh=force_refresh)
 
 @app.post("/api/tail230/recalculate")
@@ -604,12 +652,12 @@ def get_tail230_trades():
 
 @app.post("/api/tail230/trades/add")
 def add_tail230_trade(data: Dict[str, Any] = Body(...)):
-    """手动将某只标的加入 2.30 战法次日卖出盯盘"""
+    """录入用户确认的主板实际买入成交，仅用于行情提醒。"""
     sym = data.get("symbol")
     name = data.get("name", sym)
     price = float(data.get("buy_price") or data.get("price") or 0.0)
-    if not sym or price <= 0:
-        raise HTTPException(status_code=400, detail="代码与买入价不能为空且必须大于0")
+    if not sym or price <= 0 or not data_engine.is_main_board_equity(sym):
+        raise HTTPException(status_code=400, detail="请输入沪深主板普通股代码及有效的实际成交价")
     t = tail_trade_tracker.add_manual_trade(
         symbol=sym,
         name=name,
@@ -622,13 +670,14 @@ def add_tail230_trade(data: Dict[str, Any] = Body(...)):
 
 @app.post("/api/tail230/trades/close")
 def close_tail230_trade(data: Dict[str, Any] = Body(...)):
-    """手动平仓/完成某笔 2.30 战法交易"""
+    """录入用户确认的实际卖出成交价；行情提醒本身不会结算成交。"""
     sym = data.get("symbol")
     buy_date = data.get("buy_date")
     price = float(data.get("exit_price", 0.0))
+    if price <= 0:
+        raise HTTPException(status_code=400, detail="实际卖出成交价必须大于0")
     reason = data.get("exit_reason", "手动平仓离场")
-    status = data.get("status", "CLOSED_MANUAL")
-    t = tail_trade_tracker.close_trade(sym, buy_date, status, price, reason)
+    t = tail_trade_tracker.close_trade(sym, buy_date, "CLOSED_MANUAL", price, reason)
     if not t:
         raise HTTPException(status_code=404, detail="未找到对应的 2.30 战法持仓记录")
     return {"success": True, "trade": t}

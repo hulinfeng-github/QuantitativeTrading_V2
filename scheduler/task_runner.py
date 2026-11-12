@@ -29,7 +29,7 @@ def set_windows_sleep_prevention(enable: bool = True):
     """
     通过 Windows 核心原生 API (SetThreadExecutionState) 防止操作系统自动睡眠/休眠
     - 允许屏幕正常熄灭以省电和保护隐私
-    - 但强制锁定 CPU 与后台线程，保证定时任务在交易日 100% 准时执行
+    - 定时任务依赖主机持续运行、系统时钟和数据源，按配置尽力触发
     """
     if sys.platform.startswith("win"):
         try:
@@ -113,12 +113,26 @@ class QuantScheduler2:
         all_symbols = list(set(symbols + tail_syms))
         quotes = data_engine.get_realtime_quotes(all_symbols)
 
+        t0_market_exposure = None
+        if load_config().get("t0_monitor_enabled", True) and any(
+            item.get("t0_enabled", True) and data_engine.is_main_board_equity(item.get("symbol", ""))
+            for item in watchlist
+        ):
+            try:
+                from core.sentiment_radar import sentiment_radar
+                market_state = sentiment_radar.analyze_market_regime()
+                if market_state.get("data_available") and market_state.get("target_exposure") is not None:
+                    t0_market_exposure = float(market_state["target_exposure"])
+            except Exception:
+                t0_market_exposure = None
+
         for item in watchlist:
             try:
                 sym = item.get('symbol')
                 name = item.get('name', sym)
                 cost = float(item.get('holding_cost') or item.get('entry_price') or 0.0)
-                shares = int(item.get('holding_shares') or item.get('shares') or 100)
+                shares = int(item.get('holding_shares') or item.get('shares') or 0)
+                available_shares = min(int(item.get('available_shares') or 0), shares)
 
                 q = quotes.get(sym)
                 if not q:
@@ -163,7 +177,7 @@ class QuantScheduler2:
                             "reasons": [
                                 f"持仓浮亏达 {pnl_pct:+.2f}% (亏损 {abs(pnl_amt):.2f} 元)，已触及 -{hard_stop}% 账户硬止损保护线",
                                 f"现价({cur_p}元)较买入成本({cost}元)大幅下挫，技术面处于[{control_st}]",
-                                "严禁死扛或盲目补仓，必须严格执行量化纪律，建议立即挂单卖出平仓止损避险！"
+                                "模型风险阈值已触发。行情、实际持仓和可卖数量尚未核验；请先核对账户与委托状态，系统未提交订单。"
                             ],
                             "trade_levels": {
                                 "entry_price": cur_p,
@@ -183,32 +197,37 @@ class QuantScheduler2:
                             analysis_res["pnl_pct"] = pnl_pct
                         notification_manager.send_signal(analysis_res)
 
-                # 3. 检查日内做T机会
-                t0_res = t0_smart_engine.analyze_t0(
-                    symbol=sym,
-                    name=name,
-                    current_price=cur_p,
-                    daily_kline=df_kline,
-                    holding_cost=cost,
-                    holding_shares=shares
-                )
-                act = t0_res.get("signal_action")
-                if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
-                    sig_payload = t0_smart_engine.build_signal_payload(t0_res)
-                    if item.get("group_id"):
-                        sig_payload["group_id"] = item.get("group_id")
-                    notification_manager.send_signal(sig_payload)
+                # T0仅推送通过持仓、趋势与分时质量过滤的研究信号，不会自动下单。
+                if (load_config().get("t0_monitor_enabled", True)
+                        and item.get("t0_enabled", True)
+                        and data_engine.is_main_board_equity(sym)):
+                    t0_res = t0_smart_engine.analyze_t0(
+                        symbol=sym,
+                        name=name,
+                        current_price=cur_p,
+                        daily_kline=df_kline,
+                        holding_cost=cost,
+                        holding_shares=shares,
+                        available_shares=available_shares,
+                        market_exposure=t0_market_exposure
+                    )
+                    act = t0_res.get("signal_action")
+                    if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
+                        sig_payload = t0_smart_engine.build_signal_payload(t0_res)
+                        if item.get("group_id"):
+                            sig_payload["group_id"] = item.get("group_id")
+                        notification_manager.send_signal(sig_payload)
             except Exception as e:
                 print(f"[Scheduler 2.0] 巡检个股 {item.get('symbol', '')} 异常: {e}")
 
         # 4. 尾盘时段 (14:45-14:55) 自动检查未闭环做T头寸，发出强制平仓/对冲决策
         cur_hm = datetime.now().strftime("%H:%M")
-        if "14:45" <= cur_hm <= "14:55":
+        if load_config().get("t0_eod_force_close_enabled", True) and "14:45" <= cur_hm <= "14:55":
             eod_sigs = t0_smart_engine.check_eod_unclosed_positions()
             if eod_sigs:
                 notification_manager.send_signals_batch(eod_sigs)
 
-        # 5. 检查 2.30 战法昨日买入标的的次日卖出与平仓预警 (冲高止盈 / 破位止损 / 早盘衰竭 / 尾盘清仓)
+        # 5. 仅对用户确认实际买入的记录发送行情提醒；提醒不会自动结算成交。
         tail_exits = tail_trade_tracker.check_next_day_exits(quotes)
         if tail_exits:
             notification_manager.send_signals_batch(tail_exits)
@@ -232,6 +251,11 @@ class QuantScheduler2:
 
         cfg = load_config()
         min_turnover = cfg.get("min_turnover_amount", 100000000)
+        from core.sentiment_radar import sentiment_radar
+        market = sentiment_radar.analyze_market_regime()
+        market_regime_bull = bool(
+            market.get("data_available") and market.get("target_exposure", 0.0) >= 0.65
+        )
 
         # 过滤低流动性标的
         valid_stocks = [s for s in stocks if float(s.get("turnover", 0)) >= min_turnover][:total]
@@ -243,7 +267,9 @@ class QuantScheduler2:
             try:
                 df = data_engine.get_daily_kline(sym, count=180)
                 if df is not None and len(df) >= 30:
-                    res = multi_factor_strategy.analyze(sym, name, df)
+                    res = multi_factor_strategy.analyze(
+                        sym, name, df, market_regime_bull=market_regime_bull
+                    )
                     if res and res.get("score", 0) >= 60:
                         return res
             except Exception:
@@ -278,27 +304,27 @@ class QuantScheduler2:
         from core.sentiment_radar import sentiment_radar
         macro = sentiment_radar.analyze_market_regime()
 
-        # 筛选符合多因子高确定性条件的标的 (BUY 信号 或 综合评分 >= 65)
-        top_picks = [c for c in candidates if c.get("signal_type") == "BUY" or c.get("score", 0) >= 65][:6]
+        # 仅在市场数据有效且风险敞口处于结构性多头区间时推送 BUY 候选。
+        can_open = bool(macro.get("data_available") and macro.get("target_exposure", 0.0) >= 0.65)
+        top_picks = [c for c in candidates if c.get("signal_type") == "BUY"][:6] if can_open else []
 
         if not top_picks:
             msg = (
                 f"### 💎 A股收盘多因子智能选股雷达 ({date_str})\n\n"
                 f"> **大盘宏观定调**：{macro['regime']} (情绪温度计: {macro['temp_score']}分 · {macro['cycle_phase']})\n"
                 f"> **建议风险敞口**：{int(macro['target_exposure']*100)}% | 指导: {macro['action_guide']}\n\n"
-                f"🛡️ **量化风控选股结论**：\n"
-                f"- 今日全市场扫描评估，未发现满足『偏度修正 RSRS 超标 + CYQ 主力筹码集中起爆 + 财报排雷无瑕疵』的高确定性主板买入标的。\n"
-                f"- 在当前大盘弱势压制环境下，系统根据自适应风控纪律已自动调高安全防守边际，严格杜绝假突破诱多与逆势接飞刀。\n"
-                f"- **操盘指导**：保持空仓或轻仓防守观望，耐心等待大盘情绪回暖与右侧多因子共振买点确立。"
+                f"🛡️ **筛选结论**：\n"
+                f"- 今日没有通过当前市场过滤、技术规则和财务数据检查的新增候选。数据不完整时系统会暂停新增仓位。\n"
+                f"- 该过滤不能保证避免亏损，也不表示现有持仓需要买入或卖出。系统没有生成委托。"
             )
-            title = f"💎 收盘多因子选股: 今日严控风控·空仓观望 ({date_str})"
+            title = f"💎 收盘多因子筛选: 今日无新增候选 ({date_str})"
             notification_manager.send_markdown(title, msg, broadcast_groups=True, module_filter="push_screener")
             return
 
         lines = [
             f"### 💎 A股收盘多因子智能精选标的 ({date_str})\n",
             f"> 宏观大盘: **{macro['regime']}** (建议敞口: {int(macro['target_exposure']*100)}%) | 策略核心: **RSRS 2.0 + Alpha158 + CYQ筹码 + 财报排雷**\n",
-            f"| 标的名称 | 代码 | 最新现价 | 综合评分 | 修正RSRS | 主力控盘状态 | 财报画像/排雷 | 建议止损 / 止盈 |",
+            f"| 标的名称 | 代码 | 行情参考价 | 规则评分 | 修正RSRS | 筹码指标 | 财报数据状态 | 模型止损 / 目标参考 |",
             f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
         ]
 
@@ -307,7 +333,7 @@ class QuantScheduler2:
             fin = c.get("financial", {})
             rf = fin.get("red_flags", {})
             fin_persona = fin.get('persona', '主板标的')
-            fin_tag = f"{fin_persona} · {rf.get('risk_level', '安全')}"
+            fin_tag = f"{fin_persona} · {rf.get('risk_level') or '未知'}"
             stop_str = f"{levels.get('initial_stop', '-')}"
             target_str = f"{levels.get('target_price', '-')}"
 
@@ -323,16 +349,18 @@ class QuantScheduler2:
             fin = c.get("financial", {})
             dp = fin.get("dupont", {})
             gw = fin.get("growth", {})
-            f_score = fin.get("piotroski_f_score", {}).get("score", "-")
-            fin_highlights = f"杜邦ROE {dp.get('roe', '-')}% | 扣非增速 {gw.get('deduct_profit_yoy', '-')}% | 皮氏F-Score {f_score}/9分"
+            f_score = fin.get("piotroski_f_score", {}).get("score")
+            if f_score is None:
+                f_score = "不可用"
+            roe_text = f"{dp['roe']:.1f}%" if isinstance(dp.get('roe'), (int, float)) else "未知"
+            growth_value = gw.get('deduct_profit_yoy')
+            growth_text = f"{growth_value:+.1f}%" if isinstance(growth_value, (int, float)) else "未知"
+            fin_highlights = f"杜邦ROE {roe_text} | 扣非增速 {growth_text} | 可用F-Score字段 {f_score}"
             reasons_str = "；".join(c.get("reasons", [])[:2])
             lines.append(f"{idx}. **{c.get('name')}** (`{c.get('symbol')}`): {reasons_str} (📊 财报: {fin_highlights})")
 
         lines.append(
-            "\n💡 **次日实操交易指引**：\n"
-            "- 以上标的为多因子共振+财报排雷筛选之高景气/起爆标的，次日可结合早盘集合竞价表现择机介入。\n"
-            "- 严格遵守建议止损保护位，单笔仓位建议控制在 20%~25% 以内，杜绝单一重仓盲赌。\n"
-            "- *注：策略严格限定沪深主板高流动性标的，已自动剔除创业板/科创板/ST风险股票。*"
+            "\n以上为模型研究候选，止损和目标仅作规则参考，不是可成交价格或仓位建议。系统不会提交委托；请核对实际行情、账户持仓、可卖数量和交易状态。"
         )
 
         title = f"💎 收盘多因子主板精选: {top_picks[0].get('name')}等{len(top_picks)}只 ({date_str})"
@@ -340,31 +368,40 @@ class QuantScheduler2:
 
     def run_tail230_scan_and_notify(self):
         """尾盘 14:32 触发『2.30 突袭战法』主板精选标的扫描与推送"""
+        if not load_config().get("tail230_auto_scan_enabled", True):
+            return
         now = datetime.now()
         if now.weekday() >= 5:
+            return
+        from core.sentiment_radar import sentiment_radar
+        market = sentiment_radar.analyze_market_regime()
+        if not market.get("data_available") or market.get("target_exposure", 0.0) < 0.65:
+            print("[Tail230] 市场状态未确认多头或指数数据不可用，跳过隔夜策略扫描。")
             return
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动尾盘 2:30 战法主板精选标的扫描与推送...")
         candidates = tail_strategy_230.scan_today_candidates(limit=8, force_refresh=True)
         date_str = now.strftime('%Y-%m-%d')
         if not candidates:
             msg = (
-                f"### ⚡ 今日 2:30 尾盘主板突袭战法精选 ({date_str})\n\n"
-                f"> **监测提示**：今日 14:30 市场情绪或量能未达严格主力抢筹标准（要求沪深主板、日内涨幅+2%~+5.5%、量比>1.25、站稳MA5/MA20、小箱体突破形态）。\n\n"
-                f"🛡️ **策略风控提示**：今日无高确定性突袭标的入选，建议尾盘保持空仓观望或仅做好持仓对冲，规避次日低开风险。"
+                f"### ⚡ 今日尾盘日线规则筛选 ({date_str})\n\n"
+                f"> 当前日线行情未筛出候选。该筛选不能还原14:30成交、集合竞价队列或次日盘中路径。\n\n"
+                f"本系统没有生成委托建议；请以实际行情、持仓和风险限制为准。"
             )
             notification_manager.send_markdown("⚡ 2:30尾盘主板突袭雷达", msg, broadcast_groups=True, module_filter="push_tail230")
             return
 
         lines = [
-            f"### ⚡ 今日 2:30 尾盘主板突袭精选标的 ({date_str} 14:32)\n",
-            f"> 🎯 **核心策略逻辑**：锁定主板尾盘温和放量、均线多头站稳、涨幅在+2.0%~+5.5%区间的主力增量抢筹标的，次日早盘冲高极速兑现离场。\n",
-            f"| 股票名称 | 代码 | 最新价 | 涨跌幅 | 量比 | 目标止盈(+2.5%) | 防守止损(-1.8%) | 策略评分 |",
+            f"### ⚡ 尾盘日线规则候选研究摘要 ({date_str})\n",
+            "> 以下结果来自日线/行情代理规则，不代表14:30时点信号、实际成交、次日收益或投资建议。\n",
+            f"| 股票名称 | 代码 | 当前行情参考 | 涨跌幅 | 量比 | 模型目标参考价 | 模型止损参考价 | 规则分 |",
             f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
         ]
         for c in candidates[:6]:
+            vol_ratio = c.get('vol_ratio')
+            vol_ratio_text = f"{vol_ratio:.2f}倍" if vol_ratio is not None else "未知"
             lines.append(
                 f"| **{c.get('name')}** | `{c.get('symbol')}` | **{c.get('price'):.2f}** | "
-                f"**+{c.get('change_pct'):.2f}%** | {c.get('vol_ratio', 1.0):.2f}倍 | "
+                f"**+{c.get('change_pct'):.2f}%** | {vol_ratio_text} | "
                 f"`{c.get('target_sell_price', 0):.2f}` | `{c.get('stop_loss_price', 0):.2f}` | "
                 f"⭐ {c.get('score', 0):.1f} |"
             )
@@ -375,19 +412,14 @@ class QuantScheduler2:
             lines.append(f"{idx}. **{c.get('name')}** (`{c.get('symbol')}`): {reasons_str}")
 
         lines.append(
-            "\n💡 **实操交易指引**：\n"
-            "- **买入窗口**：今日 **14:35 ~ 14:55** 尾盘分批挂单介入。\n"
-            "- **次日兑现 (T+1)**：次日早盘 **09:30 ~ 09:45** 惯性冲高触及 +2.5% 或涨幅衰竭时果断止盈；若早盘破位跌破 -1.8% 止损位坚决执行纪律止损。\n"
-            "- *注：策略严格限定沪深主板，已自动剔除创业板/科创板/ST风险股票。*"
+            "\n模型价位仅用于研究展示，不是可执行委托；日线数据无法证明目标价或止损价曾可成交。\n"
+            "未录入用户确认的实际买入成交前，系统不会把候选加入持仓监控或计算账户收益。"
         )
 
         title = f"⚡ 2:30尾盘主板突袭精选: {candidates[0].get('name')}等{len(candidates)}只"
         notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_tail230")
 
-        # 自动将推荐标的纳入次日卖出与平仓跟踪引擎 (默认前3只)
-        cfg = load_config()
-        track_limit = cfg.get("tail230_auto_track_top_n", 3)
-        tail_trade_tracker.record_recommendations(candidates, limit=track_limit)
+        # Research candidates are not user positions and are never added to the fill ledger.
 
     def run_morning_auction_snapshot(self):
         """早盘 09:25:05 集合竞价撮合结束，执行官方开盘定价秒级感知与 2.30 战法高开止盈先手挂单"""
@@ -403,7 +435,7 @@ class QuantScheduler2:
         self.run_intraday_check(force=True)
 
     def run_tail230_morning_plan(self):
-        """早盘 09:28 集合竞价结束，触发『2.30 战法昨日持仓早盘操盘作战计划』预警"""
+        """早盘汇总用户确认买入记录的行情参考，不生成委托或成交。"""
         now = datetime.now()
         if now.weekday() >= 5:
             return
@@ -415,11 +447,11 @@ class QuantScheduler2:
         if not plans:
             return
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发 2.30 战法次日早盘操盘计划推送 ({len(plans)} 只持仓)...")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发尾盘策略实际成交记录行情提醒 ({len(plans)} 条)...")
         lines = [
-            f"### 🌅 2.30 战法·今日早盘操盘计划与盯盘预警 ({now.strftime('%Y-%m-%d 09:28')})\n",
-            f"> 🎯 **核心战法纪律**：昨日尾盘入场标的，今早集合竞价已定调。重点盯盘 **09:30 ~ 09:45** 冲高兑现窗口，触达目标果断挂单卖出！\n",
-            f"| 股票名称 | 代码 | 昨日买入价 | 集合竞价开盘 | 开盘溢价 | 止盈目标(+2.5%) | 防守止损(-1.8%) |",
+            f"### 🌅 尾盘策略实际成交记录行情提醒 ({now.strftime('%Y-%m-%d 09:28')})\n",
+            "> 以下记录由用户确认买入成交后建立；表内价位是模型观察线，通知不代表委托或成交。\n",
+            f"| 股票名称 | 代码 | 已记录买入成交价 | 当前行情参考 | 价格变化 | 模型目标参考价 | 模型止损参考价 |",
             f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
         ]
         for p in plans:
@@ -430,13 +462,10 @@ class QuantScheduler2:
             )
 
         lines.append(
-            "\n💡 **今早极速离场实战指令**：\n"
-            "- **冲高止盈**：开盘后脉冲上攻触及 **+2.5% 止盈线** 时，立即市价全额卖出锁定利润！\n"
-            "- **破位止损**：若直接低开破位跌破 **-1.8% 止损线**，坚决挂单止损，绝不恋战！\n"
-            "- **动能衰竭时限**：若 **09:45** 前未达止盈线且上涨动能衰竭，建议分批择机离场，杜绝短线变套牢！"
+            "\n行情触及模型价位时系统只发送提醒。请核对实际可卖数量、涨跌停/停牌状态和委托成交；本程序不会自动下单或将提醒记为实际平仓。"
         )
 
-        title = f"🌅 2.30战法早盘操盘计划: {plans[0].get('name')}等{len(plans)}只"
+        title = f"🌅 尾盘策略行情提醒: {plans[0].get('name')}等{len(plans)}条"
         notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_tail230")
 
     def run_eod_t0_check(self):
@@ -454,12 +483,17 @@ class QuantScheduler2:
             notification_manager.send_signals_batch(signals)
 
     def run_limit_up_intraday_scan(self):
-        """盘中游资打板量化扫描与精选个股通知推送 (自动记录实战跟踪账本并发送保姆级新手操盘卡片)"""
+        """盘中涨停候选日线筛选与可选研究摘要推送。"""
         if not self.is_trading_time():
             return
 
         cfg = load_config()
         if not cfg.get("limit_up_auto_notify_enabled", True):
+            return
+
+        from core.sentiment_radar import sentiment_radar
+        market = sentiment_radar.analyze_market_regime()
+        if not market.get("data_available") or market.get("target_exposure", 0.0) < 0.65:
             return
 
         min_score = float(cfg.get("limit_up_min_hardness", 80.0))
@@ -477,13 +511,13 @@ class QuantScheduler2:
 
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发盘中游资打板量化监控，精选出 {len(qualified)} 只优质涨停突破标的...")
 
-            # 自动录入打板流水账本
+            # Record candidates for daily-bar follow-up; this is not a fill ledger.
             try:
                 limit_up_engine.record_board_hitting_trades(qualified, top_n=top_n)
             except Exception as e:
                 print(f"[LimitUp] 自动记账异常: {e}")
 
-            # 发送保姆级打板卡片 (force=False 保证单日单股仅推送一次)
+            # Send research summaries (force=False keeps each symbol to one alert per day).
             pushed_count = 0
             for c in qualified:
                 res = limit_up_engine.send_limit_up_signal(c, force=False)
@@ -585,7 +619,7 @@ class QuantScheduler2:
             replace_existing=True
         )
 
-        # 3. 次日早盘 09:28 集合竞价 2.30 战法操盘作战计划预警
+        # 3. 次日早盘行情参考提醒（只针对用户确认的实际买入记录）
         self.scheduler.add_job(
             self.run_tail230_morning_plan,
             "cron",

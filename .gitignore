@@ -1,27 +1,30 @@
-# Python Bytecode & Environments
+# ---------------- Python ----------------
 __pycache__/
 *.py[cod]
 *$py.class
 .venv/
 venv/
 env/
+
+# ---------------- 环境变量 / 密钥 ----------------
+# 复制 .env.example 为 .env 后即可配置，.env 永不入库
 .env
 
-# Storage Data & Personal Privacy Protection (严格杜绝密钥与个人持仓泄露)
-storage/user_config.json
-storage/watchlist.json
-storage/signals_history.json
-storage/t0_trades.json
-storage/tail_trades_230.json
-storage/test_tail_trades.json
-storage/review_history.json
-storage/optimization_log.json
-storage/financial_cache.json
-storage/limit_up_trades.json
-storage/limit_up_ledger.csv
-storage/t0_groups.json
+# ---------------- 运行时数据与个人隐私 ----------------
+# storage/ 下除 *.example 模板外全部忽略：
+# 个人持仓、持仓成本、可卖数量、做T分组、钉钉/微信 Webhook 与密钥、
+# 交易流水、复盘历史、行情缓存、信号统计与日志都不随仓库上传。
+storage/*
+!storage/*.example
 
-# IDE & OS
+# 原子写入临时文件与日志
+*.tmp
+*.log
+
+# 一次性权限修复工具产物（如存在）
+.acl-recovery/
+
+# ---------------- IDE & OS ----------------
 .vscode/
 .idea/
 .DS_Store

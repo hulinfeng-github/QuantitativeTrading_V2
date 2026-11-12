@@ -41,12 +41,19 @@ class ChipEngine:
         if median_vol <= 0:
             median_vol = 1.0
 
-        for _, row in data.iterrows():
-            c_high = float(row['high'])
-            c_low = float(row['low'])
-            c_close = float(row['close'])
-            c_open = float(row['open'])
-            c_vol = float(row['volume'])
+        highs = data['high'].to_numpy(dtype=float)
+        lows = data['low'].to_numpy(dtype=float)
+        closes = data['close'].to_numpy(dtype=float)
+        opens = data['open'].to_numpy(dtype=float)
+        vols = data['volume'].to_numpy(dtype=float)
+        n_rows = len(data)
+
+        for i in range(n_rows):
+            c_high = highs[i]
+            c_low = lows[i]
+            c_close = closes[i]
+            c_open = opens[i]
+            c_vol = vols[i]
 
             if c_high <= c_low or c_vol <= 0:
                 continue

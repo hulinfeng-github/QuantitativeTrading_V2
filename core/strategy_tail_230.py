@@ -1,10 +1,7 @@
-"""
-A股智能量化系统 2.0 - 尾盘 2:30 突袭战法与胜率独立测算引擎 (TailStrategy230)
-融合 GitHub 高星开源项目 (songxiaoyan/stock-picker, hyan1985/stock-predict, 聚宽量化研报)：
-1. 专为 A 股主板设计的 8 步尾盘半小时 (14:30 - 14:50) 抢筹量化模型；
-2. 规避全天日内杀跌与假突破，聚焦尾盘高确定性主力增量资金共振；
-3. T+1 一夜持股极速离场机制（次日早盘冲高 9:30-9:45 快速兑现溢价）；
-4. 提供独立、严格杜绝未来函数的因果历史胜率与盈亏比回测测算。
+"""A-share late-session heuristic candidate scanner and daily-bar proxy replay.
+
+The inputs do not reconstruct 14:30 executions or next-session intraday paths.
+The replay is for research only and does not establish executable performance.
 """
 import math
 import json
@@ -22,18 +19,45 @@ from core.sentiment_radar import sentiment_radar
 
 class TailStrategy230:
     def __init__(self):
-        # 核心参数 (来自 GitHub 经典 8 步选股法实盘参数)
-        self.min_pct = 2.0                 # 最小日内涨幅 (2.0%，确保有攻击动能)
-        self.max_pct = 5.5                 # 最大日内涨幅 (5.5%，防过热追高或炸板)
-        self.min_vol_ratio = 1.25          # 最小量比 (主力资金抢筹特征)
-        self.min_turnover = 120000000.0    # 最小日成交额 (1.2亿元，保障充足流动性)
-        self.target_profit_pct = 2.5       # 次日早盘目标冲高止盈幅度 (%)
-        self.stop_loss_pct = 1.8           # 次日防守底线硬止损幅度 (%)
         self._cached_backtest = None
         self._cache_time = None
         self._cached_candidates = None
         self._candidates_cache_time = None
         self._scan_lock = threading.Lock()
+        self.reload_config()
+
+    def reload_config(self):
+        """从全局配置动态加载 2.30 战法参数 (支持热加载调优)"""
+        cfg = load_config()
+        self.min_pct = float(cfg.get("tail230_min_pct", 2.0))
+        self.max_pct = float(cfg.get("tail230_max_pct", 5.5))
+        self.min_vol_ratio = float(cfg.get("tail230_min_vol_ratio", 1.25))
+        self.min_turnover = float(cfg.get("tail230_min_turnover", 120000000.0))
+        self.target_profit_pct = float(cfg.get("tail230_target_profit_pct", 2.5))
+        self.stop_loss_pct = float(cfg.get("tail230_stop_loss_pct", 1.8))
+        self.backtest_universe_size = int(cfg.get("tail230_backtest_universe_size", 80))
+
+    def _default_backtest_universe(self) -> List[str]:
+        """从全市场主板按成交额取流动性居前的代表性样本作为回测标的池。"""
+        try:
+            stocks = data_engine.get_main_board_stock_list()
+            elig = [
+                s for s in stocks
+                if data_engine.is_main_board_equity(s.get("symbol", ""))
+                and float(s.get("turnover", 0) or 0) >= self.min_turnover
+            ]
+            elig.sort(key=lambda x: float(x.get("turnover", 0) or 0), reverse=True)
+            symbols = [s["symbol"] for s in elig[:self.backtest_universe_size]]
+            if symbols:
+                return symbols
+        except Exception:
+            pass
+        # 兜底：跨行业代表性大盘流动性标的
+        return [
+            "sh601138", "sh600519", "sh601899", "sh600036",
+            "sz002475", "sh600900", "sz000333", "sh600276",
+            "sz000651", "sh601318", "sz002594", "sh601668"
+        ]
 
     def analyze_bar(self, df: pd.DataFrame, idx: int = -1) -> Optional[Dict[str, Any]]:
         """
@@ -79,8 +103,12 @@ class TailStrategy230:
             return None
 
         # 4. 放量特征 (成交量高于过去 5 日均量 1.2 倍)
-        vol_ma5 = float(df['volume'].iloc[max(0, idx - 5):idx].mean())
-        vol_ratio = round(volume / vol_ma5, 2) if vol_ma5 > 0 else 1.0
+        volume_window = pd.to_numeric(df['volume'].iloc[max(0, idx - 5):idx], errors='coerce')
+        volume_window = volume_window.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(volume_window) < 5 or not np.isfinite(volume) or float(volume_window.mean()) <= 0:
+            return None
+        vol_ma5 = float(volume_window.mean())
+        vol_ratio = round(volume / vol_ma5, 2)
         if vol_ratio < self.min_vol_ratio:
             return None
 
@@ -187,16 +215,12 @@ class TailStrategy230:
         days: int = 150
     ) -> Dict[str, Any]:
         """
-        对 2.30 战法进行严格独立历史因果回测，精确计算实战胜率与盈亏指标
+        用日线代理规则回放尾盘策略；日线无法还原14:30成交和次日早盘路径
         """
-        # 经典代表性主板活跃高流动性股票池 (跨周期跨行业)
+        # 代表性流动性主板样本池 (跨周期跨行业)；可用 sample_symbols 显式覆盖
         if not sample_symbols:
-            sample_symbols = [
-                "sh601138", "sh600519", "sh601899", "sh600036",
-                "sz002475", "sh600900", "sz000333", "sh600276",
-                "sz000651", "sh601318", "sz002594", "sh601668",
-                "sh603993", "sz002156", "sh600585", "sz000002"
-            ]
+            sample_symbols = self._default_backtest_universe()
+        sample_symbols = [sym for sym in sample_symbols if data_engine.is_main_board_equity(sym)]
 
         # 获取上证指数基准用于宏观多空分层统计
         sh_df = data_engine.get_daily_kline("sh000001", count=days + 60)
@@ -222,7 +246,7 @@ class TailStrategy230:
         bear_trades = 0
         bear_wins = 0
 
-        # 真实交易摩擦成本 (印花税0.05% + 双边佣金0.05% + 滑点0.1% = 约0.2%)
+        # Approximate two-way costs; this is not observed fill or slippage data.
         friction_pct = 0.20
 
         # 并发极速预拉取样本标的历史K线
@@ -245,27 +269,37 @@ class TailStrategy230:
             total_len = len(df)
             start_i = max(25, total_len - days)
 
-            for i in range(start_i, total_len - 1):
+            for i in range(start_i, total_len - 2):
                 res = self.analyze_bar(df, idx=i)
                 if not res:
                     continue
 
-                # 模拟买入: T 日 14:30 尾盘买入价 (即 T 日 close)
-                buy_price = float(df.iloc[i]['close'])
-                buy_date = str(df.iloc[i]['date'])[:10]
-                is_market_bull = (buy_date in sh_bull_dates)
+                # The signal is known at T close. Use T+1 open as a proxy entry,
+                # then T+2 daily OHLC for exits so the model respects A-share T+1.
+                signal_date = str(df.iloc[i]['date'])[:10]
+                signal_close = float(df.iloc[i]['close'])
+                entry_bar = df.iloc[i + 1]
+                buy_date = str(entry_bar['date'])[:10]
+                buy_price = float(entry_bar['open'])
+                if buy_price <= 0:
+                    continue
+                # Approximate an unfillable one-price limit-up entry using a
+                # 10% ordinary-board threshold; historical special limits vary.
+                if np.isclose(float(entry_bar['high']), float(entry_bar['low']), atol=0.005) and buy_price >= signal_close * 1.095:
+                    continue
+                is_market_bull = (signal_date in sh_bull_dates)
 
-                # T+1 日（次日）验证行情
-                next_bar = df.iloc[i + 1]
-                next_date = str(next_bar['date'])[:10]
-                next_open = float(next_bar['open'])
-                next_high = float(next_bar['high'])
-                next_low = float(next_bar['low'])
-                next_close = float(next_bar['close'])
+                exit_bar = df.iloc[i + 2]
+                next_date = str(exit_bar['date'])[:10]
+                next_open = float(exit_bar['open'])
+                next_high = float(exit_bar['high'])
+                next_low = float(exit_bar['low'])
+                next_close = float(exit_bar['close'])
 
-                # 记录次日早盘冲高溢价率
-                morning_prem = (next_high - buy_price) / buy_price * 100.0
-                morning_premiums.append(morning_prem)
+                # Daily bars do not reveal whether the high occurred in the
+                # 09:30-09:45 window; report the full exit-session high instead.
+                exit_session_high_premium = (next_high - buy_price) / buy_price * 100.0
+                morning_premiums.append(exit_session_high_premium)
 
                 target_p = buy_price * (1.0 + self.target_profit_pct / 100.0)
                 stop_p = buy_price * (1.0 - self.stop_loss_pct / 100.0)
@@ -274,40 +308,33 @@ class TailStrategy230:
                 exit_reason = "次日平仓"
                 is_win = False
 
-                # 严格因果时序判定（杜绝先涨后跌/日内乐观未来函数）
-                # 1. 优先判定集合竞价开盘跳空
+                # Daily bars cannot reveal intraday event order. Use the open
+                # for gap exits and assume stop first if both barriers are hit.
                 if next_open >= target_p:
                     exit_price = next_open
-                    exit_reason = "次日高开止盈"
+                    exit_reason = "T+2开盘止盈代理"
                     is_win = True
                 elif next_open <= stop_p:
                     exit_price = next_open
-                    exit_reason = "次日低开止损"
+                    exit_reason = "T+2开盘止损代理"
                     is_win = False
                 # 2. 盘中波动研判：防未来函数双触及保守检验
                 elif next_high >= target_p and next_low <= stop_p:
-                    # 当日最高与最低均击穿止盈与止损线：基于开盘价位距离进行严谨保守因果研判
-                    # 若开盘离止损线更近，保守判定先触及止损平仓
-                    if (next_open - stop_p) <= (target_p - next_open):
-                        exit_price = stop_p
-                        exit_reason = "次日宽幅震荡先触止损"
-                        is_win = False
-                    else:
-                        exit_price = target_p
-                        exit_reason = "次日冲高止盈"
-                        is_win = True
+                    exit_price = stop_p
+                    exit_reason = "T+2双触及按止损保守估算"
+                    is_win = False
                 elif next_high >= target_p:
                     exit_price = target_p
-                    exit_reason = "次日冲高止盈"
+                    exit_reason = "T+2触及目标位代理"
                     is_win = True
                 elif next_low <= stop_p:
                     exit_price = stop_p
-                    exit_reason = "次日破位止损"
+                    exit_reason = "T+2触及止损位代理"
                     is_win = False
                 else:
                     # 3. 正常次日收盘平仓
                     exit_price = next_close
-                    exit_reason = "次日收盘平仓"
+                    exit_reason = "T+2收盘退出代理"
                     is_win = (exit_price > buy_price)
 
                 # 扣除摩擦后的净收益
@@ -336,54 +363,61 @@ class TailStrategy230:
                 trade_logs.append({
                     "symbol": sym,
                     "name": name,
+                    "signal_date": signal_date,
                     "buy_date": buy_date,
                     "buy_price": buy_price,
                     "sell_date": next_date,
                     "sell_price": round(exit_price, 2),
                     "return_pct": net_return,
-                    "morning_high_pct": round(morning_prem, 2),
+                    "exit_session_high_pct": round(exit_session_high_premium, 2),
+                    "next_session_high_pct": round(exit_session_high_premium, 2),  # legacy API alias; full exit-session high
+                    "morning_high_pct": round(exit_session_high_premium, 2),  # legacy API alias; not a morning-only value
                     "is_win": net_return > 0,
                     "market_regime": "多头/平衡市" if is_market_bull else "弱势杀跌市",
                     "reason": exit_reason
                 })
 
-        win_rate = round(win_trades / total_trades * 100.0, 1) if total_trades > 0 else 0.0
-        bull_win_rate = round(bull_wins / bull_trades * 100.0, 1) if bull_trades > 0 else 0.0
-        bear_win_rate = round(bear_wins / bear_trades * 100.0, 1) if bear_trades > 0 else 0.0
+        win_rate = round(win_trades / total_trades * 100.0, 1) if total_trades > 0 else None
+        bull_win_rate = round(bull_wins / bull_trades * 100.0, 1) if bull_trades > 0 else None
+        bear_win_rate = round(bear_wins / bear_trades * 100.0, 1) if bear_trades > 0 else None
 
-        avg_win = round(float(np.mean(win_pnl_list)), 2) if win_pnl_list else 0.0
-        avg_loss = round(float(np.mean(loss_pnl_list)), 2) if loss_pnl_list else 0.0
-        avg_return = round(total_pnl_pct / total_trades, 2) if total_trades > 0 else 0.0
-        avg_morning_prem = round(float(np.mean(morning_premiums)), 2) if morning_premiums else 0.0
-        pl_ratio = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else 2.5
+        avg_win = round(float(np.mean(win_pnl_list)), 2) if win_pnl_list else None
+        avg_loss = round(float(np.mean(loss_pnl_list)), 2) if loss_pnl_list else None
+        avg_return = round(total_pnl_pct / total_trades, 2) if total_trades > 0 else None
+        avg_morning_prem = round(float(np.mean(morning_premiums)), 2) if morning_premiums else None
+        pl_ratio = round(abs(avg_win / avg_loss), 2) if avg_win is not None and avg_loss is not None and avg_loss != 0 else None
 
         # 按时间倒序保留近 30 笔交易明细
         trade_logs.sort(key=lambda x: x["buy_date"], reverse=True)
 
         result = {
-            "strategy_name": "A股主板 2:30 尾盘突袭战法 (Tail Hunter 2.30)",
+            "strategy_name": "A股主板尾盘日线规则代理回放",
             "github_reference": "songxiaoyan/stock-picker & hyan1985/stock-predict",
             "backtest_days": days,
             "total_trades": total_trades,
             "win_trades": win_trades,
             "loss_trades": loss_trades,
-            "win_rate": win_rate,                          # 裸策略全周期实战胜率 (%)
-            "enhanced_win_rate": bull_win_rate,             # 叠加宏观大盘多头滤网后的胜率 (%)
-            "bear_win_rate": bear_win_rate,                 # 弱势杀跌市胜率 (低迷，验证避险逻辑)
+            "win_rate": win_rate,
+            "enhanced_win_rate": bull_win_rate,
+            "bear_win_rate": bear_win_rate,
             "bull_trades": bull_trades,
             "bear_trades": bear_trades,
-            "avg_return_pct": avg_return,                  # 平均单笔净收益 (%)
-            "avg_win_pct": avg_win,                        # 胜场平均涨幅 (%)
-            "avg_loss_pct": avg_loss,                      # 负场平均亏损 (%)
-            "profit_loss_ratio": pl_ratio,                 # 盈亏比
-            "avg_morning_premium_pct": avg_morning_prem,   # 次日早盘平均最高溢价 (%)
+            "avg_return_pct": avg_return,
+            "avg_win_pct": avg_win,
+            "avg_loss_pct": avg_loss,
+            "profit_loss_ratio": pl_ratio,
+            "avg_exit_session_high_premium_pct": avg_morning_prem,
+            "avg_next_session_high_premium_pct": avg_morning_prem,  # legacy API alias; full exit-session high
+            "avg_morning_premium_pct": avg_morning_prem,   # legacy API alias; not a morning-only value
+            "backtest_method": "daily_bar_proxy_signal_T_close_entry_T1_open_exit_T2_daily_OHLC",
+            "execution_limitations": "T日收盘产生信号、T+1开盘作为代理买入价、T+2日线OHLC模拟卖出；不代表14:30成交或真实成交。日线不能还原盘中事件顺序、涨跌停排队或滑点，历史主板特殊涨跌幅状态未逐日还原；同日止盈止损双触及时按止损估算。",
             "recent_trades": trade_logs[:30],
             "rules_summary": [
                 "主板合规：严格限定沪深主板，过滤ST/科创/创业板",
-                "黄金涨幅：当日14:30涨幅在 +2.0% ~ +5.5% 之间",
+                "日线涨幅规则：+2.0% ~ +5.5% (日线无法校验14:30时点)",
                 "放量抢筹：当日量比 >= 1.25，尾盘量能明显放大",
                 "均线多头：收盘站上 MA5 与 MA20 且处于突破整理形态",
-                "一夜持股：次日9:30-9:45冲高即止盈(+2.5%)，破位坚决止损(-1.8%)"
+                "时序代理：T日收盘信号、T+1开盘进场，遵守T+1在T+2日线模拟离场；价位是研究假设"
             ]
         }
         self._cached_backtest = result
@@ -400,14 +434,8 @@ tail_strategy_230 = TailStrategy230()
 
 class TailTradeTracker:
     """
-    2:30 尾盘战法标的持仓生命周期跟踪与次日极速离场监控引擎
-    核心规则 (GitHub 开源实盘研报规范)：
-    1. 每日 14:32 推荐标的自动建立跟踪档案，记录买入价、止盈目标(+2.5%)与防守止损(-1.8%)；
-    2. 次日 09:28 集合竞价结束，输出早盘操盘作战图；
-    3. 次日 09:30~09:45 冲高触达目标价立即推送【冲高止盈卖出】；
-    4. 次日跌破 -1.8% 立即推送【破位止损卖出】；
-    5. 次日 09:45~10:00 冲高动能衰竭推送【动能衰竭·时限落袋提醒】；
-    6. 次日 14:30 仍未离场的标的强制发出【次日尾盘坚决清仓】。
+    跟踪用户确认的实际买入成交并发送行情提醒；候选和提醒不等于持仓或成交。
+    实际卖出成交需人工录入，系统不根据日线高低价推断平仓。
     """
     def __init__(self, storage_file: Optional[Path] = None, trades_file: Optional[Path] = None):
         target_file = storage_file or trades_file
@@ -443,7 +471,7 @@ class TailTradeTracker:
             print(f"保存 2.30 战法持仓记录异常: {e}")
 
     def record_recommendations(self, candidates: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
-        """在每日 14:32 扫描出标的后，自动将评分最高的前 N 只标的纳入次日卖出监控池"""
+        """记录研究信号；候选信号不能被登记为用户实际持仓。"""
         now = datetime.now()
         date_str = now.strftime("%Y-%m-%d")
         time_str = now.strftime("%H:%M:%S")
@@ -476,7 +504,8 @@ class TailTradeTracker:
                 "score": float(c.get("score", 70.0)),
                 "vol_ratio": float(c.get("vol_ratio", 1.0)),
                 "change_pct": float(c.get("change_pct", 0.0)),
-                "status": "HOLDING",
+                "source": "research_signal",
+                "status": "SIGNAL_ONLY",
                 "peak_price": buy_price,
                 "reasons": c.get("reasons", []),
                 "exit_date": None,
@@ -502,7 +531,7 @@ class TailTradeTracker:
         target_pct: float = 2.5,
         stop_pct: float = 1.8
     ) -> Dict[str, Any]:
-        """支持用户在网页端或脚本中手动录入 2.30 战法实际成交买入单"""
+        """记录用户确认的实际买入成交；只记录价格，不推断数量或账户收益。"""
         now = datetime.now()
         b_date = buy_date or now.strftime("%Y-%m-%d")
         b_time = now.strftime("%H:%M:%S")
@@ -512,6 +541,8 @@ class TailTradeTracker:
 
         trade_item = {
             "id": f"{symbol}_{b_date}",
+            "source": "manual_actual_fill",
+            "entry_fill_confirmed": True,
             "symbol": symbol,
             "name": name,
             "buy_date": b_date,
@@ -521,9 +552,6 @@ class TailTradeTracker:
             "target_pct": target_pct,
             "stop_loss_price": stop_p,
             "stop_pct": stop_pct,
-            "score": 85.0,
-            "vol_ratio": 1.5,
-            "change_pct": 3.0,
             "status": "HOLDING",
             "peak_price": float(buy_price),
             "reasons": ["用户自主确认买入/实盘建仓"],
@@ -539,8 +567,12 @@ class TailTradeTracker:
         return trade_item
 
     def get_active_positions(self) -> List[Dict[str, Any]]:
-        """获取目前未平仓的所有 2.30 战法头寸"""
-        return [t for t in self._trades if t.get("status") in ["HOLDING", "ALERTED_TIMED"]]
+        """只返回用户确认实际买入、且尚未人工确认平仓的记录。"""
+        return [
+            t for t in self._trades
+            if t.get("source") == "manual_actual_fill"
+            and t.get("status") in ["HOLDING", "ALERTED_TIMED", "ALERTED_EXIT"]
+        ]
 
     def get_all_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
         """获取所有 2.30 战法历史及活跃记录"""
@@ -550,7 +582,7 @@ class TailTradeTracker:
         """标记某笔 2.30 战法交易完成平仓"""
         now = datetime.now()
         for t in self._trades:
-            if t.get("symbol") == symbol and t.get("buy_date") == buy_date:
+            if t.get("source") == "manual_actual_fill" and t.get("symbol") == symbol and t.get("buy_date") == buy_date:
                 t["status"] = status
                 t["exit_date"] = now.strftime("%Y-%m-%d")
                 t["exit_time"] = now.strftime("%H:%M:%S")
@@ -558,6 +590,8 @@ class TailTradeTracker:
                 t["exit_reason"] = exit_reason
                 buy_p = float(t.get("buy_price", exit_price))
                 t["return_pct"] = round((exit_price - buy_p) / buy_p * 100.0, 2) if buy_p > 0 else 0.0
+                t["exit_fill_confirmed"] = True
+                t["return_method"] = "买卖成交价变化，未扣佣金、印花税及其他费用；不是账户净收益"
                 self._save()
                 return t
         return None
@@ -574,79 +608,13 @@ class TailTradeTracker:
 
     def reconcile_and_clean_expired_positions(self, current_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """
-        开机自检与断档恢复：
-        自动核查所有处于未平仓状态的 2.30 战法头寸。
-        若其真实的 T+1 交易日已经过去（因用户在 T+1 日未开机运行），
-        系统自动调取该标的在 T+1 日的真实历史日K线完成回溯平仓结算，
-        彻底杜绝遗留僵尸单、消除胜率统计断层，并防止在后续交易日发出虚假的“次日早盘”报警！
+        保留兼容入口但不再用日线最高/最低价推断实际成交或自动平仓。
+        需要核对的记录由用户通过实际成交价人工结算。
         """
-        now = current_dt or datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        reconciled = []
-
-        active_positions = [t for t in self._trades if t.get("status") in ["HOLDING", "ALERTED_TIMED"]]
-        for pos in active_positions:
-            sym = pos.get("symbol")
-            buy_date = str(pos.get("buy_date", ""))[:10]
-            if not sym or not buy_date or buy_date >= today_str:
-                continue
-
-            buy_p = float(pos.get("buy_price", 0.0))
-            target_p = float(pos.get("target_sell_price", buy_p * 1.025))
-            stop_p = float(pos.get("stop_loss_price", buy_p * 0.982))
-
-            # 获取该标的历史K线寻找真正的 T+1 交易日
-            df = data_engine.get_daily_kline(sym, count=30)
-            if df is None or len(df) == 0:
-                continue
-
-            df['date_str'] = df['date'].astype(str).str[:10]
-            after_bars = df[df['date_str'] > buy_date]
-            if len(after_bars) == 0:
-                # 尚未经历任何后续交易日 (如周末或刚买入)
-                continue
-
-            t1_bar = after_bars.iloc[0]
-            t1_date = str(t1_bar['date_str'])
-
-            # 如果首个后续交易日就是今天，说明今天是正统的 T+1 日，保留给今日盘中巡检
-            if t1_date == today_str:
-                continue
-
-            # 如果首个后续交易日早于今天，说明 T+1 日在停机期间已过，执行离线自动回溯补结
-            t1_open = float(t1_bar['open'])
-            t1_high = float(t1_bar['high'])
-            t1_low = float(t1_bar['low'])
-            t1_close = float(t1_bar['close'])
-
-            if t1_open >= target_p or t1_high >= target_p:
-                status = "CLOSED_PROFIT"
-                exit_price = max(t1_open, target_p)
-                reason = f"系统离线自动回溯补结: T+1日({t1_date})最高冲至{t1_high:.2f}元触发止盈"
-            elif t1_low <= stop_p:
-                status = "CLOSED_STOP"
-                exit_price = min(t1_open, stop_p)
-                reason = f"系统离线自动回溯补结: T+1日({t1_date})最低跌至{t1_low:.2f}元触发止损"
-            else:
-                status = "CLOSED_EOD"
-                exit_price = t1_close
-                reason = f"系统离线自动回溯补结: T+1日({t1_date})尾盘收盘平仓离场"
-
-            pos["status"] = status
-            pos["exit_date"] = t1_date
-            pos["exit_time"] = "15:00:00"
-            pos["exit_price"] = round(exit_price, 2)
-            pos["exit_reason"] = reason
-            pos["return_pct"] = round((exit_price - buy_p) / buy_p * 100.0, 2) if buy_p > 0 else 0.0
-            reconciled.append(pos)
-
-        if reconciled:
-            self._save()
-
-        return reconciled
+        return []
 
     def check_morning_plan(self, quotes: Optional[Dict[str, Any]] = None, current_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        """早盘 09:28 集合竞价汇总生成操盘作战计划"""
+        """汇总用户确认买入记录的行情参考，不代表委托或实际成交。"""
         self.reconcile_and_clean_expired_positions(current_dt)
         now = current_dt or datetime.now()
         today_str = now.strftime("%Y-%m-%d")
@@ -683,7 +651,7 @@ class TailTradeTracker:
 
     def check_next_day_exits(self, quotes: Optional[Dict[str, Any]] = None, current_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """
-        次日早盘及盘中实时研判：检查 2.30 战法昨日买入标的的卖出与平仓信号
+        监控用户确认的实际买入记录并生成行情提醒；不会下单或推断平仓成交。
         """
         self.reconcile_and_clean_expired_positions(current_dt)
         now = current_dt or datetime.now()
@@ -742,8 +710,7 @@ class TailTradeTracker:
                         "date": today_str,
                         "price": cur_p,
                         "signal_type": "TAIL_PROFIT_EXIT",
-                        "signal_desc": "🎯【2.30战法·次日冲高止盈】达成目标·挂单落袋",
-                        "score": 98,
+                        "signal_desc": "🎯【行情提醒】价格触及止盈观察位，请核对实际持仓与委托",
                         "buy_price": buy_p,
                         "buy_date": buy_date,
                         "target_sell_price": target_p,
@@ -751,21 +718,23 @@ class TailTradeTracker:
                         "pnl_pct": cur_gain_pct,
                         "peak_gain_pct": peak_gain_pct,
                         "reasons": [
-                            f"昨日 14:32 尾盘买入价 {buy_p:.2f}元，分时冲高达成预期止盈目标价({target_p:.2f}元)！",
-                            f"次日早盘隔夜溢价兑现：当前收益率达到 +{cur_gain_pct}% (盘中最高冲至 +{peak_gain_pct}%)",
-                            "🎯【2.30战法铁律】早盘 09:30~09:45 冲高为主力脉冲兑现黄金期，请立即市价挂单全额卖出平仓，锁定战果！"
+                            f"记录的买入成交价为 {buy_p:.2f}元，当前行情触及观察价位 {target_p:.2f}元。",
+                            f"当前价格变动 {cur_gain_pct:+.2f}%，盘中高点对应变动 {peak_gain_pct:+.2f}%；未包含交易费用。",
+                            "此提醒不代表已成交或应立即卖出；请先核对实际持仓、可卖数量和委托状态。"
                         ],
                         "trade_levels": {
                             "entry_price": buy_p,
                             "suggested_sell_price": cur_p,
                             "target_price": target_p,
                             "initial_stop": stop_p,
-                            "action_urgency": "立即市价挂单卖出止盈，拒绝利润回吐"
+                            "action_urgency": "行情提醒；不代表委托或成交"
                         }
                     }
                     exit_signals.append(sig)
                     self.add_alert_flag(sym, buy_date, "PROFIT_EXIT")
-                    self.close_trade(sym, buy_date, "CLOSED_PROFIT", cur_p, "次日冲高止盈达成")
+                    pos["status"] = "ALERTED_EXIT"
+                    pos["last_alert_type"] = "PROFIT_EXIT"
+                    self._save()
                 continue
 
             # -------------------------------------------------------------
@@ -780,8 +749,7 @@ class TailTradeTracker:
                         "date": today_str,
                         "price": cur_p,
                         "signal_type": "TAIL_STOP_EXIT",
-                        "signal_desc": "🛑【2.30战法·次日破位止损】击穿底线·纪律离场",
-                        "score": 95,
+                        "signal_desc": "🛑【行情提醒】价格触及止损观察位，请核对实际持仓与委托",
                         "buy_price": buy_p,
                         "buy_date": buy_date,
                         "target_sell_price": target_p,
@@ -789,21 +757,23 @@ class TailTradeTracker:
                         "pnl_pct": cur_gain_pct,
                         "peak_gain_pct": peak_gain_pct,
                         "reasons": [
-                            f"昨日 14:32 尾盘买入价 {buy_p:.2f}元，分时跌破 -1.8% 防守底线({stop_p:.2f}元)！",
-                            f"次日早盘未现惯性冲高，当前浮动亏损为 {cur_gain_pct}%",
-                            "🛑【2.30战法风控】严禁将尾盘超短做成中长线套牢！请坚决执行量化纪律，立即市价全额卖出止损避险！"
+                            f"记录的买入成交价为 {buy_p:.2f}元，当前行情触及止损观察位 {stop_p:.2f}元。",
+                            f"当前价格变动 {cur_gain_pct:+.2f}%，该价格变动未包含交易费用。",
+                            "此提醒不代表已成交或应立即卖出；请先核对实际持仓、可卖数量和委托状态。"
                         ],
                         "trade_levels": {
                             "entry_price": buy_p,
                             "suggested_sell_price": cur_p,
                             "target_price": target_p,
                             "initial_stop": stop_p,
-                            "action_urgency": "立即市价止损卖出，规避持续阴跌"
+                            "action_urgency": "行情提醒；不代表委托或成交"
                         }
                     }
                     exit_signals.append(sig)
                     self.add_alert_flag(sym, buy_date, "STOP_EXIT")
-                    self.close_trade(sym, buy_date, "CLOSED_STOP", cur_p, "次日破位纪律止损")
+                    pos["status"] = "ALERTED_EXIT"
+                    pos["last_alert_type"] = "STOP_EXIT"
+                    self._save()
                 continue
 
             # -------------------------------------------------------------
@@ -829,14 +799,14 @@ class TailTradeTracker:
                         "reasons": [
                             f"当前时间已到达 {cur_hm}，A股早盘惯性冲高黄金窗口 (09:30~09:45) 已经结束",
                             f"买入价 {buy_p:.2f}元，当前现价 {cur_p:.2f}元(盈亏: {cur_gain_pct:+.2f}%)，今早最高冲至 {peak_p:.2f}元(+{peak_gain_pct:+.2f}%)",
-                            "⏳【2.30战法持股节奏】主力隔夜增量资金脉冲动能逐步衰竭，未封死涨停的标的极易回落震荡。建议在现价附近分批卖出离场，腾出流动性准备今日尾盘新机会！"
+                            "该提示只反映时段规则，不预测后续涨跌，也不代表已成交或应立即卖出；请核对实际持仓和委托状态。"
                         ],
                         "trade_levels": {
                             "entry_price": buy_p,
                             "suggested_sell_price": cur_p,
                             "target_price": target_p,
                             "initial_stop": stop_p,
-                            "action_urgency": "09:45~10:00 择机挂单减仓或落袋离场"
+                            "action_urgency": "时段观察提醒；不代表委托或成交"
                         }
                     }
                     exit_signals.append(sig)
@@ -846,8 +816,7 @@ class TailTradeTracker:
                 continue
 
             # -------------------------------------------------------------
-            # 规则 4: 次日尾盘最后坚决清仓纪律 (TAIL_EOD_EXIT)
-            # 条件：时间到达 14:30~14:55，仍未平仓的标的必须强制卖出，绝不二次留仓！
+            # 规则 4: 次日尾盘时段观察提醒 (TAIL_EOD_EXIT)
             # -------------------------------------------------------------
             if "14:30" <= cur_hm <= "14:55":
                 if "EOD_EXIT" not in alerted_flags and pos.get("status") in ["HOLDING", "ALERTED_TIMED"]:
@@ -857,8 +826,7 @@ class TailTradeTracker:
                         "date": today_str,
                         "price": cur_p,
                         "signal_type": "TAIL_EOD_EXIT",
-                        "signal_desc": "🚨【2.30战法·次日尾盘坚决清仓】极限到期·市价全平",
-                        "score": 99,
+                        "signal_desc": "🚨【行情提醒】达到模型持仓时限观察点，请核对实际持仓",
                         "buy_price": buy_p,
                         "buy_date": buy_date,
                         "target_sell_price": target_p,
@@ -866,21 +834,23 @@ class TailTradeTracker:
                         "pnl_pct": cur_gain_pct,
                         "peak_gain_pct": peak_gain_pct,
                         "reasons": [
-                            f"今日已满 2.30 战法持股极限（T+1 日尾盘 {cur_hm}）！",
-                            f"买入成本 {buy_p:.2f}元，现价 {cur_p:.2f}元 (最终单笔结算盈亏: {cur_gain_pct:+.2f}%)",
-                            "🚨【严格清仓纪律】2.30 战法严禁跨周期二次留仓过夜！请务必在 14:50 前市价全额卖出清仓，恢复空仓状态迎战今日 14:32 新标的！"
+                            f"当前时间为 {cur_hm}，模型的观察期限已到；买入价 {buy_p:.2f}元，现价 {cur_p:.2f}元。",
+                            f"价格变动 {cur_gain_pct:+.2f}%，未包含交易费用，不等同于账户盈亏。",
+                            "此提醒不代表必须卖出或已经成交；请按实际持仓、风险承受能力和委托状态自行处理。"
                         ],
                         "trade_levels": {
                             "entry_price": buy_p,
                             "suggested_sell_price": cur_p,
                             "target_price": target_p,
                             "initial_stop": stop_p,
-                            "action_urgency": "14:50 前市价全额卖出清仓"
+                            "action_urgency": "时段观察提醒；不代表委托或成交"
                         }
                     }
                     exit_signals.append(sig)
                     self.add_alert_flag(sym, buy_date, "EOD_EXIT")
-                    self.close_trade(sym, buy_date, "CLOSED_EOD", cur_p, "次日尾盘严格清仓")
+                    pos["status"] = "ALERTED_EXIT"
+                    pos["last_alert_type"] = "EOD_EXIT"
+                    self._save()
                 continue
 
         return exit_signals

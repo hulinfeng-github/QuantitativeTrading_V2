@@ -53,10 +53,12 @@ class ReviewEngineV2:
             print(f"游资打板复盘结算异常: {e}")
 
         # 5. 执行参数自迭代调优
+        auto_optimize = bool(auto_optimize and load_config().get("review_auto_optimize_enabled", True))
         optimization_result = self._self_optimize_parameters(
             market_regime=market_analysis.get("regime", "震荡"),
-            win_rate=signal_tracking.get("win_rate", 55.0),
-            apply_changes=auto_optimize
+            win_rate=signal_tracking.get("win_rate"),
+            apply_changes=auto_optimize,
+            sample_size=signal_tracking.get("total_signals", 0)
         )
 
         # 6. 组装 Markdown 复盘报告
@@ -137,9 +139,9 @@ class ReviewEngineV2:
         return results
 
     def _track_recent_signals(self, days_window: int = 10) -> Dict[str, Any]:
-        """核查近期发出的买点与做T信号实盘表现"""
+        """统计近期买点与做T信号的前向行情变化，不代表实际成交表现。"""
         if not SIGNALS_FILE.exists():
-            return {"total_signals": 0, "win_rate": 50.0, "avg_return": 0.0, "details": []}
+            return {"total_signals": 0, "win_rate": None, "avg_return": None, "details": []}
 
         try:
             with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
@@ -147,7 +149,7 @@ class ReviewEngineV2:
         except Exception:
             signals = []
 
-        # 过滤掉测试代码中产生的虚构标的或测试标识，杜绝污染历史实盘胜率统计
+        # Exclude test identifiers from the signal-tracking sample.
         buy_signals = [
             s for s in signals 
             if s.get("signal_type") in ["BUY", "BUY_T"]
@@ -157,9 +159,26 @@ class ReviewEngineV2:
             and "test" not in str(s.get("symbol", "")).lower()
         ]
         if not buy_signals:
-            return {"total_signals": 0, "win_rate": 55.0, "avg_return": 1.2, "details": []}
+            return {"total_signals": 0, "win_rate": None, "avg_return": None, "details": []}
 
-        recent = buy_signals[-15:]
+        # Repeated scheduler runs can write the same alert more than once.
+        # Count each symbol/date/type once so duplicates cannot inflate the
+        # matured sample used by reports and the parameter optimizer.
+        unique_signals = []
+        seen_signal_keys = set()
+        for signal in buy_signals:
+            symbol = str(signal.get("symbol", ""))
+            signal_date = str(signal.get("date", ""))[:10]
+            signal_type = str(signal.get("signal_type", ""))
+            if not symbol or not signal_date:
+                continue
+            key = (symbol, signal_date, signal_type)
+            if key in seen_signal_keys:
+                continue
+            seen_signal_keys.add(key)
+            unique_signals.append(signal)
+
+        recent = unique_signals[-100:]
         verified = []
         win_count = 0
 
@@ -228,23 +247,15 @@ class ReviewEngineV2:
                         ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
                         is_win = False
                     else:
-                        if len(after_bars) > 5:
-                            cur_p = float(window_bars.iloc[-1]['close'])
-                        else:
-                            q = data_engine.get_realtime_quotes([sym]).get(sym, {})
-                            cur_p = float(q.get("price", window_bars.iloc[-1]['close']))
+                        if len(after_bars) < 5:
+                            continue
+                        cur_p = float(window_bars.iloc[-1]['close'])
                         ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
                         is_win = ret_pct > 0
                 else:
-                    q = data_engine.get_realtime_quotes([sym]).get(sym, {})
-                    cur_p = float(q.get("price", rec_p))
-                    ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
-                    is_win = ret_pct > 0
+                    continue
             else:
-                q = data_engine.get_realtime_quotes([sym]).get(sym, {})
-                cur_p = float(q.get("price", rec_p))
-                ret_pct = round((cur_p - rec_p) / rec_p * 100.0, 2)
-                is_win = ret_pct > 0
+                continue
 
             if is_win:
                 win_count += 1
@@ -259,8 +270,8 @@ class ReviewEngineV2:
                 "is_win": is_win
             })
 
-        win_rate = round(win_count / len(verified) * 100.0, 1) if verified else 50.0
-        avg_ret = round(float(np.mean([x["return_pct"] for x in verified])), 2) if verified else 0.0
+        win_rate = round(win_count / len(verified) * 100.0, 1) if verified else None
+        avg_ret = round(float(np.mean([x["return_pct"] for x in verified])), 2) if verified else None
 
         return {
             "total_signals": len(verified),
@@ -272,10 +283,11 @@ class ReviewEngineV2:
     def _self_optimize_parameters(
         self,
         market_regime: str,
-        win_rate: float,
-        apply_changes: bool = True
+        win_rate: Optional[float],
+        apply_changes: bool = False,
+        sample_size: int = 0
     ) -> Dict[str, Any]:
-        """根据大盘环境与近期实盘胜率自动调优参数"""
+        """按配置和调用开关，用足量已结算代理样本调参；不代表实盘绩效。"""
         cfg = load_config()
         old_rsrs_buy = cfg.get("rsrs_buy_threshold", 0.70)
         old_atr_stop = cfg.get("atr_stop_multiplier", 2.0)
@@ -287,6 +299,28 @@ class ReviewEngineV2:
         new_rsrs_buy = old_rsrs_buy
         new_atr_stop = old_atr_stop
         reasons = []
+
+        # A handful of recent alerts is not enough evidence for adaptive
+        # thresholds. Keep automatic application gated by its config/call flag
+        # and a meaningful matured sample.
+        if win_rate is None or sample_size < 30:
+            reasons.append(f"仅有 {sample_size} 笔已结算信号，少于最低样本数30；保留当前参数，不根据缺失值自动调优")
+            apply_changes = False
+            changed = False
+            opt_entry = {
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "market_regime": market_regime,
+                "win_rate": win_rate,
+                "sample_size": sample_size,
+                "old_rsrs_buy": old_rsrs_buy,
+                "new_rsrs_buy": old_rsrs_buy,
+                "old_atr_stop": old_atr_stop,
+                "new_atr_stop": old_atr_stop,
+                "applied": False,
+                "reasons": reasons
+            }
+            self._save_optimization_log(opt_entry)
+            return opt_entry
 
         # 1. 弱势/熊市杀跌或胜率过低：上调买入门槛以过滤假突破，同时严格【收紧止损】以控制单笔最大回撤
         if win_rate < 45.0 or "杀跌" in market_regime or "空头" in market_regime:
@@ -323,6 +357,7 @@ class ReviewEngineV2:
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "market_regime": market_regime,
             "win_rate": win_rate,
+            "sample_size": sample_size,
             "old_rsrs_buy": old_rsrs_buy,
             "new_rsrs_buy": new_rsrs_buy,
             "old_atr_stop": old_atr_stop,
@@ -417,39 +452,57 @@ class ReviewEngineV2:
                 md.append("- 今日无做T流水记录。")
         except Exception:
             md.append("- 今日做T数据加载正常。")
+
+        # 累计绩效 (基于历史已平仓做T样本，信号代理口径)
+        try:
+            from core.t0_smart_engine import t0_smart_engine
+            st = t0_smart_engine.get_stats()
+            if st.get("available"):
+                pf = st.get("profit_factor")
+                md.append(
+                    f"- **做T累计绩效**: {st['total_trades']} 笔 | 胜率 **{st['win_rate']}%** | "
+                    f"平均 **{st['avg_pnl_pct']:+.2f}%** (盈 {st['avg_win_pct']:+.2f}% / 亏 {st['avg_loss_pct']:+.2f}%) | "
+                    f"盈亏因子 **{pf if pf is not None else '∞'}** (净口径，含费用估算，非实盘)"
+                )
+        except Exception:
+            pass
         md.append("")
 
         # 4. 游资龙虎打板模型复盘与隔日溢价战绩
-        md.append("### 四、 ⚡ 游资龙虎打板模型复盘与隔日溢价战绩")
+        md.append("### 四、 ⚡ 涨停候选信号后续行情跟踪（未验证真实成交）")
         if limit_up_stats and limit_up_stats.get("total_trades", 0) > 0:
             st = limit_up_stats
-            md.append(f"- **模型累计打板样本**: **{st.get('total_trades')}** 笔 | **已结算评估**: **{st.get('settled_trades')}** 笔 | **待结算(持仓中)**: **{st.get('pending_trades')}** 笔")
-            md.append(f"- **开盘竞价高开胜率**: **{st.get('open_premium_win_rate')}%** (次日竞价溢价概率)")
-            md.append(f"- **盘中最高冲高胜率**: **{st.get('peak_profit_win_rate')}%** (次日最高冲高 >= +2.0% 止盈概率)")
-            md.append(f"- **连板晋级接力率**: **{st.get('consecutive_rate')}%** (成功实现二连板/三连板进阶)")
-            md.append(f"- **核心收益指标**: 次日开盘均值 **{st.get('avg_open_pnl'):+.2f}%** | 冲高均值 **{st.get('avg_peak_pnl'):+.2f}%** | 收盘均值 **{st.get('avg_close_pnl'):+.2f}%**")
-            md.append(f"- **风控胜负手**: 盈亏比 **{st.get('profit_loss_ratio')}:1** | 大面率(跌幅>=-5%) **{st.get('big_loss_rate')}%**")
+            md.append(f"- **信号样本**: **{st.get('total_trades')}** 条 | **已跟踪**: **{st.get('settled_trades')}** 条 | **待后续行情**: **{st.get('pending_trades')}** 条")
+            md.append(f"- **信号至次日开盘上涨占比**: **{st.get('open_premium_win_rate')}%**")
+            md.append(f"- **次日最高涨幅≥2%占比**: **{st.get('peak_profit_win_rate')}%** (不代表可成交)")
+            md.append(f"- **次日继续涨停占比**: **{st.get('consecutive_rate')}%** (按日线估算)")
+            md.append(f"- **次日开盘/最高/收盘平均变动**: {st.get('avg_open_pnl')}% / {st.get('avg_peak_pnl')}% / {st.get('avg_close_pnl')}% (未扣成本)")
+            md.append(f"- **样本收益比**: **{st.get('profit_loss_ratio') or '不可用'}** | **次日跌幅≤-4%占比**: **{st.get('big_loss_rate')}%**")
             
             # 板型细分
             by_type = st.get("by_board_type", {})
             if by_type:
                 type_summaries = []
                 for b_name, b_val in by_type.items():
-                    type_summaries.append(f"{b_name}(样本{b_val.get('count')}笔·冲高胜率{b_val.get('win_rate')}%)")
+                    type_summaries.append(f"{b_name}(信号{b_val.get('count')}条·次日最高涨幅≥2%占比{b_val.get('win_rate')}%)")
                 md.append(f"- **板型胜率阵列**: {' · '.join(type_summaries)}")
 
             # 今日结算简况
             if limit_up_review and limit_up_review.get("settled_count", 0) > 0:
-                md.append(f"- **今日收盘自动结算**: 成功结算并回填 **{limit_up_review.get('settled_count')}** 笔待决订单，台账同步刷新")
+                md.append(f"- **今日行情跟踪更新**: 为 **{limit_up_review.get('settled_count')}** 条信号记录回填后续行情字段；非真实成交结算")
             
-            md.append(f"- **实战流水账本**: 存储于 `storage/limit_up_ledger.csv` (UTF-8 with BOM，Excel/WPS即点即开)")
+            md.append(f"- **信号跟踪台账**: `storage/limit_up_ledger.csv` (UTF-8 with BOM)")
         else:
             md.append("- 游资龙虎打板模块运行正常，待触发符合封板硬度标准标的后自动归档维护。")
         md.append("")
 
         # 5. 历史策略推荐信号回访
         md.append("### 五、 历史策略推荐信号前向胜率")
-        md.append(f"- 近期信号样本: **{tracking.get('total_signals')}** 笔 | 胜率: **{tracking.get('win_rate')}%** | 平均前向收益: **{tracking.get('avg_return'):+.2f}%**")
+        tracking_win_rate = tracking.get("win_rate")
+        tracking_avg_return = tracking.get("avg_return")
+        win_rate_label = f"{tracking_win_rate:.1f}%" if tracking_win_rate is not None else "样本不足"
+        avg_return_label = f"{tracking_avg_return:+.2f}%" if tracking_avg_return is not None else "样本不足"
+        md.append(f"- 近期已结算信号样本: **{tracking.get('total_signals', 0)}** 笔 | 胜率: **{win_rate_label}** | 平均前向收益: **{avg_return_label}**")
         md.append("")
 
         # 6. 策略参数自我进化演进 (Self-Tuning)
@@ -566,6 +619,19 @@ class ReviewEngineV2:
                     md.append("- 今日无做T流水记录。")
             except Exception:
                 md.append("- 本组做T数据加载正常。")
+
+            # 累计绩效 (基于历史已平仓做T样本，信号代理口径)
+            try:
+                from core.t0_smart_engine import t0_smart_engine
+                st = t0_smart_engine.get_stats()
+                if st.get("available"):
+                    pf = st.get("profit_factor")
+                    md.append(
+                        f"- **做T累计绩效**: {st['total_trades']} 笔 | 胜率 **{st['win_rate']}%** | "
+                        f"平均 **{st['avg_pnl_pct']:+.2f}%** | 盈亏因子 **{pf if pf is not None else '∞'}** (净口径，含费用估算，非实盘)"
+                    )
+            except Exception:
+                pass
             md.append("")
 
         # 4. 游资龙虎打板模型复盘与隔日溢价战绩 (如果启用了 push_limitup)
@@ -573,22 +639,26 @@ class ReviewEngineV2:
             md.append("### 四、 ⚡ 游资龙虎打板模型复盘与隔日溢价战绩")
             if limit_up and limit_up.get("total_trades", 0) > 0:
                 st = limit_up
-                md.append(f"- **模型累计打板样本**: **{st.get('total_trades')}** 笔 | **已结算评估**: **{st.get('settled_trades')}** 笔 | **待结算**: **{st.get('pending_trades')}** 笔")
-                md.append(f"- **开盘竞价高开胜率**: **{st.get('open_premium_win_rate')}%** | **最高冲高胜率**: **{st.get('peak_profit_win_rate')}%**")
-                md.append(f"- **连板晋级接力率**: **{st.get('consecutive_rate')}%** | **盈亏比**: **{st.get('profit_loss_ratio')}:1**")
-                md.append(f"- **核心收益指标**: 次日开盘均值 **{st.get('avg_open_pnl'):+.2f}%** | 冲高均值 **{st.get('avg_peak_pnl'):+.2f}%**")
+                md.append(f"- **候选信号样本**: **{st.get('total_trades')}** 条 | **已跟踪**: **{st.get('settled_trades')}** 条 | **待后续行情**: **{st.get('pending_trades')}** 条")
+                md.append(f"- **信号至次日开盘上涨占比**: **{st.get('open_premium_win_rate')}%** | **次日最高涨幅≥2%占比**: **{st.get('peak_profit_win_rate')}%** (不含成交验证)")
+                md.append(f"- **次日继续涨停占比**: **{st.get('consecutive_rate')}%** (日线估算) | **样本收益比**: **{st.get('profit_loss_ratio') or '不可用'}**")
+                md.append(f"- **次日开盘/最高平均变动**: {st.get('avg_open_pnl')}% / {st.get('avg_peak_pnl')}% (未扣成本)")
                 by_type = st.get("by_board_type", {})
                 if by_type:
-                    type_summaries = [f"{b_name}(样本{b_val.get('count')}笔·胜率{b_val.get('win_rate')}%)" for b_name, b_val in by_type.items()]
+                    type_summaries = [f"{b_name}(信号{b_val.get('count')}条·次日最高涨幅≥2%占比{b_val.get('win_rate')}%)" for b_name, b_val in by_type.items()]
                     md.append(f"- **板型胜率阵列**: {' · '.join(type_summaries)}")
             else:
-                md.append("- 游资龙虎打板模块运行正常，监控中。")
+                md.append("- 暂无已跟踪的涨停候选信号样本。")
             md.append("")
 
         # 5. 策略推荐信号回访 (如果启用了 push_screener 或 push_tail230)
         if group.get("push_screener", True) or group.get("push_tail230", True):
             md.append("### 五、 多因子/尾盘策略推荐信号前向胜率")
-            md.append(f"- 近期信号样本: **{tracking.get('total_signals', 0)}** 笔 | 胜率: **{tracking.get('win_rate', 0)}%** | 平均前向收益: **{tracking.get('avg_return', 0.0):+.2f}%**")
+            tracking_win_rate = tracking.get("win_rate")
+            tracking_avg_return = tracking.get("avg_return")
+            win_rate_label = f"{tracking_win_rate:.1f}%" if tracking_win_rate is not None else "样本不足"
+            avg_return_label = f"{tracking_avg_return:+.2f}%" if tracking_avg_return is not None else "样本不足"
+            md.append(f"- 近期已结算信号样本: **{tracking.get('total_signals', 0)}** 笔 | 胜率: **{win_rate_label}** | 平均前向收益: **{avg_return_label}**")
             md.append("")
 
         # 6. 策略参数自我进化演进 (Self-Tuning)
