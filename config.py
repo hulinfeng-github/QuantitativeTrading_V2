@@ -124,6 +124,8 @@ DEFAULT_CONFIG = {
     "t0_min_market_exposure": 0.35,     # 仅在市场状态不低于该风险敞口时生成新T0信号
                                          # 0.35=多头震荡及以上允许(空头震荡也允许做T摊薄)；0.65=仅多头；0=不限制
     "t0_min_market_exposure_sell": 0.0, # 倒T(高抛)的市场敞口下限；0=弱市也允许高抛防御，仅要求指数数据可用
+    "t0_signal_only_mode": True,       # 信号观察模式：程序无法获知真实成交，已结束信号不锁死当天
+    "t0_signal_cooldown_minutes": 20,  # 信号观察模式下，同一标的两次做T信号的最小间隔(分钟)
     "t0_max_trades_per_day": 1,         # 单只标的每日做T最大次数
     "t0_single_direction_only": True,   # 单日做T单向严格锁定
     "t0_trend_filter_enabled": True,    # 开启大趋势过滤 (顺势做T)

@@ -236,6 +236,23 @@ class T0SmartEngine:
         return ("09:30" <= hm <= "11:30") or ("13:00" <= hm <= "15:00")
 
     @staticmethod
+    def _signal_cooldown_ok(pos: Dict[str, Any], cooldown_minutes: int) -> bool:
+        """
+        信号观察模式的冷却判定：距上一次信号结束(或开始)是否已超过冷却分钟数。
+        程序无法获知真实成交，因此已结束的信号不应锁死当天；冷却后允许重新研判。
+        """
+        raw = str(pos.get("exit_time") or pos.get("entry_time") or "")
+        try:
+            parts = [int(x) for x in raw.split(":")]
+            hh, mm = parts[0], parts[1]
+            ss = parts[2] if len(parts) > 2 else 0
+            now = datetime.now()
+            end_dt = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+            return (now - end_dt).total_seconds() / 60.0 >= max(1, int(cooldown_minutes))
+        except (ValueError, TypeError, IndexError):
+            return True
+
+    @staticmethod
     def _close_action(action: str, direction: str) -> str:
         if action == "CLOSE_T":
             return "BUY_BACK" if direction == "SELL_T" else "SELL_HEDGE"
@@ -328,6 +345,8 @@ class T0SmartEngine:
         max_minute_age = max(1, int(cfg.get("t0_minute_max_age_minutes", 5)))
         min_market_exposure = float(cfg.get("t0_min_market_exposure", 0.35))
         min_market_exposure_sell = float(cfg.get("t0_min_market_exposure_sell", 0.0))
+        signal_only_mode = bool(cfg.get("t0_signal_only_mode", True))
+        signal_cooldown_minutes = max(1, int(cfg.get("t0_signal_cooldown_minutes", 20)))
         holding_shares = max(0, int(holding_shares or 0))
         available_shares = min(max(0, int(available_shares or 0)), holding_shares)
 
@@ -428,6 +447,12 @@ class T0SmartEngine:
 
         # 3. 检查现有持仓状态跟踪
         existing_pos = self.tracker.get_position(symbol)
+        # 信号观察模式：程序无法获知用户的真实成交，已结束的信号不应锁死当天。
+        # 冷却期过后允许重新研判新信号（本次仅在内存中视为无仓，不改写已平仓历史）。
+        if (existing_pos is not None and signal_only_mode
+                and existing_pos.get("status") in ("FINISHED", "STOPPED")
+                and self._signal_cooldown_ok(existing_pos, signal_cooldown_minutes)):
+            existing_pos = None
         signal_action = "HOLD_T"
         signal_desc = "震荡观望"
         reasons = []
