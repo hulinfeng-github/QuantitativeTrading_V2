@@ -15,20 +15,6 @@ class NotificationManager:
         self._sent_cache = set()
         self._load_sent_cache()
 
-    @staticmethod
-    def _dedup_key(symbol: str, sig_type: str, when: datetime) -> str:
-        """
-        去重键：
-        - 波段/尾盘/打板类：按「标的+类型+日」去重，一天一次；
-        - 日内做T：按 30 分钟时间桶去重。程序无法获知真实成交，做T是纯信号提醒，
-          允许多次提示（配合引擎冷却期），又不至于每分钟刷屏。
-        """
-        day = when.strftime("%Y-%m-%d")
-        if sig_type in ("BUY_T", "SELL_T", "CLOSE_T", "STOP_T"):
-            bucket = (when.minute // 30) * 30
-            return f"{symbol}_{sig_type}_{day}_{when.strftime('%H')}{bucket:02d}"
-        return f"{symbol}_{sig_type}_{day}"
-
     def _load_sent_cache(self):
         """系统启动或重载时从 signals_history.json 预加载今日已发推送去重缓存，防止服务重启后重复刷屏"""
         try:
@@ -41,14 +27,8 @@ class NotificationManager:
                             if isinstance(sig, dict) and sig.get("date") == today:
                                 sym = sig.get("symbol", "")
                                 st = sig.get("signal_type", "")
-                                if not (sym and st):
-                                    continue
-                                ts_raw = str(sig.get("timestamp") or "")
-                                try:
-                                    when = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
-                                except ValueError:
-                                    when = datetime.now()
-                                self._sent_cache.add(self._dedup_key(sym, st, when))
+                                if sym and st:
+                                    self._sent_cache.add(f"{sym}_{st}_{today}")
         except Exception:
             pass
 
@@ -68,7 +48,7 @@ class NotificationManager:
         symbol = signal.get("symbol", "")
         sig_type = signal.get("signal_type", "")
         today = datetime.now().strftime("%Y-%m-%d")
-        cache_key = self._dedup_key(symbol, sig_type, datetime.now())
+        cache_key = f"{symbol}_{sig_type}_{today}"
 
         if not force and cache_key in self._sent_cache:
             return {"dingtalk": False, "wechat": False, "skipped": True}
@@ -172,7 +152,7 @@ class NotificationManager:
         for s in signals:
             sym = s.get("symbol", "")
             st = s.get("signal_type", "")
-            ck = self._dedup_key(sym, st, datetime.now())
+            ck = f"{sym}_{st}_{today}"
             if not force and ck in self._sent_cache:
                 skipped_count += 1
                 continue
@@ -252,7 +232,7 @@ class NotificationManager:
             sym = s.get("symbol", "")
             st = s.get("signal_type", "")
             if dt_sent or wx_sent:
-                self._sent_cache.add(self._dedup_key(sym, st, datetime.now()))
+                self._sent_cache.add(f"{sym}_{st}_{today}")
             if st and st not in ["HOLD", "HOLDING", "HOLD_T", "HOLDING_T"]:
                 self._record_signal_history(s)
 
