@@ -96,16 +96,17 @@ DEFAULT_CONFIG = {
     # ---------------- 4. A股 T+1 日内做T 2.0 参数 ----------------
     "t0_monitor_enabled": True,         # 开启T0研究信号监控；信号不会自动提交订单
     "t0_use_dynamic_boll": True,        # 开启分时自适应带宽 (基于价格相对VWAP的平均偏离)
-    "t0_band_dev_k": 1.5,               # 自适应带宽 = k × 分时价格相对VWAP的平均绝对偏离(%)
+    "t0_band_dev_k": 1.0,               # 自适应带宽 = k × 分时价格相对VWAP的平均绝对偏离(%)
+                                         # k 越大带宽越宽、信号越少；1.0 为兼顾频率的默认值
     "t0_band_min_pct": 0.6,             # 自适应带宽下限 (%)
     "t0_band_max_pct": 2.8,             # 自适应带宽上限 (%)
     "t0_sell_asymmetry": 1.15,          # 倒T(卖出)带宽 = 正T带宽 × 该系数 (上轨略宽)
     "t0_bias_buy": -1.5,                # 分时数据不足时的固定低吸偏离阈值 (兜底)
     "t0_bias_sell": 2.0,                # 分时数据不足时的固定高抛偏离阈值 (兜底)
-    "t0_reversal_bars": 2,              # 反转确认所需连续同向分钟K线数 (>=2)
-    "t0_reversal_volume_confirm": True, # 反转需放量确认 (分钟量 >= 近期均量)
+    "t0_reversal_bars": 1,              # 反转确认所需连续同向分钟K线数 (1=更灵敏，2=更严格)
+    "t0_reversal_volume_confirm": False, # 反转放量确认 (默认关闭以保证信号频率，可改 True 加强质量)
     "t0_reversal_volume_mult": 1.0,     # 放量确认倍数 (反转分钟量 >= 近期均量 × 该系数)
-    "t0_vwap_slope_filter": True,       # 开启日内容均价VWAP斜率过滤 (趋势日不逆势做T)
+    "t0_vwap_slope_filter": False,      # 日内容均价VWAP斜率过滤 (默认关闭；开启后趋势日不逆势做T，但信号更少)
     "t0_vwap_slope_lookback": 15,       # VWAP斜率回看分钟数
     "t0_max_vwap_slope_pct": 0.8,       # VWAP斜率绝对值上限(%)，超过视为单边趋势日
     "t0_stop_loss_pct": 1.5,            # 做T防守保护止损比例 (%)
@@ -120,7 +121,9 @@ DEFAULT_CONFIG = {
     "t0_slippage_rate": 0.0005,         # 单边滑点估算 (0.05%)
     "t0_minute_min_bars": 30,           # 开仓信号最低有效分时条数
     "t0_minute_max_age_minutes": 5,     # 分时末条最大允许延迟分钟数
-    "t0_min_market_exposure": 0.65,     # 仅在市场状态支持较高风险敞口时生成新T0信号
+    "t0_min_market_exposure": 0.35,     # 仅在市场状态不低于该风险敞口时生成新T0信号
+                                         # 0.35=多头震荡及以上允许(空头震荡也允许做T摊薄)；0.65=仅多头；0=不限制
+    "t0_min_market_exposure_sell": 0.0, # 倒T(高抛)的市场敞口下限；0=弱市也允许高抛防御，仅要求指数数据可用
     "t0_max_trades_per_day": 1,         # 单只标的每日做T最大次数
     "t0_single_direction_only": True,   # 单日做T单向严格锁定
     "t0_trend_filter_enabled": True,    # 开启大趋势过滤 (顺势做T)

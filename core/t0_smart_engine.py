@@ -326,7 +326,8 @@ class T0SmartEngine:
         late_stop_scale = float(cfg.get("t0_late_stop_scale", 0.8))
         min_minute_bars = max(30, int(cfg.get("t0_minute_min_bars", 30)))
         max_minute_age = max(1, int(cfg.get("t0_minute_max_age_minutes", 5)))
-        min_market_exposure = float(cfg.get("t0_min_market_exposure", 0.65))
+        min_market_exposure = float(cfg.get("t0_min_market_exposure", 0.35))
+        min_market_exposure_sell = float(cfg.get("t0_min_market_exposure_sell", 0.0))
         holding_shares = max(0, int(holding_shares or 0))
         available_shares = min(max(0, int(available_shares or 0)), holding_shares)
 
@@ -537,14 +538,15 @@ class T0SmartEngine:
             elif suggested_shares < 100:
                 signal_desc = "当日可卖底仓不足·不生成T0信号"
                 reasons.append("需在自选持仓中填写已从券商核对的当日可卖股数，至少100股且不高于总持仓")
-            elif market_exposure is None or market_exposure < min_market_exposure:
-                signal_desc = "市场风险偏高或指数数据未知·不生成新信号"
-                reasons.append(f"新T0信号要求市场参考敞口至少{min_market_exposure:.0%}；当前={market_exposure if market_exposure is not None else '未知'}")
             elif current_price <= dyn_lower:
                 trend_allows_buy = trend_direction == "BULL" or (not use_trend_filter and trend_direction != "NEUTRAL")
                 if not trend_allows_buy:
                     signal_desc = "日线趋势未确认·跳过低吸信号"
                     reasons.append(f"低吸只在MA20、MA60多头且MA20上行时启用；当前趋势={trend_direction}")
+                elif market_exposure is None or market_exposure < min_market_exposure:
+                    # 正T(买入低吸)仅在正敞口市场启用，弱市不接下跌刀
+                    signal_desc = "市场风险偏高·不生成正T低吸"
+                    reasons.append(f"正T要求市场参考敞口至少{min_market_exposure:.0%}；当前={market_exposure if market_exposure is not None else '未知'}")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct < -max_vwap_slope_pct:
                     signal_desc = "分时均价单边下行·跳过正T低吸"
                     reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边下行超过{max_vwap_slope_pct}%，逆势低吸风险高")
@@ -591,6 +593,10 @@ class T0SmartEngine:
                 if not trend_allows_sell:
                     signal_desc = "上行趋势未出现极端偏离·跳过倒T"
                     reasons.append("多头趋势中不做普通偏离高抛，避免过早卖出；仅观察极端偏离后的回落确认")
+                elif market_exposure is None or market_exposure < min_market_exposure_sell:
+                    # 倒T(高抛)属防御性操作，门槛远低于正T；仅在指数数据完全不可用时拦截
+                    signal_desc = "指数数据不可用·不生成倒T信号"
+                    reasons.append("无法确认市场状态时暂停生成新做T信号，待数据恢复后重新评估")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct > max_vwap_slope_pct:
                     signal_desc = "分时均价单边急涨·跳过倒T高抛"
                     reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边急涨超过{max_vwap_slope_pct}%，逆势高抛易卖飞")
