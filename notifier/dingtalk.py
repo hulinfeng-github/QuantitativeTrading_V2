@@ -267,6 +267,21 @@ def format_batch_signals_markdown(signals: List[Dict[str, Any]], group_name: str
             item_lines.append(f"- **策略退出提醒**: 参考价 {fmt_p(price)}元。请结合实际持仓和可成交价格判断；不是委托指令。")
         elif sig_type in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
             item_lines.append(f"- **做T模型提醒**: 参考价 {fmt_p(price)}元，模型目标/风控线 {levels.get('target_price', '-')}元 / {levels.get('initial_stop', '-')}元。请核对可用底仓、T+1可卖数量与成交状态；系统未下单。")
+            regime = signal.get("regime_status") or signal.get("trend_direction", "")
+            regime_reason = signal.get("regime_reason", "")
+            if regime:
+                regime_map = {"BULL": "🐂 牛市/多头主升通道", "BEAR": "🐻 熊市/空头弱势通道", "NEUTRAL": "⚖️ 震荡平衡通道"}
+                r_text = regime_map.get(regime, regime)
+                item_lines.append(f"- **市场通道研判**: **{r_text}**" + (f" ({regime_reason})" if regime_reason else ""))
+            net_amt = signal.get("net_pnl_amt")
+            dilution = signal.get("dilution_per_share")
+            new_cost = signal.get("new_holding_cost")
+            cost = signal.get("holding_cost", 0.0)
+            if net_amt is not None and cost > 0 and new_cost is not None:
+                if net_amt > 0:
+                    item_lines.append(f"- **💡 解套成本摊薄**: 净回笼差价现金 **+{net_amt:.1f} 元**，持仓成本预计由 **{fmt_p(cost)} 元** 降至 **{fmt_p(new_cost)} 元** (每股摊薄 **-{abs(dilution):.3f} 元**)")
+                else:
+                    item_lines.append(f"- **⚠️ 差价对冲微调**: 净差价 **{net_amt:.1f} 元**，持仓成本微调至 **{fmt_p(new_cost)} 元**")
         elif sig_type == "EOD_FORCE_CLOSE_T":
             item_lines.append("- **尾盘风险提醒**: 请核对当日买入数量、可卖底仓和实际委托；模型提醒不等于必须交易或已成交。")
         elif sig_type == "EOD_HEDGE_ALERT_T":
@@ -489,14 +504,40 @@ class DingTalkNotifier:
             t0_strength = signal.get("t0_score") or signal.get("t0_strength")
             if t0_strength:
                 lines.append(f"- **做T信号强度**: **{int(t0_strength)} 分** (规则启发式，非校准概率)")
+
+            # 市场通道研判展示
+            regime = signal.get("regime_status") or signal.get("trend_direction", "")
+            regime_reason = signal.get("regime_reason", "")
+            if regime:
+                regime_map = {"BULL": "🐂 牛市/多头主升通道", "BEAR": "🐻 熊市/空头弱势通道", "NEUTRAL": "⚖️ 震荡平衡通道"}
+                r_text = regime_map.get(regime, regime)
+                if regime_reason:
+                    lines.append(f"- **市场通道研判**: **{r_text}** ({regime_reason})")
+                else:
+                    lines.append(f"- **市场通道研判**: **{r_text}**")
+
             if sig_type == "SELL_T":
                 lines.extend([
                     f"- **倒T模型观察**: 参考价 {fmt_p(price)} 元；目标/风控线 {levels.get('target_price')} / {levels.get('initial_stop')} 元。请核对可卖底仓；系统未下单。"
                 ])
+                target_p = levels.get("target_price")
+                if target_p and price > 0:
+                    try:
+                        diff_v = abs(price - float(target_p))
+                        lines.append(f"- **🎯 解套降本目标**: 目标回踩 {fmt_p(target_p)} 元，若达成预计每股摊薄成本约 **{diff_v:.3f} 元**")
+                    except Exception:
+                        pass
             elif sig_type == "BUY_T":
                 lines.extend([
                     f"- **正T模型观察**: 参考价 {fmt_p(price)} 元；目标/风控线 {levels.get('target_price')} / {levels.get('initial_stop')} 元。请核对可用资金与T+1限制；系统未下单。"
                 ])
+                target_p = levels.get("target_price")
+                if target_p and price > 0:
+                    try:
+                        diff_v = abs(float(target_p) - price)
+                        lines.append(f"- **🎯 解套降本目标**: 目标冲高 {fmt_p(target_p)} 元，若达成预计每股摊薄成本约 **{diff_v:.3f} 元**")
+                    except Exception:
+                        pass
             elif sig_type == "CLOSE_T":
                 t0_dir = signal.get("t0_direction", "")
                 close_act = signal.get("close_action", "")
@@ -509,6 +550,17 @@ class DingTalkNotifier:
                     lines.extend([
                         f"- **正T行情提醒**: 卖出观察价 {fmt_p(price)} 元，模型数量参考 {shares} 股；请核对实际可卖数量与委托，系统未下单。"
                     ])
+
+                # 💡 解套成本摊薄提示
+                net_amt = signal.get("net_pnl_amt")
+                dilution = signal.get("dilution_per_share")
+                new_cost = signal.get("new_holding_cost")
+                cost = signal.get("holding_cost", 0.0)
+                if net_amt is not None and cost > 0 and new_cost is not None:
+                    if net_amt > 0:
+                        lines.append(f"- **💡 解套成本摊薄**: 本次做T净回笼现金 **+{net_amt:.1f} 元**，预计持仓成本从 **{fmt_p(cost)} 元** 降至 **{fmt_p(new_cost)} 元** (每股摊薄 **-{abs(dilution):.3f} 元**)")
+                    else:
+                        lines.append(f"- **⚠️ 差价对冲微调**: 净差价 **{net_amt:.1f} 元**，持仓成本微调至 **{fmt_p(new_cost)} 元**")
             elif sig_type == "STOP_T":
                 t0_dir = signal.get("t0_direction", "")
                 close_act = signal.get("close_action", "")
@@ -521,6 +573,9 @@ class DingTalkNotifier:
                     lines.extend([
                         f"- **正T风险提醒**: 行情触及模型防守线，参考价 {fmt_p(price)} 元，数量参考 {shares} 股；请核对T+1可卖数量和委托。"
                     ])
+                net_amt = signal.get("net_pnl_amt")
+                if net_amt is not None:
+                    lines.append(f"- **防守止损结算**: 净损益 {net_amt:+.1f} 元，启动熔断保护底仓")
 
         # 5. 尾盘未对冲做T强制平仓与对冲抉择提醒
         elif sig_type == "EOD_FORCE_CLOSE_T":

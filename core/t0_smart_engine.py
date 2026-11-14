@@ -13,7 +13,7 @@ import json
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 import numpy as np
 from config import T0_TRADES_FILE, T0_HISTORY_FILE, load_config
@@ -30,6 +30,154 @@ def round_price_dynamic(price: float, symbol: str = "") -> float:
     if is_etf or price < 5.0:
         return round(float(price), 3)
     return round(float(price), 2)
+
+def evaluate_market_regime(
+    daily_kline: Optional[pd.DataFrame],
+    current_price: float,
+    symbol: str = "",
+    as_of_date: Optional[str] = None
+) -> Tuple[str, float, str]:
+    """
+    严谨多因子趋势通道与牛熊市状态识别 (双均线+斜率+迟滞滤波防频繁切换)
+    返回: (regime: 'BULL' | 'BEAR' | 'NEUTRAL', ma20: float, reason: str)
+    """
+    if daily_kline is None or len(daily_kline) < 20 or "close" not in daily_kline.columns:
+        return "NEUTRAL", current_price, "日K线样本不足20天，中立平衡判定"
+        
+    df_source = daily_kline.copy()
+    if "date" in df_source.columns and len(df_source) > 0:
+        if as_of_date:
+            df_source = df_source[df_source["date"].astype(str).str[:10] < as_of_date]
+        else:
+            today_s = datetime.now().strftime("%Y-%m-%d")
+            last_d = str(df_source["date"].iloc[-1])[:10]
+            if last_d == today_s:
+                df_source = df_source.iloc[:-1]
+                
+    closes = pd.to_numeric(df_source["close"], errors="coerce").dropna().to_numpy()
+    if len(closes) < 20:
+        return "NEUTRAL", current_price, "有效收盘价样本不足20天"
+        
+    ma5 = float(np.mean(closes[-5:]))
+    ma20 = float(np.mean(closes[-20:]))
+    ma20_prev3 = float(np.mean(closes[-23:-3])) if len(closes) >= 23 else ma20
+    ma20_slope_pct = (ma20 - ma20_prev3) / ma20_prev3 * 100.0 if ma20_prev3 > 0 else 0.0
+    
+    sym_lower = str(symbol).lower()
+    is_etf = any(sym_lower.startswith(p) for p in ["sh5", "sz15", "sz16", "sh51", "sh56", "sh58", "sh50", "sz18"])
+    
+    # 迟滞缓冲区间：个股±1.2%，ETF±0.8%，防止在均线附近0.01元频繁假突破横跳
+    buffer_pct = 0.8 if is_etf else 1.2
+    upper_band = ma20 * (1.0 + buffer_pct / 100.0)
+    lower_band = ma20 * (1.0 - buffer_pct / 100.0)
+    
+    p = float(current_price)
+    
+    # 严谨牛市/多头主升通道：
+    # 1. 价格突破MA20缓冲上轨且MA20走平或拐头向上；或 2. MA5/MA20金叉多头共振且MA20正斜率扩张
+    is_bull = False
+    bull_reason = ""
+    if p >= upper_band and ma20_slope_pct >= -0.15:
+        is_bull = True
+        bull_reason = f"现价({p:.2f}元)突破MA20缓冲上轨({upper_band:.2f}元)且均线走稳(3日斜率{ma20_slope_pct:+.2f}%)"
+    elif p >= ma20 and ma5 >= ma20 and ma20_slope_pct > 0.05:
+        is_bull = True
+        bull_reason = f"均线多头共振(MA5>MA20且3日斜率{ma20_slope_pct:+.2f}%)"
+        
+    # 严谨熊市/空头弱势通道：
+    # 1. 价格跌破MA20缓冲下轨且MA20走弱；或 2. MA5/MA20死叉空头共振且MA20负斜率下泄
+    is_bear = False
+    bear_reason = ""
+    if p <= lower_band and ma20_slope_pct <= 0.15:
+        is_bear = True
+        bear_reason = f"现价({p:.2f}元)跌破MA20缓冲下轨({lower_band:.2f}元)且均线走弱(3日斜率{ma20_slope_pct:+.2f}%)"
+    elif p < ma20 and ma5 < ma20 and ma20_slope_pct < -0.05:
+        is_bear = True
+        bear_reason = f"均线空头死叉(MA5<MA20且3日斜率{ma20_slope_pct:+.2f}%)"
+        
+    if is_bull and not is_bear:
+        return "BULL", ma20, bull_reason
+    elif is_bear and not is_bull:
+        return "BEAR", ma20, bear_reason
+    else:
+        return "NEUTRAL", ma20, f"处于MA20±{buffer_pct}%迟滞平衡区间(MA20={ma20:.2f}元)"
+
+
+def compute_intraday_divergence(
+    minute_frame: Optional[pd.DataFrame],
+    current_price: float,
+    min_bars: int = 12
+) -> Tuple[bool, bool, str]:
+    """
+    分时多因子背离预测与动能衰竭研判 (5m MACD 底背离/顶背离 + KDJ 极值拐点)
+    返回: (buy_divergence_confirmed, sell_divergence_confirmed, divergence_desc)
+    """
+    if minute_frame is None or len(minute_frame) < min_bars:
+        return False, False, ""
+        
+    prices = pd.to_numeric(minute_frame["price"], errors="coerce").dropna().to_numpy(dtype=float)
+    if len(prices) < min_bars:
+        return False, False, ""
+        
+    # 计算分时 MACD (EMA12, EMA26, DEA9)
+    s = pd.Series(prices)
+    ema12 = s.ewm(span=12, adjust=False).mean()
+    ema26 = s.ewm(span=26, adjust=False).mean()
+    dif = (ema12 - ema26).to_numpy()
+    dea = pd.Series(dif).ewm(span=9, adjust=False).mean().to_numpy()
+    macd_hist = (dif - dea) * 2.0
+    
+    # 计算分时 KDJ (9, 3, 3)
+    low_min = s.rolling(9, min_periods=1).min()
+    high_max = s.rolling(9, min_periods=1).max()
+    rsv = np.where(high_max > low_min, (s - low_min) / (high_max - low_min) * 100.0, 50.0)
+    k_vals = [50.0]
+    d_vals = [50.0]
+    for r in rsv:
+        k = (2.0 / 3.0) * k_vals[-1] + (1.0 / 3.0) * r
+        d = (2.0 / 3.0) * d_vals[-1] + (1.0 / 3.0) * k
+        k_vals.append(k)
+        d_vals.append(d)
+    k_arr = np.array(k_vals[1:])
+    d_arr = np.array(d_vals[1:])
+    j_arr = 3.0 * k_arr - 2.0 * d_arr
+    
+    reasons = []
+    
+    # 1. 底背离预测 (用于正T抄底): 价格创近12根分时局部新低，但 MACD DIF 不创新低且拐头向上
+    kdj_oversold_gold = (j_arr[-1] > k_arr[-1] and j_arr[-2] <= k_arr[-2] and j_arr[-2] < 25.0)
+    min_idx = int(np.argmin(prices[-12:]))
+    price_trough = prices[-12 + min_idx]
+    macd_trough = dif[-12 + min_idx]
+    macd_bottom_div = False
+    if 2 < min_idx < 10:
+        if prices[-1] <= price_trough * 1.003 and dif[-1] > macd_trough + 0.002 and dif[-1] > dif[-2]:
+            macd_bottom_div = True
+            
+    buy_div = kdj_oversold_gold or macd_bottom_div
+    if kdj_oversold_gold:
+        reasons.append("KDJ超卖低位金叉")
+    if macd_bottom_div:
+        reasons.append("MACD分时底背离")
+        
+    # 2. 顶背离预测 (用于倒T高抛): 价格创近12根分时局部新高，但 MACD DIF 不创新高且拐头向下
+    kdj_overbought_dead = (j_arr[-1] < k_arr[-1] and j_arr[-2] >= k_arr[-2] and j_arr[-2] > 75.0)
+    max_idx = int(np.argmax(prices[-12:]))
+    price_peak = prices[-12 + max_idx]
+    macd_peak = dif[-12 + max_idx]
+    macd_top_div = False
+    if 2 < max_idx < 10:
+        if prices[-1] >= price_peak * 0.997 and dif[-1] < macd_peak - 0.002 and dif[-1] < dif[-2]:
+            macd_top_div = True
+            
+    sell_div = kdj_overbought_dead or macd_top_div
+    if kdj_overbought_dead:
+        reasons.append("KDJ超买高位死叉")
+    if macd_top_div:
+        reasons.append("MACD分时顶背离")
+        
+    return buy_div, sell_div, "+".join(reasons)
+
 
 
 class T0PositionTracker:
@@ -221,6 +369,15 @@ class T0PositionTracker:
             pos["net_pnl_pct"] = round(net_pct, 2)
             pos["net_pnl_type"] = "signal_proxy_net_incl_fees_slippage_estimate"
 
+            # 计算解套成本动态摊薄 (按当前持仓股数冲减每股成本)
+            if shares > 0:
+                dilution_per_share = round(net_amt / shares, 3)
+                pos["dilution_per_share"] = dilution_per_share
+                pos["new_holding_cost"] = round(entry_p - dilution_per_share, 3)
+            else:
+                pos["dilution_per_share"] = 0.0
+                pos["new_holding_cost"] = entry_p
+
             self._save()
             self._append_history(pos.copy())
 
@@ -355,8 +512,10 @@ class T0SmartEngine:
 
     def _result(self, symbol, name, current_price, vwap, bias, dyn_lower, dyn_upper,
                 trend, market_exposure, action, desc, reasons, active_dir="",
-                target=None, stop=None, entry=None, shares=0, score=0) -> Dict[str, Any]:
-        return {
+                target=None, stop=None, entry=None, shares=0, score=0,
+                regime_reason="", regime_status="") -> Dict[str, Any]:
+        pos = self.tracker.get_position(symbol)
+        res = {
             "symbol": symbol,
             "name": name,
             "current_price": current_price,
@@ -365,11 +524,13 @@ class T0SmartEngine:
             "dyn_lower": dyn_lower,
             "dyn_upper": dyn_upper,
             "trend_direction": trend,
+            "regime_status": regime_status or trend,
+            "regime_reason": regime_reason,
             "market_exposure": market_exposure,
             "signal_action": action,
             "signal_desc": desc,
             "reasons": reasons,
-            "position": self.tracker.get_position(symbol),
+            "position": pos,
             "direction": active_dir,
             "t0_direction": active_dir,
             "close_action": self._close_action(action, active_dir),
@@ -380,6 +541,16 @@ class T0SmartEngine:
             "score": score,
             "t0_score": score
         }
+        if pos:
+            if "dilution_per_share" in pos:
+                res["dilution_per_share"] = pos["dilution_per_share"]
+            if "new_holding_cost" in pos:
+                res["new_holding_cost"] = pos["new_holding_cost"]
+            if "net_pnl_amt" in pos:
+                res["net_pnl_amt"] = pos["net_pnl_amt"]
+            if "fees_amt" in pos:
+                res["fees_amt"] = pos["fees_amt"]
+        return res
 
     def analyze_t0(
         self,
@@ -402,6 +573,10 @@ class T0SmartEngine:
         require_dual_resonance = bool(cfg.get("t0_require_dual_resonance", True))
         golden_window_only = bool(cfg.get("t0_golden_window_only", True))
         avoid_early_morning_short = bool(cfg.get("t0_avoid_early_morning_short", True))
+        divergence_filter_enabled = bool(cfg.get("t0_divergence_filter_enabled", True))
+        agile_trailing_enabled = bool(cfg.get("t0_agile_trailing_enabled", True))
+        agile_active_pct = float(cfg.get("t0_agile_trailing_active", 0.6))
+        agile_callback_pct = float(cfg.get("t0_agile_trailing_callback", 0.2))
         stop_pct = float(cfg.get("t0_stop_loss_pct", 1.5))
         take_profit_pct = float(cfg.get("t0_take_profit_pct", 1.5))
         trailing_pct = float(cfg.get("t0_trailing_profit_pct", 0.5))
@@ -440,6 +615,8 @@ class T0SmartEngine:
             stop_pct = round(stop_pct * 0.6, 2)
             band_min_pct = round(band_min_pct * 0.6, 2)
             band_max_pct = round(band_max_pct * 0.65, 2)
+            agile_active_pct = round(agile_active_pct * 0.6, 2)
+            agile_callback_pct = round(agile_callback_pct * 0.75, 2)
 
         # ---- 交易时段守卫：仅在未传入 df_minute 时拦截非交易时段 ----
         if df_minute is None and not self.is_trading_session():
@@ -518,23 +695,8 @@ class T0SmartEngine:
             minute_data_ok = True
             minute_closes = pd.to_numeric(df_minute["price"], errors="coerce").dropna().to_numpy()
 
-        # 2. 检查大趋势通道 (顺势定调)
-        trend_direction = "NEUTRAL"
-        if daily_kline is not None and "close" in daily_kline and len(daily_kline) >= 20:
-            daily_source = daily_kline
-            if "date" in daily_source.columns and len(daily_source) > 0:
-                last_daily_date = str(daily_source["date"].iloc[-1])[:10]
-                if last_daily_date == now.strftime("%Y-%m-%d"):
-                    daily_source = daily_source.iloc[:-1]
-            daily_close = pd.to_numeric(daily_source["close"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            if len(daily_close) >= 20:
-                ma20 = float(daily_close.rolling(20, min_periods=20).mean().iloc[-1])
-                prev_close = float(daily_close.iloc[-1])
-                # 无论昨日收盘还是当前现价，只要在MA20之上均可视为偏多环境
-                if prev_close >= ma20 or current_price >= ma20:
-                    trend_direction = "BULL"
-                else:
-                    trend_direction = "BEAR"
+        # 2. 严谨多因子趋势通道与牛熊市状态识别 (双均线+斜率+迟滞滤波防频繁切换)
+        trend_direction, ma20, regime_reason = evaluate_market_regime(daily_kline, current_price, symbol)
 
         # 3. 检查现有持仓状态跟踪与冷却期解除
         # 检索当日同向止损风控熔断历史与单日做T频次统计
@@ -601,13 +763,19 @@ class T0SmartEngine:
                         signal_desc = "正T防守止损对冲平仓"
                         reasons.append(f"跌破正T防守底线 {stop_p}元(-{stop_pct}%)，建议立即卖出底仓止损保护！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
-                    # 2. 冲高回落动态浮动对冲止盈
+                    # 2. 敏捷动态移动止盈 (小步快跑落袋解套，保底0.6%锁定+回撤0.2%走)
+                    elif agile_trailing_enabled and peak_profit_pct >= agile_active_pct and (peak_profit_pct - curr_profit_pct) >= agile_callback_pct:
+                        signal_action = "CLOSE_T"
+                        signal_desc = "正T敏捷移动止盈对冲平仓"
+                        reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后回落{agile_callback_pct}%，敏捷移动锁定做T利润，摊薄持仓成本！")
+                        self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                    # 3. 冲高回落动态浮动对冲止盈
                     elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
                         signal_action = "CLOSE_T"
                         signal_desc = "正T冲高回落对冲平仓"
                         reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后回落{trailing_pct}%，建议高抛卖出等量底仓，动态锁定做T利润！")
                         self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
-                    # 3. 达到静态目标止盈
+                    # 4. 达到静态目标止盈
                     elif round(current_price, 3) >= round(target_p, 3) - 1e-4:
                         signal_action = "CLOSE_T"
                         signal_desc = "正T冲高卖出对冲平仓"
@@ -627,13 +795,19 @@ class T0SmartEngine:
                         signal_desc = "倒T反抽止损买回归位"
                         reasons.append(f"价格反抽冲破防守线 {stop_p}元，为防底仓抛飞，建议立即以市价买回等量底仓（{pos_shares}股）止损对冲！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
-                    # 2. 探底回升动态止盈
+                    # 2. 敏捷动态移动止盈 (倒T探底回升买回锁差价)
+                    elif agile_trailing_enabled and peak_profit_pct >= agile_active_pct and (peak_profit_pct - curr_profit_pct) >= agile_callback_pct:
+                        signal_action = "CLOSE_T"
+                        signal_desc = "倒T敏捷移动止盈买回平仓"
+                        reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后回升{agile_callback_pct}%，敏捷买回等量底仓锁定差价，摊薄持仓成本！")
+                        self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                    # 3. 探底回升动态止盈
                     elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
                         signal_action = "CLOSE_T"
                         signal_desc = "倒T探底回升对冲平仓"
                         reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后回升{trailing_pct}%，建议立即买回等量底仓，锁定做T利润！")
                         self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
-                    # 3. 回踩目标价平仓买回
+                    # 4. 回踩目标价平仓买回
                     elif round(current_price, 3) <= round(target_p, 3) + 1e-4:
                         signal_action = "CLOSE_T"
                         signal_desc = "倒T回踩低吸买入平仓"
@@ -682,17 +856,33 @@ class T0SmartEngine:
             elif today_trade_count >= max_daily_trades:
                 signal_desc = f"达单日做T上限({max_daily_trades}次)·观望"
                 reasons.append(f"该标的今日已完成 {today_trade_count} 笔做T，已达单日频次上限({max_daily_trades}次)，防范过度交易磨损")
-            elif (bias <= bias_buy_thresh and current_price <= dyn_lower) if require_dual_resonance else (bias <= bias_buy_thresh or current_price <= dyn_lower):
-                # 正T买入判定：优先多头；若空头但偏离达超跌线，允许做超跌反抽
+            # 计算分时动能背离预测 (MACD 5m 底/顶背离 + KDJ 极值拐点)
+            buy_div, sell_div, div_desc = compute_intraday_divergence(minute_frame if minute_data_ok else None, current_price)
+
+            if (bias <= bias_buy_thresh and current_price <= dyn_lower) if require_dual_resonance else (bias <= bias_buy_thresh or current_price <= dyn_lower):
+                # 正T买入判定：
+                # 1. 牛市通道 (BULL) 或 震荡平衡 (NEUTRAL)：顺势逢低吸纳做正T；
+                # 2. 熊市通道 (BEAR)：严格防范盲目接飞刀！必须满足分时背离预测(MACD底背离/KDJ超卖金叉)且分时止跌企稳确认！
                 is_oversold_bounce = (bias <= bias_buy_thresh * 1.35)
-                trend_allows_buy = (trend_direction == "BULL") or is_oversold_bounce or (not use_trend_filter)
+                if not use_trend_filter:
+                    trend_allows_buy = True
+                elif trend_direction == "BEAR":
+                    trend_allows_buy = (buy_div and buy_reversal_confirmed) if divergence_filter_enabled else is_oversold_bounce
+                elif trend_direction == "BULL":
+                    trend_allows_buy = True
+                else:  # NEUTRAL
+                    trend_allows_buy = True
 
                 if "BUY_T" in today_stopped_dirs:
                     signal_desc = "今日正T已止损·触发风控熔断"
                     reasons.append("该标的今日此前已触发正T防守止损，表明处于强单边下泄行情，日内暂停同向做T防范二次磨损")
                 elif not trend_allows_buy:
-                    signal_desc = "空头趋势压制·严禁接飞刀"
-                    reasons.append(f"标的处于空头通道且负偏离({bias:.2f}%)未达恐慌超跌线({bias_buy_thresh*1.35:.2f}%)，防范单边阴跌")
+                    if trend_direction == "BEAR":
+                        signal_desc = "空头通道严禁接飞刀·等待底背离共振"
+                        reasons.append(f"标的处于空头熊市弱势通道({regime_reason})，严禁左侧盲目接飞刀；必须等待5分钟MACD底背离或KDJ超卖止跌企稳才允许做正T反抽")
+                    else:
+                        signal_desc = "空头趋势压制·严禁接飞刀"
+                        reasons.append(f"标的处于空头通道且负偏离({bias:.2f}%)未达恐慌超跌线({bias_buy_thresh*1.35:.2f}%)，防范单边阴跌")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct < -max_vwap_slope_pct and not is_oversold_bounce:
                     signal_desc = "分时VWAP单边下泄·跳过低吸"
                     reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边急挫，逆势低吸风险高")
@@ -701,7 +891,10 @@ class T0SmartEngine:
                     reasons.append("价格触及动态下轨，等待分时止跌转强反转确认")
                 else:
                     signal_action = "BUY_T"
-                    if is_oversold_bounce:
+                    if buy_div:
+                        signal_desc = f"🌟 背离预测正T·低吸机会触发 ({div_desc})"
+                        reasons.append(f"分时出现动能衰竭【{div_desc}】，现价偏离分时均价({vwap}元)达 {bias:.2f}%，触及动态下轨({dyn_lower}元)，具备高胜率超跌反弹差价")
+                    elif is_oversold_bounce:
                         signal_desc = "🌟 破位超跌反弹·正T急跌低吸"
                         reasons.append(f"日内急跌出现极端负偏离({bias:.2f}%)，触发强力超跌反抽买点，轻仓快进快出做正T")
                     else:
@@ -720,7 +913,7 @@ class T0SmartEngine:
                     active_entry = current_price
                     active_shares = suggested_shares
 
-                    t0_score = self._t0_score(bias, (vwap - dyn_lower)/vwap*100.0 if vwap > 0 else 0.0, trend_direction == "BULL", True, minute_bar_age_minutes, is_late, is_oversold_bounce)
+                    t0_score = self._t0_score(bias, (vwap - dyn_lower)/vwap*100.0 if vwap > 0 else 0.0, trend_direction == "BULL", True, minute_bar_age_minutes, is_late, is_oversold_bounce or buy_div)
 
                     self.tracker.open_position(
                         symbol=symbol, name=name, direction="BUY_T", price=current_price,
@@ -728,9 +921,20 @@ class T0SmartEngine:
                     )
 
             elif (bias >= bias_sell_thresh and current_price >= dyn_upper) if require_dual_resonance else (bias >= bias_sell_thresh or current_price >= dyn_upper):
-                # 倒T高抛判定：空头或震荡优先；多头通道中仅在极端脉冲时允许防抛飞
+                # 倒T高抛判定：
+                # 1. 熊市通道 (BEAR)：倒T高抛是解套降成本核心主力策略（早盘冲高卖出底仓，下午低吸买回）；
+                # 2. 牛市通道 (BULL)：严格防卖飞！仅在极端脉冲或分时顶背离时允许高抛；
+                # 3. 震荡平衡 (NEUTRAL)：标准均值回归高抛低吸。
                 is_extreme_pulse = (bias >= bias_sell_thresh * 1.25)
-                trend_allows_sell = (trend_direction == "BEAR") or is_extreme_pulse or (not use_trend_filter)
+                if not use_trend_filter:
+                    trend_allows_sell = True
+                elif trend_direction == "BEAR":
+                    trend_allows_sell = True  # 熊市倒T是降成本解套的核心利器
+                elif trend_direction == "BULL":
+                    trend_allows_sell = is_extreme_pulse or (divergence_filter_enabled and sell_div)
+                else:  # NEUTRAL
+                    trend_allows_sell = True
+
                 early_short_blocked = (avoid_early_morning_short and current_hm <= "09:45" and bias < (1.7 if is_etf else 2.8))
 
                 if "SELL_T" in today_stopped_dirs:
@@ -741,7 +945,7 @@ class T0SmartEngine:
                     reasons.append(f"09:45前属于早盘竞价发现与主力抢筹脉冲期，现价涨幅偏离(+{bias:.2f}%)未达极值({1.7 if is_etf else 2.8}%)，暂不开倒T以防底仓卖飞")
                 elif not trend_allows_sell:
                     signal_desc = "多头主升·严禁倒T防抛飞"
-                    reasons.append("标的高处于多头主升通道，倒T高抛极易卖飞强势核心牛股，仅在极端偏离脉冲时高抛")
+                    reasons.append("标的高处于多头主升通道，倒T高抛极易卖飞强势核心牛股，仅在极端偏离脉冲或分时顶背离时允许高抛")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct > max_vwap_slope_pct:
                     signal_desc = "分时VWAP单边急涨·跳过倒T"
                     reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边急涨，防范过早减仓卖飞")
@@ -750,8 +954,15 @@ class T0SmartEngine:
                     reasons.append("现价触及动态上轨，等待分时滞涨回落确认")
                 else:
                     signal_action = "SELL_T"
-                    signal_desc = "⚡ 倒T高抛机会触发"
-                    reasons.append(f"现价冲高偏离分时均价({vwap}元)达 +{bias:.2f}%，触及动态布林上轨({dyn_upper}元)，适合高抛后低吸回补")
+                    if sell_div:
+                        signal_desc = f"⚡ 背离预测倒T·高抛机会触发 ({div_desc})"
+                        reasons.append(f"分时冲高出现动能衰竭【{div_desc}】，现价偏离VWAP均价({vwap}元)达 +{bias:.2f}%，触及动态上轨({dyn_upper}元)，适合先卖底仓高抛、尾盘低吸回补降成本")
+                    elif trend_direction == "BEAR":
+                        signal_desc = "⚡ 弱势通道顺势倒T·高抛摊薄成本"
+                        reasons.append(f"标的处于弱势空头通道({regime_reason})，现价冲高偏离分时均价({vwap}元)达 +{bias:.2f}%，触及上轨({dyn_upper}元)，顺势卖出底仓，待回落低吸摊薄持仓成本")
+                    else:
+                        signal_desc = "⚡ 倒T高抛机会触发"
+                        reasons.append(f"现价冲高偏离分时均价({vwap}元)达 +{bias:.2f}%，触及动态布林上轨({dyn_upper}元)，适合高抛后低吸回补")
 
                     suggested_stop = round_price_dynamic(current_price * (1.0 + stop_pct / 100.0), symbol)
                     suggested_target = round_price_dynamic(min(vwap * (1.0 - take_profit_vwap_pct / 100.0), current_price * (1.0 - take_profit_pct / 100.0)), symbol)
@@ -764,7 +975,7 @@ class T0SmartEngine:
                     active_entry = current_price
                     active_shares = suggested_shares
 
-                    t0_score = self._t0_score(bias, (dyn_upper - vwap)/vwap*100.0 if vwap > 0 else 0.0, trend_direction == "BEAR", True, minute_bar_age_minutes, is_late, is_extreme_pulse)
+                    t0_score = self._t0_score(bias, (dyn_upper - vwap)/vwap*100.0 if vwap > 0 else 0.0, trend_direction == "BEAR", True, minute_bar_age_minutes, is_late, is_extreme_pulse or sell_div)
 
                     self.tracker.open_position(
                         symbol=symbol, name=name, direction="SELL_T", price=current_price,
@@ -776,7 +987,8 @@ class T0SmartEngine:
             symbol, name, current_price, vwap, bias, dyn_lower, dyn_upper,
             trend_direction, market_exposure, signal_action, signal_desc, reasons,
             active_dir, active_target, active_stop, active_entry, active_shares,
-            calc_score
+            calc_score,
+            regime_reason=regime_reason, regime_status=trend_direction
         )
 
     def build_signal_payload(self, t0_res: Dict[str, Any]) -> Dict[str, Any]:
@@ -796,7 +1008,7 @@ class T0SmartEngine:
             "target_price": target_p
         }
 
-        return {
+        res_dict = {
             "symbol": sym,
             "name": t0_res.get("name", sym),
             "date": datetime.now().strftime("%Y-%m-%d"),
@@ -811,8 +1023,16 @@ class T0SmartEngine:
             "close_action": t0_res.get("close_action", ""),
             "holding_shares": shares,
             "holding_cost": entry_p,
-            "trade_levels": trade_levels
+            "trade_levels": trade_levels,
+            "trend_direction": t0_res.get("trend_direction", ""),
+            "regime_status": t0_res.get("regime_status", ""),
+            "regime_reason": t0_res.get("regime_reason", "")
         }
+        # 传递解套成本摊薄信息
+        for k in ["dilution_per_share", "new_holding_cost", "net_pnl_amt", "fees_amt"]:
+            if k in t0_res:
+                res_dict[k] = t0_res[k]
+        return res_dict
 
     def check_eod_unclosed_positions(self) -> List[Dict[str, Any]]:
         """

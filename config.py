@@ -106,6 +106,11 @@ DEFAULT_CONFIG = {
     "t0_require_dual_resonance": True,  # 开启双重共振 (偏离阈值 AND 动态布林触轨同时满足，规避单边假信号)
     "t0_golden_window_only": True,      # 仅在黄金交易窗口开新仓 (自动屏蔽 11:00-11:30 假突破陷阱期)
     "t0_avoid_early_morning_short": True, # 开启早盘防倒T保护 (09:45前主力抢筹脉冲期严格限制倒T，非极端不抛底仓)
+    "t0_divergence_filter_enabled": True, # 开启分时多因子背离预测 (5m MACD底背离/顶背离 + KDJ极值拐点，防熊市接飞刀)
+    "t0_agile_trailing_enabled": True,  # 开启敏捷动态移动止盈 (0.6%锁定 + 0.2%回撤，小步快跑积少成多解套)
+    "t0_agile_trailing_active": 0.6,    # 敏捷移动止盈激活阈值(%) (主板0.6%，ETF自适应0.4%)
+    "t0_agile_trailing_callback": 0.2,  # 敏捷移动止盈回撤锁定阈值(%) (0.2%)
+    "t0_cost_dilution_notify": True,    # 开启持仓成本动态摊薄与解套进度追踪通知
     "t0_reversal_bars": 1,              # 反转确认所需连续同向分钟K线数 (1=更灵敏，2=更严格)
     "t0_reversal_volume_confirm": False, # 反转放量确认 (默认关闭以保证信号频率，可改 True 加强质量)
     "t0_reversal_volume_mult": 1.0,     # 放量确认倍数 (反转分钟量 >= 近期均量 × 该系数)
