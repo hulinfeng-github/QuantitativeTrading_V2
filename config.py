@@ -124,8 +124,8 @@ DEFAULT_CONFIG = {
     "t0_min_market_exposure": 0.35,     # 仅在市场状态不低于该风险敞口时生成新T0信号
                                          # 0.35=多头震荡及以上允许(空头震荡也允许做T摊薄)；0.65=仅多头；0=不限制
     "t0_min_market_exposure_sell": 0.0, # 倒T(高抛)的市场敞口下限；0=弱市也允许高抛防御，仅要求指数数据可用
-    "t0_max_trades_per_day": 2,         # 单只标的每日做T最大次数
-    "t0_daily_stop_circuit_breaker": True, # 开启单日同向止损熔断 (当日止损后不再开同向仓位)         # 单只标的每日做T最大次数
+    "t0_max_trades_per_day": 1,         # 单只标的每日做T最大次数 (实证证明单日1笔胜率最高达54.5%，避免过度交易)
+    "t0_daily_stop_circuit_breaker": True, # 开启单日同向止损熔断 (当日止损后不再开同向仓位)
     "t0_single_direction_only": True,   # 单日做T单向严格锁定
     "t0_trend_filter_enabled": True,    # 开启大趋势过滤 (顺势做T)
     "t0_eod_force_close_enabled": True, # 开启尾盘风险核验提醒；不会自动平仓

@@ -536,7 +536,7 @@ class T0SmartEngine:
         # 3. 检查现有持仓状态跟踪与冷却期解除
         # 检索当日同向止损风控熔断历史与单日做T频次统计
         use_circuit_breaker = bool(cfg.get("t0_daily_stop_circuit_breaker", True))
-        max_daily_trades = max(1, int(cfg.get("t0_max_trades_per_day", 2)))
+        max_daily_trades = max(1, int(cfg.get("t0_max_trades_per_day", 1)))
         today_str = now.strftime("%Y-%m-%d")
         hist = self.tracker.load_history()
         today_symbol_trades = [
