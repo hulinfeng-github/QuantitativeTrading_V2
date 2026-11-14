@@ -199,9 +199,19 @@ class T0PositionTracker:
 
             entry_amt = entry_p * shares
             exit_amt = exit_price * shares
-            comm_entry = max(min_comm, entry_amt * comm_r)
-            comm_exit = max(min_comm, exit_amt * comm_r)
-            stamp_amt = (exit_amt if direction == "BUY_T" else entry_amt) * stamp_r
+            sym_lower = str(symbol).lower()
+            is_etf = any(sym_lower.startswith(p) for p in ["sh5", "sz15", "sz16", "sh51", "sh56", "sh58", "sh50", "sz18"])
+            
+            if is_etf:
+                # 场内ETF免征印花税，多数券商ETF佣金免除最低5元限制
+                stamp_amt = 0.0
+                comm_entry = entry_amt * comm_r
+                comm_exit = exit_amt * comm_r
+            else:
+                comm_entry = max(min_comm, entry_amt * comm_r)
+                comm_exit = max(min_comm, exit_amt * comm_r)
+                stamp_amt = (exit_amt if direction == "BUY_T" else entry_amt) * stamp_r
+
             slip_amt = (entry_amt + exit_amt) * slip_r
             fees = comm_entry + comm_exit + stamp_amt + slip_amt
             net_amt = gross_amt - fees
@@ -524,6 +534,17 @@ class T0SmartEngine:
                     trend_direction = "BEAR"
 
         # 3. 检查现有持仓状态跟踪与冷却期解除
+        # 检索当日同向止损风控熔断历史
+        use_circuit_breaker = bool(cfg.get("t0_daily_stop_circuit_breaker", True))
+        today_stopped_dirs = set()
+        if use_circuit_breaker:
+            today_str = now.strftime("%Y-%m-%d")
+            hist = self.tracker.load_history()
+            today_stopped_dirs = {
+                h.get("direction") for h in hist
+                if h.get("symbol") == symbol and h.get("date") == today_str and h.get("status") == "STOPPED"
+            }
+
         existing_pos = self.tracker.get_position(symbol)
         if (existing_pos is not None
                 and existing_pos.get("status") in ["FINISHED", "STOPPED"]
@@ -655,7 +676,10 @@ class T0SmartEngine:
                 is_oversold_bounce = (bias <= bias_buy_thresh * 1.35)
                 trend_allows_buy = (trend_direction == "BULL") or is_oversold_bounce or (not use_trend_filter)
 
-                if not trend_allows_buy:
+                if "BUY_T" in today_stopped_dirs:
+                    signal_desc = "今日正T已止损·触发风控熔断"
+                    reasons.append("该标的今日此前已触发正T防守止损，表明处于强单边下泄行情，日内暂停同向做T防范二次磨损")
+                elif not trend_allows_buy:
                     signal_desc = "空头趋势压制·严禁接飞刀"
                     reasons.append(f"标的处于空头通道且负偏离({bias:.2f}%)未达恐慌超跌线({bias_buy_thresh*1.35:.2f}%)，防范单边阴跌")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct < -max_vwap_slope_pct and not is_oversold_bounce:
@@ -697,7 +721,10 @@ class T0SmartEngine:
                 is_extreme_pulse = (bias >= bias_sell_thresh * 1.25)
                 trend_allows_sell = (trend_direction == "BEAR") or is_extreme_pulse or (not use_trend_filter)
 
-                if not trend_allows_sell:
+                if "SELL_T" in today_stopped_dirs:
+                    signal_desc = "今日倒T已止损·触发风控熔断"
+                    reasons.append("该标的今日此前已触发倒T防守止损，表明处于强单边主升行情，日内暂停同向做T防范再次卖飞")
+                elif not trend_allows_sell:
                     signal_desc = "多头主升·严禁倒T防抛飞"
                     reasons.append("标的高处于多头主升通道，倒T高抛极易卖飞强势核心牛股，仅在极端偏离脉冲时高抛")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct > max_vwap_slope_pct:
