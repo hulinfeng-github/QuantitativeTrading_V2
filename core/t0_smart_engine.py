@@ -397,8 +397,11 @@ class T0SmartEngine:
         全量研判当前标的日内做T机会与持仓状态监控
         """
         cfg = load_config()
-        bias_buy_thresh = float(cfg.get("t0_bias_buy", -1.5))
-        bias_sell_thresh = float(cfg.get("t0_bias_sell", 2.0))
+        bias_buy_thresh = float(cfg.get("t0_bias_buy", -1.2))
+        bias_sell_thresh = float(cfg.get("t0_bias_sell", 2.5))
+        require_dual_resonance = bool(cfg.get("t0_require_dual_resonance", True))
+        golden_window_only = bool(cfg.get("t0_golden_window_only", True))
+        avoid_early_morning_short = bool(cfg.get("t0_avoid_early_morning_short", True))
         stop_pct = float(cfg.get("t0_stop_loss_pct", 1.5))
         take_profit_pct = float(cfg.get("t0_take_profit_pct", 1.5))
         trailing_pct = float(cfg.get("t0_trailing_profit_pct", 0.5))
@@ -566,6 +569,8 @@ class T0SmartEngine:
         suggested_shares = available_lot if available_lot >= 100 else 100
         active_shares = suggested_shares
         entry_window_ok = ("09:31" <= current_hm <= "14:50") or (df_minute is not None and not self.is_trading_session())
+        if golden_window_only and existing_pos is None and ("11:00" <= current_hm <= "11:30"):
+            entry_window_ok = False
         is_late = time_decay_enabled and current_hm >= late_window_start
 
         if existing_pos:
@@ -672,12 +677,12 @@ class T0SmartEngine:
                 signal_desc = "分时数据不足或延迟·观望"
                 reasons.append("需要有效分时数据以精确计算VWAP均价通道")
             elif not entry_window_ok:
-                signal_desc = "非开仓时段·暂停新信号"
-                reasons.append("做T开仓仅在 09:31 至 14:50 执行")
+                signal_desc = "垃圾时段防守·暂停新开仓" if golden_window_only and "11:00" <= current_hm <= "11:30" else "非开仓时段·暂停新信号"
+                reasons.append("11:00-11:30属于午盘流动性骤降与假突破高发期，系统主动规避以确保做T高胜率" if golden_window_only and "11:00" <= current_hm <= "11:30" else "做T开仓仅在 09:31 至 14:50 执行")
             elif today_trade_count >= max_daily_trades:
                 signal_desc = f"达单日做T上限({max_daily_trades}次)·观望"
                 reasons.append(f"该标的今日已完成 {today_trade_count} 笔做T，已达单日频次上限({max_daily_trades}次)，防范过度交易磨损")
-            elif bias <= bias_buy_thresh or current_price <= dyn_lower:
+            elif (bias <= bias_buy_thresh and current_price <= dyn_lower) if require_dual_resonance else (bias <= bias_buy_thresh or current_price <= dyn_lower):
                 # 正T买入判定：优先多头；若空头但偏离达超跌线，允许做超跌反抽
                 is_oversold_bounce = (bias <= bias_buy_thresh * 1.35)
                 trend_allows_buy = (trend_direction == "BULL") or is_oversold_bounce or (not use_trend_filter)
@@ -722,14 +727,18 @@ class T0SmartEngine:
                         stop_price=suggested_stop, target_price=suggested_target, shares=active_shares
                     )
 
-            elif bias >= bias_sell_thresh or current_price >= dyn_upper:
+            elif (bias >= bias_sell_thresh and current_price >= dyn_upper) if require_dual_resonance else (bias >= bias_sell_thresh or current_price >= dyn_upper):
                 # 倒T高抛判定：空头或震荡优先；多头通道中仅在极端脉冲时允许防抛飞
                 is_extreme_pulse = (bias >= bias_sell_thresh * 1.25)
                 trend_allows_sell = (trend_direction == "BEAR") or is_extreme_pulse or (not use_trend_filter)
+                early_short_blocked = (avoid_early_morning_short and current_hm <= "09:45" and bias < (1.7 if is_etf else 2.8))
 
                 if "SELL_T" in today_stopped_dirs:
                     signal_desc = "今日倒T已止损·触发风控熔断"
                     reasons.append("该标的今日此前已触发倒T防守止损，表明处于强单边主升行情，日内暂停同向做T防范再次卖飞")
+                elif early_short_blocked:
+                    signal_desc = "早盘抢筹脉冲·防倒T卖飞保护"
+                    reasons.append(f"09:45前属于早盘竞价发现与主力抢筹脉冲期，现价涨幅偏离(+{bias:.2f}%)未达极值({1.7 if is_etf else 2.8}%)，暂不开倒T以防底仓卖飞")
                 elif not trend_allows_sell:
                     signal_desc = "多头主升·严禁倒T防抛飞"
                     reasons.append("标的高处于多头主升通道，倒T高抛极易卖飞强势核心牛股，仅在极端偏离脉冲时高抛")
