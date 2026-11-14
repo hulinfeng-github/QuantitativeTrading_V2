@@ -534,16 +534,19 @@ class T0SmartEngine:
                     trend_direction = "BEAR"
 
         # 3. 检查现有持仓状态跟踪与冷却期解除
-        # 检索当日同向止损风控熔断历史
+        # 检索当日同向止损风控熔断历史与单日做T频次统计
         use_circuit_breaker = bool(cfg.get("t0_daily_stop_circuit_breaker", True))
+        max_daily_trades = max(1, int(cfg.get("t0_max_trades_per_day", 2)))
+        today_str = now.strftime("%Y-%m-%d")
+        hist = self.tracker.load_history()
+        today_symbol_trades = [
+            h for h in hist
+            if h.get("symbol") == symbol and h.get("date") == today_str and h.get("status") in ["FINISHED", "STOPPED"]
+        ]
+        today_trade_count = len(today_symbol_trades)
         today_stopped_dirs = set()
         if use_circuit_breaker:
-            today_str = now.strftime("%Y-%m-%d")
-            hist = self.tracker.load_history()
-            today_stopped_dirs = {
-                h.get("direction") for h in hist
-                if h.get("symbol") == symbol and h.get("date") == today_str and h.get("status") == "STOPPED"
-            }
+            today_stopped_dirs = {h.get("direction") for h in today_symbol_trades if h.get("status") == "STOPPED"}
 
         existing_pos = self.tracker.get_position(symbol)
         if (existing_pos is not None
@@ -671,6 +674,9 @@ class T0SmartEngine:
             elif not entry_window_ok:
                 signal_desc = "非开仓时段·暂停新信号"
                 reasons.append("做T开仓仅在 09:31 至 14:50 执行")
+            elif today_trade_count >= max_daily_trades:
+                signal_desc = f"达单日做T上限({max_daily_trades}次)·观望"
+                reasons.append(f"该标的今日已完成 {today_trade_count} 笔做T，已达单日频次上限({max_daily_trades}次)，防范过度交易磨损")
             elif bias <= bias_buy_thresh or current_price <= dyn_lower:
                 # 正T买入判定：优先多头；若空头但偏离达超跌线，允许做超跌反抽
                 is_oversold_bounce = (bias <= bias_buy_thresh * 1.35)
