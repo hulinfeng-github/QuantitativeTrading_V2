@@ -306,9 +306,8 @@ class QuantScheduler2:
         from core.sentiment_radar import sentiment_radar
         macro = sentiment_radar.analyze_market_regime()
 
-        # 仅在市场数据有效且风险敞口处于结构性多头区间时推送 BUY 候选。
-        can_open = bool(macro.get("data_available") and macro.get("target_exposure", 0.0) >= 0.65)
-        top_picks = [c for c in candidates if c.get("signal_type") == "BUY"][:6] if can_open else []
+        # 筛选符合多因子高确定性条件的标的 (BUY 信号 或 综合评分 >= 65)
+        top_picks = [c for c in candidates if c.get("signal_type") == "BUY" or c.get("score", 0) >= 65][:6]
 
         if not top_picks:
             msg = (

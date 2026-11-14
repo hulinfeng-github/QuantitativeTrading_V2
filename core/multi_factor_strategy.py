@@ -231,25 +231,18 @@ class MultiFactorStrategy:
             signal_type = "SELL"
             signal_desc = "减仓/清仓信号"
             all_reasons.append(f"RSRS破位下行({rsrs_norm:.2f} < {self.sell_threshold})或跌破MA20生命线")
-        elif total_score >= self.score_buy_upper and rsrs_norm >= self.buy_threshold and close > ma20:
-            # 数据回测：综合评分进入过度拥挤区(>=上限)后，后续收益转为明显亏损
-            signal_type = "WATCH"
-            signal_desc = "评分过热·暂缓追高"
-            all_reasons.append(f"综合评分({total_score:.1f})已进入过度拥挤区(>={self.score_buy_upper})，历史上的后续收益偏差")
-        elif total_score >= 75.0 and rsrs_norm >= self.buy_upper_threshold and close > ma20:
-            # 数据回测显示：修正RSRS过强(>=上限)时追高风险大，后续收益反而转负
-            signal_type = "WATCH"
-            signal_desc = "RSRS过热·暂缓追高"
-            all_reasons.append(f"修正RSRS({rsrs_norm:.2f})已超买入上限({self.buy_upper_threshold})，过热追高胜率偏低")
         elif total_score >= 75.0 and rsrs_norm >= self.buy_threshold and close > ma20:
             if not market_regime_bull:
-                signal_type = "WATCH"
-                signal_desc = "市场风险过滤·暂缓开仓"
-                all_reasons.append("市场状态未确认处于多头环境，暂缓新增仓位")
+                if total_score < 80.0 or vol_ratio < 1.2:
+                    signal_type = "WATCH"
+                    signal_desc = "弱市压制·观望"
+                    all_reasons.append("大盘处于弱势压制通道，防范系统性假突破，暂缓开仓")
+                else:
+                    signal_type = "BUY"
+                    signal_desc = "弱市主力共振突破买点"
             else:
                 signal_type = "BUY"
-                signal_desc = "多因子研究候选·需独立核验"
-                all_reasons.append("⚠️ 规则筛选信号未验证实际成交和样本外收益，不是交易指令")
+                signal_desc = "强力波段买点(主力突破起爆)" if control_status == "主力突破起爆" else "强力波段买点(多因子共振)" 
         elif total_score >= 60.0 and rsrs_norm >= 0.4 and close > ma20:
             signal_type = "WATCH"
             signal_desc = "主力蓄势关注标的"

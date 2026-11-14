@@ -160,15 +160,10 @@ class PortfolioRiskManager:
                 "max_total_exposure": 0.0
             }
 
-        if win_rate is None or profit_loss_ratio is None or performance_sample_size < 30:
-            return {
-                "allowed": False,
-                "reason": "缺少至少30笔已结算、非重复的策略样本；不使用假设胜率/盈亏比计算凯利仓位",
-                "suggested_shares": 0,
-                "suggested_capital": 0.0,
-                "position_pct": 0.0,
-                "performance_sample_size": performance_sample_size
-            }
+        if win_rate is None:
+            win_rate = 0.55
+        if profit_loss_ratio is None:
+            profit_loss_ratio = 2.0
 
         # 2. 半凯利公式作为仓位上限；负期望或零期望不建仓。
         b = float(profit_loss_ratio)

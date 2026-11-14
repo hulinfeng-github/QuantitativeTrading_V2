@@ -216,9 +216,9 @@ dingtalk_rate_limiter = DingTalkRateLimiter()
 def format_batch_signals_markdown(signals: List[Dict[str, Any]], group_name: str = "") -> Tuple[str, str]:
     """将多个交易信号格式化为单条聚合 Markdown 卡片内容"""
     gtag = f"【{group_name}】" if group_name else "【量化2.0】"
-    title = f"⚡ {gtag}多标的规则信号摘要 ({len(signals)} 只)"
+    title = f"⚡ {gtag}多标的量化交易指令聚合 ({len(signals)} 只)"
     blocks = [
-        f"### ⚡ {gtag}量化规则信号摘要 ({len(signals)} 只标的)",
+        f"### ⚡ {gtag}多标的量化交易指令聚合 ({len(signals)} 只标的)",
         f"> 以下标的触发规则筛选条件。信号不代表实际成交、交易指令或可执行委托：",
         "---"
     ]

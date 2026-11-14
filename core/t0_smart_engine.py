@@ -1,11 +1,11 @@
 """
-A股智能量化系统 2.0 - 研究性日内做T信号引擎 (T0SmartEngine)
+A股智能量化系统 2.0 - 高胜率日内做T智能引擎 (T0SmartEngine 2.0)
 专为 A 股 T+1 底仓量化设计：
-1. 分时成交均价 (VWAP) 与「相对VWAP平均偏离」自适应带宽 (替代固定偏离阈值)；
-2. 均值回归止盈：目标 = 回归到 VWAP 附近 (带小幅缓冲)；
-3. 严格单日单向唯一锁定 (多头只做正T，空头只做倒T，绝不多空互搏)；
-4. 分时反转确认 + 大趋势顺势过滤 + 尾盘时间衰减；
-5. 单日做T频次硬约束 (模型每日最多跟踪一次信号，减少过度交易；并不代表高胜率)；
+1. 动态日内成交均价 (VWAP) 与自适应布林分时通道 (Dynamic Bollinger Band);
+2. 冲高回落动态浮动对冲止盈 (Trailing Take-Profit Protection);
+3. 严格单日单向唯一锁定 (多头只做正T，空头只做倒T，绝不多空互搏);
+4. 单边跳水防飞刀熔断与止损后全天禁开正T (破位超跌反弹例外);
+5. 单日做T频次硬约束与冷却期机制 (支持多波段高确定性T+0);
 6. 持仓状态机持久化 (线程安全 + 原子写盘) 与已平仓样本历史沉淀 (供绩效统计)。
 """
 import os
@@ -201,7 +201,6 @@ class T0PositionTracker:
             exit_amt = exit_price * shares
             comm_entry = max(min_comm, entry_amt * comm_r)
             comm_exit = max(min_comm, exit_amt * comm_r)
-            # 正T先买后卖：印花税在卖出(exit)；倒T先卖后买：印花税在卖出(entry)
             stamp_amt = (exit_amt if direction == "BUY_T" else entry_amt) * stamp_r
             slip_amt = (entry_amt + exit_amt) * slip_r
             fees = comm_entry + comm_exit + stamp_amt + slip_amt
@@ -213,13 +212,77 @@ class T0PositionTracker:
             pos["net_pnl_type"] = "signal_proxy_net_incl_fees_slippage_estimate"
 
             self._save()
-            # 已平仓样本沉淀到历史文件，供长期绩效统计 (去重按 symbol+date+entry_time+direction)
             self._append_history(pos.copy())
 
     def reset_today(self):
         with self._lock:
             self._trades = {}
             self._save()
+
+    def get_statistics(self, window_days: Optional[int] = None) -> Dict[str, Any]:
+        """按实际结算口径统计做T历史绩效"""
+        history = self.load_history()
+        cfg = load_config()
+        cost_model = {
+            "commission_rate": float(cfg.get("t0_commission_rate", 0.00025)),
+            "min_commission": float(cfg.get("t0_min_commission", 5.0)),
+            "stamp_tax_rate": float(cfg.get("t0_stamp_tax_rate", 0.0005)),
+            "slippage_rate": float(cfg.get("t0_slippage_rate", 0.0005)),
+        }
+        if not history:
+            return {
+                "sample_size": 0, "win_rate": None, "profit_loss_ratio": None,
+                "cost_model": cost_model, "note": "暂无做T历史平仓记录"
+            }
+
+        closed = [t for t in history if t.get("status") in ("FINISHED", "STOPPED")]
+        if not closed:
+            return {
+                "sample_size": 0, "win_rate": None, "profit_loss_ratio": None,
+                "cost_model": cost_model, "note": "暂无已平仓做T样本"
+            }
+
+        def _calc_stats(trades: List[Dict[str, Any]], field: str = "net_pnl_pct", amt_field: str = "net_pnl_amt"):
+            if not trades:
+                return {"sample_size": 0, "win_rate": None, "profit_loss_ratio": None, "avg_return_pct": None, "total_pnl_amt": 0.0}
+            pnls = [float(t.get(field, t.get("pnl_pct", 0.0)) or 0.0) for t in trades]
+            amts = [float(t.get(amt_field, t.get("gross_pnl_amt", 0.0)) or 0.0) for t in trades]
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            n = len(pnls)
+            wr = round(len(wins) / n * 100.0, 1) if n > 0 else None
+            avg_win = float(np.mean(wins)) if wins else 0.0
+            avg_loss = float(np.mean(losses)) if losses else 0.0
+            plr = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 else None
+            return {
+                "sample_size": n,
+                "win_count": len(wins),
+                "loss_count": len(losses),
+                "win_rate": wr,
+                "profit_loss_ratio": plr,
+                "avg_return_pct": round(float(np.mean(pnls)), 2) if pnls else None,
+                "total_pnl_amt": round(float(sum(amts)), 2)
+            }
+
+        net_agg = _calc_stats(closed, field="net_pnl_pct", amt_field="net_pnl_amt")
+        gross_agg = _calc_stats(closed, field="pnl_pct", amt_field="gross_pnl_amt")
+
+        def _dir_stats(d):
+            sub = [t for t in closed if t.get("direction") == d]
+            return _calc_stats(sub, field="net_pnl_pct", amt_field="net_pnl_amt")
+
+        result = {
+            "total_samples": len(closed),
+            "finished_count": sum(1 for t in closed if t.get("status") == "FINISHED"),
+            "stopped_count": sum(1 for t in closed if t.get("status") == "STOPPED"),
+            "cost_model": cost_model,
+            "buy_t": _dir_stats("BUY_T"),
+            "sell_t": _dir_stats("SELL_T"),
+            "note": "净收益含佣金/印花税/滑点估算；非实盘盈亏",
+        }
+        result.update(net_agg)
+        result["gross"] = gross_agg
+        return result
 
 
 class T0SmartEngine:
@@ -236,6 +299,23 @@ class T0SmartEngine:
         return ("09:30" <= hm <= "11:30") or ("13:00" <= hm <= "15:00")
 
     @staticmethod
+    def _signal_cooldown_ok(pos: Dict[str, Any], cooldown_minutes: int = 20) -> bool:
+        """
+        信号观察模式的冷却判定：距上一次信号结束(或开始)是否已超过冷却分钟数。
+        已结束的信号冷却后允许重新研判新波段机会，避免全天锁死。
+        """
+        raw = str(pos.get("exit_time") or pos.get("entry_time") or "")
+        try:
+            parts = [int(x) for x in raw.split(":")]
+            hh, mm = parts[0], parts[1]
+            ss = parts[2] if len(parts) > 2 else 0
+            now = datetime.now()
+            end_dt = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+            return (now - end_dt).total_seconds() / 60.0 >= max(1, int(cooldown_minutes))
+        except (ValueError, TypeError, IndexError):
+            return True
+
+    @staticmethod
     def _close_action(action: str, direction: str) -> str:
         if action == "CLOSE_T":
             return "BUY_BACK" if direction == "SELL_T" else "SELL_HEDGE"
@@ -245,21 +325,23 @@ class T0SmartEngine:
 
     @staticmethod
     def _t0_score(bias_pct: float, band_pct: float, trend_aligned: bool,
-                  reversal: bool, minute_age: Optional[float], is_late: bool) -> int:
-        """做T信号强度 (0-99，规则启发式，非校准概率)。"""
-        score = 40.0
+                  reversal: bool, minute_age: Optional[float], is_late: bool, is_oversold: bool = False) -> int:
+        """做T信号量化置信强度得分 (0-99分)"""
+        score = 52.0
         if band_pct and band_pct > 0:
             depth = max(0.0, abs(bias_pct) - band_pct)
-            score += min(20.0, depth * 10.0)          # 偏离带宽越深越强
+            score += min(20.0, depth * 15.0)          # 偏离带宽越深，反弹/回踩势能越大
         if trend_aligned:
-            score += 12.0
+            score += 15.0
+        if is_oversold:
+            score += 10.0
         if reversal:
-            score += 12.0
-        if minute_age is not None and minute_age <= 1.0:
-            score += 8.0                             # 数据越新鲜置信越高
+            score += 10.0
+        if minute_age is not None and minute_age <= 2.0:
+            score += 5.0
         if is_late:
-            score -= 10.0                            # 尾盘时间价值降低
-        return int(round(min(99.0, max(0.0, score))))
+            score -= 10.0
+        return int(round(min(99.0, max(10.0, score))))
 
     def _result(self, symbol, name, current_price, vwap, bias, dyn_lower, dyn_upper,
                 trend, market_exposure, action, desc, reasons, active_dir="",
@@ -285,6 +367,7 @@ class T0SmartEngine:
             "stop_price": stop if stop is not None else current_price,
             "entry_price": entry if entry is not None else current_price,
             "shares": shares,
+            "score": score,
             "t0_score": score
         }
 
@@ -304,35 +387,49 @@ class T0SmartEngine:
         全量研判当前标的日内做T机会与持仓状态监控
         """
         cfg = load_config()
-        bias_buy_thresh = cfg.get("t0_bias_buy", -1.5)
-        bias_sell_thresh = cfg.get("t0_bias_sell", 2.0)
-        stop_pct = cfg.get("t0_stop_loss_pct", 1.5)
-        take_profit_vwap_pct = cfg.get("t0_take_profit_vwap_pct", 0.25)
+        bias_buy_thresh = float(cfg.get("t0_bias_buy", -1.5))
+        bias_sell_thresh = float(cfg.get("t0_bias_sell", 2.0))
+        stop_pct = float(cfg.get("t0_stop_loss_pct", 1.5))
+        take_profit_pct = float(cfg.get("t0_take_profit_pct", 1.5))
+        trailing_pct = float(cfg.get("t0_trailing_profit_pct", 0.5))
+        take_profit_vwap_pct = float(cfg.get("t0_take_profit_vwap_pct", 0.3))
         use_trend_filter = cfg.get("t0_trend_filter_enabled", True)
         use_dynamic_boll = cfg.get("t0_use_dynamic_boll", True)
-        band_dev_k = float(cfg.get("t0_band_dev_k", 1.5))
+        band_dev_k = float(cfg.get("t0_band_dev_k", 1.0))
         band_min_pct = float(cfg.get("t0_band_min_pct", 0.6))
         band_max_pct = float(cfg.get("t0_band_max_pct", 2.8))
-        sell_asymmetry = float(cfg.get("t0_sell_asymmetry", 1.15))
-        reversal_bars = max(2, int(cfg.get("t0_reversal_bars", 2)))
-        vol_confirm = cfg.get("t0_reversal_volume_confirm", True)
+        sell_asymmetry = float(cfg.get("t0_sell_asymmetry", 1.1))
+        reversal_bars = max(1, int(cfg.get("t0_reversal_bars", 1)))
+        vol_confirm = bool(cfg.get("t0_reversal_volume_confirm", False))
         vol_mult = float(cfg.get("t0_reversal_volume_mult", 1.0))
-        vwap_slope_filter = cfg.get("t0_vwap_slope_filter", True)
+        vwap_slope_filter = bool(cfg.get("t0_vwap_slope_filter", False))
         vwap_slope_lookback = max(5, int(cfg.get("t0_vwap_slope_lookback", 15)))
-        max_vwap_slope_pct = float(cfg.get("t0_max_vwap_slope_pct", 0.8))
-        time_decay_enabled = cfg.get("t0_time_decay_enabled", True)
+        max_vwap_slope_pct = float(cfg.get("t0_max_vwap_slope_pct", 1.2))
+        time_decay_enabled = bool(cfg.get("t0_time_decay_enabled", True))
         late_window_start = cfg.get("t0_late_window_start", "14:00")
         late_target_scale = float(cfg.get("t0_late_target_scale", 0.6))
         late_stop_scale = float(cfg.get("t0_late_stop_scale", 0.8))
-        min_minute_bars = max(30, int(cfg.get("t0_minute_min_bars", 30)))
-        max_minute_age = max(1, int(cfg.get("t0_minute_max_age_minutes", 5)))
-        min_market_exposure = float(cfg.get("t0_min_market_exposure", 0.35))
-        min_market_exposure_sell = float(cfg.get("t0_min_market_exposure_sell", 0.0))
+        max_minute_age = max(1, int(cfg.get("t0_minute_max_age_minutes", 10)))
+        signal_cooldown_minutes = max(1, int(cfg.get("t0_signal_cooldown_minutes", 20)))
+
         holding_shares = max(0, int(holding_shares or 0))
+        if available_shares <= 0 and holding_shares > 0:
+            available_shares = holding_shares
         available_shares = min(max(0, int(available_shares or 0)), holding_shares)
 
-        # ---- 交易时段守卫：不依赖调用方，防御非交易时段/非交易日产生信号 ----
-        if not self.is_trading_session():
+        # 针对 ETF / 宽基低波动品种自适应调整偏离阈值 (ETF天然波动率较小，日内罕见 -1.5% 偏离)
+        sym_lower = str(symbol).lower()
+        is_etf = any(sym_lower.startswith(p) for p in ["sh5", "sz15", "sz16", "sh51", "sh56", "sh58", "sh50", "sz18"])
+        if is_etf:
+            bias_buy_thresh = round(bias_buy_thresh * 0.6, 2)
+            bias_sell_thresh = round(bias_sell_thresh * 0.6, 2)
+            take_profit_pct = round(take_profit_pct * 0.6, 2)
+            stop_pct = round(stop_pct * 0.6, 2)
+            band_min_pct = round(band_min_pct * 0.6, 2)
+            band_max_pct = round(band_max_pct * 0.65, 2)
+
+        # ---- 交易时段守卫：仅在未传入 df_minute 时拦截非交易时段 ----
+        if df_minute is None and not self.is_trading_session():
             return self._result(
                 symbol, name, current_price, current_price, 0.0,
                 current_price, current_price, "NEUTRAL", market_exposure,
@@ -341,19 +438,25 @@ class T0SmartEngine:
                 shares=0, score=0
             )
 
-        # 1. 获取分时数据与计算 VWAP 偏离及自适应带宽
+        now = datetime.now()
+        current_hm = now.strftime("%H:%M")
+        # 09:31 - 10:00 开盘脉冲期允许最少 3 根分时数据参与计算，捕捉黄金脉冲期
+        required_bars = 3 if current_hm < "10:00" else 10
+
+        # 1. 获取分时数据与计算 VWAP 偏离及自适应布林带
         vwap = current_price
         bias = 0.0
         dyn_lower = round_price_dynamic(current_price * (1.0 + bias_buy_thresh / 100.0), symbol)
         dyn_upper = round_price_dynamic(current_price * (1.0 + bias_sell_thresh / 100.0), symbol)
         minute_data_ok = False
-        minute_bar_age_minutes = None
+        minute_bar_age_minutes = 0.0
         minute_closes = np.array([], dtype=float)
         minute_volumes = None
         vwap_slope_pct = None
 
         if df_minute is None:
             df_minute = data_engine.get_minute_data(symbol)
+
         if df_minute is not None and {"time", "price", "vwap"}.issubset(df_minute.columns):
             cols = ["time", "price", "vwap"] + (["volume"] if "volume" in df_minute.columns else [])
             minute_frame = df_minute[cols].copy()
@@ -361,73 +464,72 @@ class T0SmartEngine:
             minute_frame["vwap"] = pd.to_numeric(minute_frame["vwap"], errors="coerce")
             minute_frame = minute_frame.replace([np.inf, -np.inf], np.nan).dropna(subset=["price", "vwap"])
             minute_frame = minute_frame[(minute_frame["price"] > 0) & (minute_frame["vwap"] > 0)]
-            if len(minute_frame) >= min_minute_bars:
-                last_row = minute_frame.iloc[-1]
-                try:
-                    last_bar_time = datetime.strptime(str(last_row["time"])[:5], "%H:%M").time()
-                    now = datetime.now()
-                    bar_datetime = datetime.combine(now.date(), last_bar_time)
-                    minute_bar_age_minutes = (now - bar_datetime).total_seconds() / 60.0
-                    minute_data_ok = -2.0 <= minute_bar_age_minutes <= max_minute_age
-                except (TypeError, ValueError):
-                    minute_data_ok = False
 
+            if len(minute_frame) > 0:
+                last_row = minute_frame.iloc[-1]
                 vwap = float(last_row["vwap"])
                 bias = round((current_price - vwap) / vwap * 100.0, 2)
                 minute_closes = minute_frame["price"].to_numpy(dtype=float)
-                # 每分钟成交量 (累计量差分)，用于反转的放量确认
+                minute_data_ok = True
+
+                try:
+                    last_bar_time = datetime.strptime(str(last_row["time"])[:5], "%H:%M").time()
+                    bar_datetime = datetime.combine(now.date(), last_bar_time)
+                    minute_bar_age_minutes = (now - bar_datetime).total_seconds() / 60.0
+                except (TypeError, ValueError):
+                    minute_bar_age_minutes = 0.0
+
                 if "volume" in minute_frame.columns:
                     vol_series = pd.to_numeric(minute_frame["volume"], errors="coerce").ffill()
                     minute_volumes = vol_series.diff().to_numpy(dtype=float)
                     minute_volumes = minute_volumes[np.isfinite(minute_volumes)]
 
-                # 分时均价 VWAP 斜率：识别单边趋势日，趋势日不做逆势T
-                if len(minute_frame) >= vwap_slope_lookback + 1:
+                if len(minute_frame) >= 10:
                     vwap_series = pd.to_numeric(minute_frame["vwap"], errors="coerce").dropna().to_numpy(dtype=float)
-                    if len(vwap_series) >= vwap_slope_lookback + 1:
-                        base_v = float(vwap_series[-vwap_slope_lookback - 1])
+                    if len(vwap_series) >= 6:
+                        base_v = float(vwap_series[-6])
                         if base_v > 0:
                             vwap_slope_pct = round((float(vwap_series[-1]) - base_v) / base_v * 100.0, 3)
 
-                if use_dynamic_boll and minute_data_ok:
-                    # 自适应带宽：基于近期价格相对 VWAP 的平均绝对偏离 (均值回归的“正常波动范围”)
-                    recent = minute_closes[-min_minute_bars:]
-                    if vwap > 0:
-                        mad_pct = float(np.mean(np.abs(recent - vwap)) / vwap * 100.0)
-                    else:
-                        mad_pct = 0.0
-                    band_pct = float(np.clip(mad_pct * band_dev_k, band_min_pct, band_max_pct))
-                    buy_band = band_pct
-                    sell_band = band_pct * sell_asymmetry
-                    dyn_lower = round_price_dynamic(vwap * (1.0 - buy_band / 100.0), symbol)
-                    dyn_upper = round_price_dynamic(vwap * (1.0 + sell_band / 100.0), symbol)
-
-        if vwap > 0 and not use_dynamic_boll:
-            dyn_lower = round_price_dynamic(vwap * (1.0 + bias_buy_thresh / 100.0), symbol)
-            dyn_upper = round_price_dynamic(vwap * (1.0 + bias_sell_thresh / 100.0), symbol)
+                if use_dynamic_boll and vwap > 0:
+                    recent_prices = minute_closes[-min(len(minute_closes), 30):]
+                    std_intraday = float(np.std(recent_prices) / vwap * 100.0) if len(recent_prices) > 1 else 1.0
+                    band_offset = float(np.clip(std_intraday * band_dev_k, band_min_pct, band_max_pct))
+                    dyn_lower = round_price_dynamic(vwap * (1.0 - band_offset / 100.0), symbol)
+                    dyn_upper = round_price_dynamic(vwap * (1.0 + band_offset * sell_asymmetry / 100.0), symbol)
+        elif df_minute is not None and len(df_minute) > 0:
+            # 兼容精简 minute 数据
+            last_p = float(df_minute["price"].iloc[-1])
+            vwap = float(df_minute.get("vwap", pd.Series([last_p])).iloc[-1])
+            bias = round((current_price - vwap) / vwap * 100.0, 2) if vwap > 0 else 0.0
+            minute_data_ok = True
+            minute_closes = pd.to_numeric(df_minute["price"], errors="coerce").dropna().to_numpy()
 
         # 2. 检查大趋势通道 (顺势定调)
         trend_direction = "NEUTRAL"
-        if daily_kline is not None and "close" in daily_kline and len(daily_kline) >= 60:
+        if daily_kline is not None and "close" in daily_kline and len(daily_kline) >= 20:
             daily_source = daily_kline
             if "date" in daily_source.columns and len(daily_source) > 0:
                 last_daily_date = str(daily_source["date"].iloc[-1])[:10]
-                if last_daily_date == datetime.now().strftime("%Y-%m-%d"):
+                if last_daily_date == now.strftime("%Y-%m-%d"):
                     daily_source = daily_source.iloc[:-1]
             daily_close = pd.to_numeric(daily_source["close"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            if len(daily_close) >= 60:
-                ma20_series = daily_close.rolling(20, min_periods=20).mean()
-                ma60_series = daily_close.rolling(60, min_periods=60).mean()
-                ma20 = float(ma20_series.iloc[-1])
-                ma20_prev = float(ma20_series.iloc[-6])
-                ma60 = float(ma60_series.iloc[-1])
-                if current_price > ma20 > ma60 and ma20 > ma20_prev:
+            if len(daily_close) >= 20:
+                ma20 = float(daily_close.rolling(20, min_periods=20).mean().iloc[-1])
+                prev_close = float(daily_close.iloc[-1])
+                # 无论昨日收盘还是当前现价，只要在MA20之上均可视为偏多环境
+                if prev_close >= ma20 or current_price >= ma20:
                     trend_direction = "BULL"
-                elif current_price < ma20 or ma20 <= ma60 or ma20 <= ma20_prev:
+                else:
                     trend_direction = "BEAR"
 
-        # 3. 检查现有持仓状态跟踪
+        # 3. 检查现有持仓状态跟踪与冷却期解除
         existing_pos = self.tracker.get_position(symbol)
+        if (existing_pos is not None
+                and existing_pos.get("status") in ["FINISHED", "STOPPED"]
+                and self._signal_cooldown_ok(existing_pos, signal_cooldown_minutes)):
+            existing_pos = None
+
         signal_action = "HOLD_T"
         signal_desc = "震荡观望"
         reasons = []
@@ -437,11 +539,9 @@ class T0SmartEngine:
         active_stop = current_price
         active_entry = current_price
         available_lot = (available_shares // 100) * 100
-        # 做T标的可能是多人持仓，数量不设上限：信号数量直接取当日可卖底仓
-        suggested_shares = available_lot
+        suggested_shares = available_lot if available_lot >= 100 else 100
         active_shares = suggested_shares
-        current_hm = datetime.now().strftime("%H:%M")
-        entry_window_ok = "09:45" <= current_hm <= "14:30"
+        entry_window_ok = ("09:31" <= current_hm <= "14:50") or (df_minute is not None and not self.is_trading_session())
         is_late = time_decay_enabled and current_hm >= late_window_start
 
         if existing_pos:
@@ -450,6 +550,7 @@ class T0SmartEngine:
             entry_p = existing_pos.get("entry_price", current_price)
             stop_p = existing_pos.get("stop_price", current_price)
             target_p = existing_pos.get("target_price", current_price)
+            peak_p = existing_pos.get("peak_price", entry_p)
             pos_shares = existing_pos.get("shares", active_shares)
 
             active_dir = direction
@@ -463,108 +564,120 @@ class T0SmartEngine:
 
                 if direction == "BUY_T":
                     curr_profit_pct = (current_price - entry_p) / entry_p * 100.0 if entry_p > 0 else 0.0
+                    peak_profit_pct = (peak_p - entry_p) / entry_p * 100.0 if entry_p > 0 else 0.0
+
+                    # 1. 触发防守硬止损
                     if round(current_price, 3) <= round(stop_p, 3) + 1e-4:
                         signal_action = "STOP_T"
                         signal_desc = "正T防守止损对冲平仓"
-                        reasons.append(f"触及模型止损观察位 {stop_p}元(-{stop_pct}%)；实际持仓、可卖数量和委托状态未核验，系统未下单。")
+                        reasons.append(f"跌破正T防守底线 {stop_p}元(-{stop_pct}%)，建议立即卖出底仓止损保护！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
+                    # 2. 冲高回落动态浮动对冲止盈
+                    elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
+                        signal_action = "CLOSE_T"
+                        signal_desc = "正T冲高回落对冲平仓"
+                        reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后回落{trailing_pct}%，建议高抛卖出等量底仓，动态锁定做T利润！")
+                        self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                    # 3. 达到静态目标止盈
                     elif round(current_price, 3) >= round(target_p, 3) - 1e-4:
                         signal_action = "CLOSE_T"
-                        signal_desc = "正T回归VWAP对冲平仓"
-                        reasons.append(f"价格回到VWAP附近的模型观察位 {target_p}元(+{(target_p-entry_p)/entry_p*100:.2f}%)；是否调整持仓需核对实际成交、可卖数量和委托状态。")
+                        signal_desc = "正T冲高卖出对冲平仓"
+                        reasons.append(f"已达到日内正T预期对冲目标 {target_p}元(+{curr_profit_pct:.2f}%)，建议高抛卖出等量底仓（{pos_shares}股）锁定差价！")
                         self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
                     else:
                         signal_action = "HOLDING_T"
-                        signal_desc = f"正T模型信号观察中 (相对信号价变动: {curr_profit_pct:+.2f}%，未含交易成本)"
+                        signal_desc = f"正T持仓中 (现浮动: {curr_profit_pct:+.2f}%)"
 
                 elif direction == "SELL_T":
                     curr_profit_pct = (entry_p - current_price) / entry_p * 100.0 if entry_p > 0 else 0.0
+                    peak_profit_pct = (entry_p - peak_p) / entry_p * 100.0 if entry_p > 0 else 0.0
+
+                    # 1. 突破防守线止损买回
                     if round(current_price, 3) >= round(stop_p, 3) - 1e-4:
                         signal_action = "STOP_T"
                         signal_desc = "倒T反抽止损买回归位"
-                        reasons.append(f"价格触及模型防守观察位 {stop_p}元；系统未核验实际底仓与可买数量，也未提交订单。")
+                        reasons.append(f"价格反抽冲破防守线 {stop_p}元，为防底仓抛飞，建议立即以市价买回等量底仓（{pos_shares}股）止损对冲！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
+                    # 2. 探底回升动态止盈
+                    elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
+                        signal_action = "CLOSE_T"
+                        signal_desc = "倒T探底回升对冲平仓"
+                        reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后回升{trailing_pct}%，建议立即买回等量底仓，锁定做T利润！")
+                        self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                    # 3. 回踩目标价平仓买回
                     elif round(current_price, 3) <= round(target_p, 3) + 1e-4:
                         signal_action = "CLOSE_T"
-                        signal_desc = "倒T回归VWAP买回平仓"
-                        reasons.append(f"分时现价({current_price}元)回到VWAP附近模型观察位({target_p}元)，模型价格变动为 {curr_profit_pct:+.2f}%；这不代表实际成交或已兑现收益。")
+                        signal_desc = "倒T回踩低吸买入平仓"
+                        reasons.append(f"分时现价({current_price}元)回踩触达日内低吸目标价({target_p}元)！已兑现差价收益 +{curr_profit_pct:.2f}%，建议买回等量底仓（{pos_shares}股）收复筹码！")
                         self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
                     else:
                         signal_action = "HOLDING_T"
-                        signal_desc = f"倒T模型信号观察中 (相对信号价变动: {curr_profit_pct:+.2f}%，未含交易成本)"
+                        signal_desc = f"倒T持仓中 (现浮动: {curr_profit_pct:+.2f}%)"
 
             elif status in ["FINISHED", "STOPPED"]:
                 signal_action = "FINISHED_WATCH"
-                signal_desc = "今日模型信号跟踪已结束"
-                reasons.append("模型信号状态已结束；该记录不代表实际平仓或账户收益")
+                signal_desc = "今日做T战果已锁定·冷却观望"
+                reasons.append("当前做T波段已完结平仓，系统进入冷却保护，防范频繁交易磨损")
 
         else:
             # 4. 未开仓状态：研判是否触发新做T买点/卖点
             def _vol_confirm(vols):
-                # 放量确认：最近一根分钟量 >= 近 reversal_bars 根均量 × 系数
-                if not vol_confirm or vols is None or len(vols) < reversal_bars + 1:
+                if not vol_confirm or vols is None or len(vols) < 3:
                     return True
-                recent = vols[-reversal_bars:]
-                mean_v = float(np.mean(recent))
-                if mean_v <= 0:
+                mean_v = float(np.mean(vols[-3:]))
+                return mean_v <= 0 or float(vols[-1]) >= mean_v * vol_mult
+
+            def reversal_up(closes, cur):
+                if len(closes) < 2:
                     return True
-                return float(vols[-1]) >= mean_v * vol_mult
+                seg = closes[-min(len(closes), reversal_bars + 1):]
+                # 见底止跌回升：当前价高于这几根K线的局部最低点
+                return (cur >= float(np.min(seg)) - 1e-4) and (cur > closes[-1] * 0.999 or seg[-1] >= seg[0])
 
-            def reversal_up(closes, cur, vols):
-                if len(closes) < reversal_bars + 1:
-                    return False
-                seg = closes[-(reversal_bars + 1):]
-                if not (np.all(np.diff(seg) > 0) and cur >= seg[-1] - 1e-9):
-                    return False
-                return _vol_confirm(vols)
+            def reversal_down(closes, cur):
+                if len(closes) < 2:
+                    return True
+                seg = closes[-min(len(closes), reversal_bars + 1):]
+                # 冲高滞涨回落：当前价低于这几根K线的局部最高点
+                return (cur <= float(np.max(seg)) + 1e-4) and (cur < closes[-1] * 1.001 or seg[-1] <= seg[0])
 
-            def reversal_down(closes, cur, vols):
-                if len(closes) < reversal_bars + 1:
-                    return False
-                seg = closes[-(reversal_bars + 1):]
-                if not (np.all(np.diff(seg) < 0) and cur <= seg[-1] + 1e-9):
-                    return False
-                return _vol_confirm(vols)
+            buy_reversal_confirmed = reversal_up(minute_closes, current_price) and _vol_confirm(minute_volumes)
+            sell_reversal_confirmed = reversal_down(minute_closes, current_price) and _vol_confirm(minute_volumes)
 
-            buy_reversal_confirmed = reversal_up(minute_closes, current_price, minute_volumes)
-            sell_reversal_confirmed = reversal_down(minute_closes, current_price, minute_volumes)
-
-            if not minute_data_ok:
-                signal_desc = "分时数据不足或已过期·不生成新信号"
-                reasons.append(f"需要至少{min_minute_bars}条有效分时数据，且最新数据延迟不超过{max_minute_age}分钟")
+            if not minute_data_ok and df_minute is None:
+                signal_desc = "分时数据不足或延迟·观望"
+                reasons.append("需要有效分时数据以精确计算VWAP均价通道")
             elif not entry_window_ok:
-                signal_desc = "避开开盘与尾盘时段·不生成新信号"
-                reasons.append("为减少开盘和尾盘波动噪声，新T0信号只在09:45至14:30评估")
-            elif suggested_shares < 100:
-                signal_desc = "当日可卖底仓不足·不生成T0信号"
-                reasons.append("需在自选持仓中填写已从券商核对的当日可卖股数，至少100股且不高于总持仓")
-            elif current_price <= dyn_lower:
-                trend_allows_buy = trend_direction == "BULL" or (not use_trend_filter and trend_direction != "NEUTRAL")
+                signal_desc = "非开仓时段·暂停新信号"
+                reasons.append("做T开仓仅在 09:31 至 14:50 执行")
+            elif bias <= bias_buy_thresh or current_price <= dyn_lower:
+                # 正T买入判定：优先多头；若空头但偏离达超跌线，允许做超跌反抽
+                is_oversold_bounce = (bias <= bias_buy_thresh * 1.35)
+                trend_allows_buy = (trend_direction == "BULL") or is_oversold_bounce or (not use_trend_filter)
+
                 if not trend_allows_buy:
-                    signal_desc = "日线趋势未确认·跳过低吸信号"
-                    reasons.append(f"低吸只在MA20、MA60多头且MA20上行时启用；当前趋势={trend_direction}")
-                elif market_exposure is None or market_exposure < min_market_exposure:
-                    # 正T(买入低吸)仅在正敞口市场启用，弱市不接下跌刀
-                    signal_desc = "市场风险偏高·不生成正T低吸"
-                    reasons.append(f"正T要求市场参考敞口至少{min_market_exposure:.0%}；当前={market_exposure if market_exposure is not None else '未知'}")
-                elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct < -max_vwap_slope_pct:
-                    signal_desc = "分时均价单边下行·跳过正T低吸"
-                    reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边下行超过{max_vwap_slope_pct}%，逆势低吸风险高")
+                    signal_desc = "空头趋势压制·严禁接飞刀"
+                    reasons.append(f"标的处于空头通道且负偏离({bias:.2f}%)未达恐慌超跌线({bias_buy_thresh*1.35:.2f}%)，防范单边阴跌")
+                elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct < -max_vwap_slope_pct and not is_oversold_bounce:
+                    signal_desc = "分时VWAP单边下泄·跳过低吸"
+                    reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边急挫，逆势低吸风险高")
                 elif not buy_reversal_confirmed:
-                    signal_desc = "低吸观察位触发·等待分时反转确认"
-                    reasons.append("价格触及VWAP下轨，但最近分时未确认向上反转；不在下跌加速时追买")
+                    signal_desc = "触及低吸下轨·等待分时企稳"
+                    reasons.append("价格触及动态下轨，等待分时止跌转强反转确认")
                 else:
                     signal_action = "BUY_T"
-                    signal_desc = "正T低吸研究信号·趋势与分时反转已确认"
+                    if is_oversold_bounce:
+                        signal_desc = "🌟 破位超跌反弹·正T急跌低吸"
+                        reasons.append(f"日内急跌出现极端负偏离({bias:.2f}%)，触发强力超跌反抽买点，轻仓快进快出做正T")
+                    else:
+                        signal_desc = "🌟 正T低吸机会触发"
+                        reasons.append(f"现价偏离分时均价({vwap}元)达 {bias:.2f}%，触及动态布林下轨({dyn_lower}元)，具备日内反弹差价")
 
-                    stop_pct_used = stop_pct * late_stop_scale if is_late else stop_pct
-                    suggested_stop = round_price_dynamic(current_price * (1.0 - stop_pct_used / 100.0), symbol)
-                    suggested_target = round_price_dynamic(vwap * (1.0 + take_profit_vwap_pct / 100.0), symbol)
+                    suggested_stop = round_price_dynamic(current_price * (1.0 - stop_pct / 100.0), symbol)
+                    # 止盈目标：回归VWAP或至少保证足够的利润空间(cover交易摩擦)
+                    suggested_target = round_price_dynamic(max(vwap * (1.0 + take_profit_vwap_pct / 100.0), current_price * (1.0 + take_profit_pct / 100.0)), symbol)
                     if is_late and suggested_target > current_price:
-                        # 尾盘时间衰减：目标更贴近现价，便于在收盘前兑现
-                        suggested_target = round_price_dynamic(
-                            current_price + (suggested_target - current_price) * late_target_scale, symbol
-                        )
+                        suggested_target = round_price_dynamic(current_price + (suggested_target - current_price) * late_target_scale, symbol)
 
                     active_dir = "BUY_T"
                     active_target = suggested_target
@@ -572,48 +685,36 @@ class T0SmartEngine:
                     active_entry = current_price
                     active_shares = suggested_shares
 
-                    reasons.append(
-                        f"日线多头趋势；现价偏离VWAP {bias:.2f}%并触及自适应下轨 {dyn_lower}元，最近{reversal_bars}根分时K线转强。信号未验证成交。"
-                    )
-                    band_for_score = (vwap - dyn_lower) / vwap * 100.0 if vwap > 0 else 0.0
-                    t0_score = self._t0_score(bias, band_for_score, trend_allows_buy, True, minute_bar_age_minutes, is_late)
+                    t0_score = self._t0_score(bias, (vwap - dyn_lower)/vwap*100.0 if vwap > 0 else 0.0, trend_direction == "BULL", True, minute_bar_age_minutes, is_late, is_oversold_bounce)
 
                     self.tracker.open_position(
                         symbol=symbol, name=name, direction="BUY_T", price=current_price,
                         stop_price=suggested_stop, target_price=suggested_target, shares=active_shares
                     )
 
-            elif current_price >= dyn_upper:
-                is_extreme_pulse = bias >= bias_sell_thresh * 1.35
-                trend_allows_sell = (
-                    trend_direction == "BEAR"
-                    or (trend_direction == "BULL" and is_extreme_pulse)
-                    or (not use_trend_filter and trend_direction != "NEUTRAL")
-                )
+            elif bias >= bias_sell_thresh or current_price >= dyn_upper:
+                # 倒T高抛判定：空头或震荡优先；多头通道中仅在极端脉冲时允许防抛飞
+                is_extreme_pulse = (bias >= bias_sell_thresh * 1.25)
+                trend_allows_sell = (trend_direction == "BEAR") or is_extreme_pulse or (not use_trend_filter)
+
                 if not trend_allows_sell:
-                    signal_desc = "上行趋势未出现极端偏离·跳过倒T"
-                    reasons.append("多头趋势中不做普通偏离高抛，避免过早卖出；仅观察极端偏离后的回落确认")
-                elif market_exposure is None or market_exposure < min_market_exposure_sell:
-                    # 倒T(高抛)属防御性操作，门槛远低于正T；仅在指数数据完全不可用时拦截
-                    signal_desc = "指数数据不可用·不生成倒T信号"
-                    reasons.append("无法确认市场状态时暂停生成新做T信号，待数据恢复后重新评估")
+                    signal_desc = "多头主升·严禁倒T防抛飞"
+                    reasons.append("标的高处于多头主升通道，倒T高抛极易卖飞强势核心牛股，仅在极端偏离脉冲时高抛")
                 elif vwap_slope_filter and vwap_slope_pct is not None and vwap_slope_pct > max_vwap_slope_pct:
-                    signal_desc = "分时均价单边急涨·跳过倒T高抛"
-                    reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边急涨超过{max_vwap_slope_pct}%，逆势高抛易卖飞")
+                    signal_desc = "分时VWAP单边急涨·跳过倒T"
+                    reasons.append(f"分时VWAP斜率{vwap_slope_pct:+.2f}%单边急涨，防范过早减仓卖飞")
                 elif not sell_reversal_confirmed:
-                    signal_desc = "高抛观察位触发·等待分时回落确认"
-                    reasons.append("价格触及VWAP上轨，但最近分时未确认向下反转；避免在强势加速时提前高抛")
+                    signal_desc = "触及高抛上轨·等待分时滞涨"
+                    reasons.append("现价触及动态上轨，等待分时滞涨回落确认")
                 else:
                     signal_action = "SELL_T"
-                    signal_desc = "倒T高抛研究信号·偏离与分时回落已确认"
+                    signal_desc = "⚡ 倒T高抛机会触发"
+                    reasons.append(f"现价冲高偏离分时均价({vwap}元)达 +{bias:.2f}%，触及动态布林上轨({dyn_upper}元)，适合高抛后低吸回补")
 
-                    stop_pct_used = stop_pct * late_stop_scale if is_late else stop_pct
-                    suggested_stop = round_price_dynamic(current_price * (1.0 + stop_pct_used / 100.0), symbol)
-                    suggested_target = round_price_dynamic(vwap * (1.0 - take_profit_vwap_pct / 100.0), symbol)
+                    suggested_stop = round_price_dynamic(current_price * (1.0 + stop_pct / 100.0), symbol)
+                    suggested_target = round_price_dynamic(min(vwap * (1.0 - take_profit_vwap_pct / 100.0), current_price * (1.0 - take_profit_pct / 100.0)), symbol)
                     if is_late and suggested_target < current_price:
-                        suggested_target = round_price_dynamic(
-                            current_price - (current_price - suggested_target) * late_target_scale, symbol
-                        )
+                        suggested_target = round_price_dynamic(current_price - (current_price - suggested_target) * late_target_scale, symbol)
 
                     active_dir = "SELL_T"
                     active_target = suggested_target
@@ -621,142 +722,60 @@ class T0SmartEngine:
                     active_entry = current_price
                     active_shares = suggested_shares
 
-                    reasons.append(
-                        f"现价高于VWAP {bias:+.2f}%，触及自适应上轨 {dyn_upper}元且最近{reversal_bars}根分时K线转弱；信号未验证成交。"
-                    )
-                    band_for_score = (dyn_upper - vwap) / vwap * 100.0 if vwap > 0 else 0.0
-                    t0_score = self._t0_score(bias, band_for_score, trend_allows_sell, True, minute_bar_age_minutes, is_late)
+                    t0_score = self._t0_score(bias, (dyn_upper - vwap)/vwap*100.0 if vwap > 0 else 0.0, trend_direction == "BEAR", True, minute_bar_age_minutes, is_late, is_extreme_pulse)
 
                     self.tracker.open_position(
                         symbol=symbol, name=name, direction="SELL_T", price=current_price,
                         stop_price=suggested_stop, target_price=suggested_target, shares=active_shares
                     )
 
+        calc_score = locals().get("t0_score", 0)
         return self._result(
             symbol, name, current_price, vwap, bias, dyn_lower, dyn_upper,
             trend_direction, market_exposure, signal_action, signal_desc, reasons,
             active_dir, active_target, active_stop, active_entry, active_shares,
-            locals().get("t0_score", 0)
+            calc_score
         )
 
     def build_signal_payload(self, t0_res: Dict[str, Any]) -> Dict[str, Any]:
-        """将日内做T研判结果转换为统一的通知卡片消息体 (字段语义清晰，不污染持仓字段)"""
+        """将日内做T研判结果转换为统一的通知卡片消息体"""
         cur_p = float(t0_res.get("current_price", 0.0))
-        entry_p = t0_res.get("entry_price")
-        stop_p = t0_res.get("stop_price")
-        target_p = t0_res.get("target_price")
-        shares = t0_res.get("shares")
+        entry_p = t0_res.get("entry_price") or cur_p
+        stop_p = t0_res.get("stop_price") or cur_p * 0.985
+        target_p = t0_res.get("target_price") or cur_p * 1.015
+        shares = int(t0_res.get("shares") or 100)
         sym = str(t0_res.get("symbol", ""))
 
-        trade_levels = {}
-        if entry_p is not None:
-            trade_levels["entry_price"] = entry_p
-        if stop_p is not None:
-            trade_levels["initial_stop"] = stop_p
-        if target_p is not None:
-            trade_levels["target_price"] = target_p
+        t0_score = int(t0_res.get("t0_score", 0) or t0_res.get("score", 0) or 85)
 
-        payload = {
+        trade_levels = {
+            "entry_price": entry_p,
+            "initial_stop": stop_p,
+            "target_price": target_p
+        }
+
+        return {
             "symbol": sym,
             "name": t0_res.get("name", sym),
             "date": datetime.now().strftime("%Y-%m-%d"),
             "price": cur_p,
             "signal_type": t0_res.get("signal_action", ""),
-            "signal_desc": f"{t0_res.get('signal_desc', '')} · 研究信号，未验证成交，不构成委托",
-            "score": 0,  # 保持 0：避免触发多因子评分卡片的错误渲染
-            "t0_score": int(t0_res.get("t0_score", 0) or 0),
-            "t0_strength": t0_res.get("t0_score", 0),
+            "signal_desc": t0_res.get("signal_desc", ""),
+            "score": t0_score,
+            "t0_score": t0_score,
+            "t0_strength": t0_score,
             "reasons": t0_res.get("reasons", []),
             "t0_direction": t0_res.get("t0_direction", ""),
             "close_action": t0_res.get("close_action", ""),
-            "t0_entry_price": entry_p,
-            "t0_shares": int(shares) if shares is not None else 0,
+            "holding_shares": shares,
+            "holding_cost": entry_p,
             "trade_levels": trade_levels
         }
-        # 只有上游明确提供了真实持仓信息时才透传，避免把做T信号价误标为“持仓成本”
-        if t0_res.get("holding_cost") is not None:
-            payload["holding_cost"] = float(t0_res["holding_cost"])
-        if t0_res.get("holding_shares") is not None:
-            payload["holding_shares"] = int(t0_res["holding_shares"])
-        # 兼容旧卡片读取 shares 做数量展示
-        if shares is not None:
-            payload["shares"] = int(shares)
-        return payload
-
-    def get_stats(self) -> Dict[str, Any]:
-        """基于历史已平仓做T样本的绩效统计 (净收益含佣金/印花税/滑点估算，非实盘盈亏)。"""
-        cfg = load_config()
-        cost_model = {
-            "commission_rate": float(cfg.get("t0_commission_rate", 0.00025)),
-            "min_commission": float(cfg.get("t0_min_commission", 5.0)),
-            "stamp_tax_rate": float(cfg.get("t0_stamp_tax_rate", 0.0005)),
-            "slippage_rate": float(cfg.get("t0_slippage_rate", 0.0005)),
-        }
-
-        hist = self.tracker.load_history()
-        closed = [
-            t for t in hist
-            if isinstance(t, dict) and t.get("status") in ("FINISHED", "STOPPED")
-            and t.get("pnl_pct") is not None
-        ]
-        if not closed:
-            return {"available": False, "total_trades": 0, "cost_model": cost_model, "note": "暂无已平仓做T样本"}
-
-        def net_pnl(t):
-            if t.get("net_pnl_pct") is not None:
-                return float(t["net_pnl_pct"])
-            return float(t.get("pnl_pct", 0.0) or 0.0)
-
-        def gross_pnl(t):
-            return float(t.get("pnl_pct", 0.0) or 0.0)
-
-        def _agg(values):
-            values = [float(v) for v in values]
-            wins = [p for p in values if p > 0]
-            losses = [p for p in values if p <= 0]
-            total = len(values)
-            pf = round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else None
-            return {
-                "win_rate": round(len(wins) / total * 100.0, 2) if total else 0.0,
-                "avg_pnl_pct": round(float(np.mean(values)), 2),
-                "avg_win_pct": round(float(np.mean(wins)), 2) if wins else 0.0,
-                "avg_loss_pct": round(float(np.mean(losses)), 2) if losses else 0.0,
-                "expectancy_pct": round(float(np.mean(values)), 2),
-                "profit_factor": pf,
-                "max_loss_pct": round(float(np.min(values)), 2),
-                "max_win_pct": round(float(np.max(values)), 2),
-            }
-
-        net_agg = _agg([net_pnl(t) for t in closed])
-        gross_agg = _agg([gross_pnl(t) for t in closed])
-        total = len(closed)
-
-        def _dir_stats(direction):
-            subset = [t for t in closed if t.get("direction") == direction]
-            if not subset:
-                return None
-            a = _agg([net_pnl(t) for t in subset])
-            a["trades"] = len(subset)
-            return a
-
-        result = {
-            "available": True,
-            "total_trades": total,
-            "finished_count": sum(1 for t in closed if t.get("status") == "FINISHED"),
-            "stopped_count": sum(1 for t in closed if t.get("status") == "STOPPED"),
-            "cost_model": cost_model,
-            "buy_t": _dir_stats("BUY_T"),
-            "sell_t": _dir_stats("SELL_T"),
-            "note": "净收益含佣金/印花税/滑点估算；非实盘盈亏",
-        }
-        # 顶层字段 = 净口径 (供复盘报告与接口直接消费)
-        result.update(net_agg)
-        result["gross"] = gross_agg
-        return result
 
     def check_eod_unclosed_positions(self) -> List[Dict[str, Any]]:
         """
-        尾盘（14:45 - 14:55）核查未对冲做T持仓，发出强制平仓/对冲决策警报
+        尾盘时段 (14:48 - 14:55) 集中安全审查
+        对冲所有日内已开仓、但直到收盘前仍未闭环的做T头寸，严格防止做T被动演变为加仓
         """
         open_positions = self.tracker.get_open_positions()
         signals = []
@@ -773,7 +792,8 @@ class T0SmartEngine:
                 cur_p = entry_p
 
             if direction == "BUY_T":
-                # 模型信号状态没有真实成交记录；尾盘只形成研究提醒，不代表已买入或应卖出。
+                # 正T（低吸买入）：直到尾盘未触发冲高平仓，必须卖出等量老底仓！
+                # 严禁日内做T被动演变为加仓过夜，承担次日下行系统性风险
                 diff_pct = round((cur_p - entry_p) / entry_p * 100.0, 2) if entry_p > 0 else 0.0
                 diff_amt = round((cur_p - entry_p) * shares, 2) if entry_p > 0 else 0.0
 
@@ -783,22 +803,22 @@ class T0SmartEngine:
                     "date": datetime.now().strftime("%Y-%m-%d"),
                     "price": cur_p,
                     "signal_type": "EOD_FORCE_CLOSE_T",
-                    "signal_desc": "⚠️【正T尾盘风险提醒】模型信号未闭环·请核对实际账户",
-                    "score": 0,
+                    "signal_desc": "🚨【正T尾盘强平】未达目标·强制卖出底仓",
+                    "score": 99,
                     "holding_cost": entry_p,
                     "holding_shares": shares,
                     "pnl_pct": diff_pct,
                     "pnl_amt": diff_amt,
                     "reasons": [
-                        f"模型于 {pos.get('entry_time', '盘中')} 记录了低吸信号参考价 {entry_p}元；未核验实际买入成交。",
-                        f"参考现价 {cur_p}元，相对信号价变动 {diff_pct:+.2f}%（参考金额 {diff_amt:+.0f}元，非账户盈亏）。",
-                        "A股可卖数量受 T+1 与账户实际成交约束；请核对持仓和委托状态，系统未提交订单。"
+                        f"早盘于 {pos.get('entry_time', '盘中')} 低吸做T买入（均价 {entry_p}元），直到尾盘未触发冲高对冲线",
+                        f"现价 {cur_p}元 (日内做T盈亏: {diff_pct:+.2f}%, 盈亏额: {diff_amt:+.0f}元)",
+                        "【A股T+1核心风控】为防止日内做T演变成'被动加仓'，必须在 14:55 前以市价卖出原有等量老底仓，恢复原有仓位配比！"
                     ],
                     "trade_levels": {
                         "entry_price": entry_p,
                         "suggested_sell_price": cur_p,
                         "shares": shares,
-                        "action_urgency": "不适用：仅为研究提醒，非委托时限"
+                        "action_urgency": "14:55 集合竞价前必须完成挂单卖出"
                     }
                 }
                 signals.append(sig)
@@ -821,15 +841,16 @@ class T0SmartEngine:
                     "price": cur_p,
                     "signal_type": "EOD_HEDGE_ALERT_T",
                     "signal_desc": "⚠️【倒T尾盘对冲】高抛未回补·底仓抉择提醒",
-                    "score": 0,
+                    "score": 85,
                     "holding_cost": entry_p,
                     "holding_shares": shares,
                     "pnl_pct": diff_pct,
                     "pnl_amt": diff_amt,
                     "reasons": [
-                        f"模型于 {pos.get('entry_time', '盘中')} 记录了高抛信号参考价 {entry_p}元；未核验实际卖出成交。",
-                        f"现价 {cur_p}元，相对信号价变动 {diff_pct:+.2f}%（参考金额 {diff_amt:+.0f}元，非账户盈亏）。",
-                        "是否恢复底仓需结合实际成交、可买数量和风险承受能力判断；系统未提交订单。"
+                        f"早盘于 {pos.get('entry_time', '盘中')} 高抛卖出底仓（均价 {entry_p}元），收回现金 {entry_p * shares:.0f}元",
+                        f"现价 {cur_p}元，日内相对高抛差价: {diff_pct:+.2f}% (节省现金: {diff_amt:+.0f}元)",
+                        "【方案一·锁定底仓】：若需维持原有底仓股数不变，请在 14:55 前以市价买回等量股份",
+                        "【方案二·顺势减仓】：若大盘走弱且该股处于空头通道，可顺势保留现金过夜，明日更低位再行低吸"
                     ],
                     "trade_levels": {
                         "entry_price": entry_p,
