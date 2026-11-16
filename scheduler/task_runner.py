@@ -367,6 +367,21 @@ class QuantScheduler2:
         title = f"💎 收盘多因子主板精选: {top_picks[0].get('name')}等{len(top_picks)}只 ({date_str})"
         notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_screener")
 
+        # 将精选标的归档入历史信号库，以便每日复盘前向跟踪与自我演进调优
+        for c in top_picks:
+            sig_entry = {
+                "symbol": c.get("symbol"),
+                "name": c.get("name"),
+                "date": date_str,
+                "price": c.get("price"),
+                "signal_type": "BUY",
+                "source": "multi_factor_screener",
+                "score": c.get("score"),
+                "trade_levels": c.get("trade_levels", {}),
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            notification_manager._record_signal_history(sig_entry)
+
     def run_tail230_scan_and_notify(self):
         """尾盘 14:32 触发『2.30 突袭战法』主板精选标的扫描与推送"""
         if not load_config().get("tail230_auto_scan_enabled", True):
@@ -419,6 +434,24 @@ class QuantScheduler2:
 
         title = f"⚡ 2:30尾盘主板突袭精选: {candidates[0].get('name')}等{len(candidates)}只"
         notification_manager.send_markdown(title, "\n".join(lines), broadcast_groups=True, module_filter="push_tail230")
+
+        # 将尾盘候选标的归档入历史信号库，以便每日复盘前向跟踪与自我演进调优
+        for c in candidates:
+            sig_entry = {
+                "symbol": c.get("symbol"),
+                "name": c.get("name"),
+                "date": date_str,
+                "price": c.get("price"),
+                "signal_type": "TAIL_BUY",
+                "source": "tail230_strategy",
+                "score": c.get("score"),
+                "trade_levels": {
+                    "initial_stop": c.get("stop_loss_price"),
+                    "target_price": c.get("target_sell_price")
+                },
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            notification_manager._record_signal_history(sig_entry)
 
         # Research candidates are not user positions and are never added to the fill ledger.
 

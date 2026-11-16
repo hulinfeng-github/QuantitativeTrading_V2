@@ -178,9 +178,9 @@ class TailStrategy230:
                 except (ValueError, TypeError):
                     continue
 
-            # 按成交额降序排序，选取流动性与主力参与度最高的候选 (前25只极速评估)
+            # 按成交额降序排序，选取流动性与主力参与度最高的候选 (前60只并发极速评估，确保标的样本充足)
             matched.sort(key=lambda x: float(x.get("turnover", 0)), reverse=True)
-            target_stocks = matched[:25]
+            target_stocks = matched[:60]
 
             def _check_one(s):
                 sym = s["symbol"]

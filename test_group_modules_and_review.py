@@ -310,7 +310,8 @@ class TestGroupModulesAndReview(unittest.TestCase):
                 "symbol": "sz002156",
                 "name": "通富微电",
                 "signal_type": "BUY_T",
-                "price": 25.5
+                "price": 25.5,
+                "is_test": True
             }
             res = notification_manager.send_signal(t0_sig, force=True)
             self.assertTrue(res.get("dingtalk"))

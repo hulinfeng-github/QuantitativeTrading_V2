@@ -35,7 +35,8 @@ def evaluate_market_regime(
     daily_kline: Optional[pd.DataFrame],
     current_price: float,
     symbol: str = "",
-    as_of_date: Optional[str] = None
+    as_of_date: Optional[str] = None,
+    market_exposure: Optional[float] = None
 ) -> Tuple[str, float, str]:
     """
     严谨多因子趋势通道与牛熊市状态识别 (双均线+斜率+迟滞滤波防频繁切换)
@@ -95,6 +96,13 @@ def evaluate_market_regime(
         is_bear = True
         bear_reason = f"均线空头死叉(MA5<MA20且3日斜率{ma20_slope_pct:+.2f}%)"
         
+    # 宏观大盘极度冰点联动熔断：若大盘处于系统性杀跌(敞口<=20%)，禁止误判为中立/多头
+    if market_exposure is not None and market_exposure <= 0.20:
+        if is_bull:
+            return "NEUTRAL", ma20, f"个股技术面强势但受大盘极度冰点(敞口{int(market_exposure*100)}%)系统性压制，降级为平衡震荡"
+        else:
+            return "BEAR", ma20, f"大盘极度冰点系统性杀跌(建议敞口{int(market_exposure*100)}%)，空头弱势通道主导"
+
     if is_bull and not is_bear:
         return "BULL", ma20, bull_reason
     elif is_bear and not is_bull:
@@ -699,7 +707,7 @@ class T0SmartEngine:
             minute_closes = pd.to_numeric(df_minute["price"], errors="coerce").dropna().to_numpy()
 
         # 2. 严谨多因子趋势通道与牛熊市状态识别 (双均线+斜率+迟滞滤波防频繁切换)
-        trend_direction, ma20, regime_reason = evaluate_market_regime(daily_kline, current_price, symbol)
+        trend_direction, ma20, regime_reason = evaluate_market_regime(daily_kline, current_price, symbol, as_of_date=None, market_exposure=market_exposure)
 
         # 3. 检查现有持仓状态跟踪与冷却期解除
         # 检索当日同向止损风控熔断历史与单日做T频次统计
@@ -766,12 +774,31 @@ class T0SmartEngine:
                         signal_desc = "正T防守止损对冲平仓"
                         reasons.append(f"跌破正T防守底线 {stop_p}元(-{stop_pct}%)，建议立即卖出底仓止损保护！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
-                    # 2. 敏捷动态移动止盈 (小步快跑落袋解套，保底0.6%锁定+回撤0.2%走)
-                    elif agile_trailing_enabled and peak_profit_pct >= agile_active_pct and (peak_profit_pct - curr_profit_pct) >= agile_callback_pct:
-                        signal_action = "CLOSE_T"
-                        signal_desc = "正T敏捷移动止盈对冲平仓"
-                        reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后回落{agile_callback_pct}%，敏捷移动锁定做T利润，摊薄持仓成本！")
-                        self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                    # 2. 敏捷动态移动止盈 (严格扣费后正净利保护，A股个股0.85%起步，ETF 0.6%起步，防止扣费反噬负利)
+                    elif agile_trailing_enabled and peak_profit_pct >= (agile_active_pct if is_etf else max(agile_active_pct, 0.70)) and (peak_profit_pct - curr_profit_pct) >= agile_callback_pct:
+                        min_fee_pct = 0.12 if is_etf else 0.25
+                        if curr_profit_pct > min_fee_pct:
+                            signal_action = "CLOSE_T"
+                            signal_desc = "正T敏捷移动止盈对冲平仓"
+                            reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后回落{agile_callback_pct}%且扣费净利润锁定，敏捷移动锁定做T利润，摊薄持仓成本！")
+                            self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                        else:
+                            signal_action = "HOLDING_T"
+                            signal_desc = f"正T盈利冲高中 (当前浮动: +{curr_profit_pct:.2f}%)"
+                    # 2.1 横盘钝化保本减负平仓 (持仓超120分钟且下午14:00后平价锁定，规避尾盘强制平仓摩擦)
+                    elif current_hm >= "14:00" and existing_pos.get("entry_time"):
+                        dur_mins = 0
+                        try:
+                            e_ts = existing_pos.get("entry_time", "")
+                            if len(e_ts) >= 5:
+                                dur_mins = (int(current_hm[:2]) * 60 + int(current_hm[3:5])) - (int(e_ts[:2]) * 60 + int(e_ts[3:5]))
+                        except Exception:
+                            pass
+                        if dur_mins >= 120 and abs(curr_profit_pct) <= 0.35 and curr_profit_pct >= 0.05:
+                            signal_action = "CLOSE_T"
+                            signal_desc = "正T横盘钝化·保本减负平仓"
+                            reasons.append(f"做T持仓已达{dur_mins}分钟且持续横盘钝化，在平价成本线微利平仓，平稳释放底仓并规避尾盘被动强平")
+                            self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
                     # 3. 冲高回落动态浮动对冲止盈
                     elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
                         signal_action = "CLOSE_T"
@@ -798,12 +825,17 @@ class T0SmartEngine:
                         signal_desc = "倒T反抽止损买回归位"
                         reasons.append(f"价格反抽冲破防守线 {stop_p}元，为防底仓抛飞，建议立即以市价买回等量底仓（{pos_shares}股）止损对冲！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
-                    # 2. 敏捷动态移动止盈 (倒T探底回升买回锁差价)
-                    elif agile_trailing_enabled and peak_profit_pct >= agile_active_pct and (peak_profit_pct - curr_profit_pct) >= agile_callback_pct:
-                        signal_action = "CLOSE_T"
-                        signal_desc = "倒T敏捷移动止盈买回平仓"
-                        reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后回升{agile_callback_pct}%，敏捷买回等量底仓锁定差价，摊薄持仓成本！")
-                        self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+# 2. 敏捷动态移动止盈 (严格扣费后正净利保护，A股个股0.85%起步，ETF 0.6%起步)
+                    elif agile_trailing_enabled and peak_profit_pct >= (agile_active_pct if is_etf else max(agile_active_pct, 0.70)) and (peak_profit_pct - curr_profit_pct) >= agile_callback_pct:
+                        min_fee_pct = 0.12 if is_etf else 0.25
+                        if curr_profit_pct > min_fee_pct:
+                            signal_action = "CLOSE_T"
+                            signal_desc = "倒T敏捷移动止盈买回平仓"
+                            reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后回升{agile_callback_pct}%且扣费净利润锁定，敏捷买回等量底仓锁定差价，摊薄持仓成本！")
+                            self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
+                        else:
+                            signal_action = "HOLDING_T"
+                            signal_desc = f"倒T浮盈持有中 (当前价差: +{curr_profit_pct:.2f}%)"
                     # 3. 探底回升动态止盈
                     elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
                         signal_action = "CLOSE_T"
@@ -864,11 +896,19 @@ class T0SmartEngine:
                 reasons.append(f"该标的今日已完成 {today_trade_count} 笔做T，已达单日频次上限({max_daily_trades}次)，防范过度交易磨损")
             elif (bias <= bias_buy_thresh and current_price <= dyn_lower) if require_dual_resonance else (bias <= bias_buy_thresh or current_price <= dyn_lower):
                 # 正T买入判定：
-                # 1. 牛市通道 (BULL) 或 震荡平衡 (NEUTRAL)：顺势逢低吸纳做正T；
-                # 2. 熊市通道 (BEAR)：严格防范盲目接飞刀！必须满足分时背离预测(MACD底背离/KDJ超卖金叉)且分时止跌企稳确认！
+                # 1. 宏观系统性杀跌硬防护：若大盘宏观敞口<=20%或极度冰点，严禁常态低吸，仅允许极端恐慌超跌共振(-2.2%以下)
+                # 2. 早盘脉冲期杀跌保护：09:30~09:45 前15分钟开盘集中下泄期，非极端超跌严禁急躁买入接飞刀
+                # 3. 熊市通道 (BEAR)：必须满足分时背离预测(MACD底背离/KDJ超卖金叉)且分时止跌企稳确认！
+                is_macro_dump = (market_exposure is not None and market_exposure <= 0.20)
+                is_extreme_oversold = (bias <= bias_buy_thresh * 1.6)
                 is_oversold_bounce = (bias <= bias_buy_thresh * 1.35)
+                early_morning_buy_blocked = (current_hm <= "09:45" and bias > bias_buy_thresh * 1.6)
+
                 if not use_trend_filter:
                     trend_allows_buy = True
+                elif is_macro_dump:
+                    # 宏观系统性杀跌期：极度冰点，常规负偏离直接阻断，仅在极端恐慌+背离企稳时允许轻仓博反弹
+                    trend_allows_buy = (is_extreme_oversold and buy_div and buy_reversal_confirmed) if divergence_filter_enabled else is_extreme_oversold
                 elif trend_direction == "BEAR":
                     trend_allows_buy = (buy_div and buy_reversal_confirmed) if divergence_filter_enabled else is_oversold_bounce
                 elif trend_direction == "BULL":
@@ -879,6 +919,12 @@ class T0SmartEngine:
                 if "BUY_T" in today_stopped_dirs:
                     signal_desc = "今日正T已止损·触发风控熔断"
                     reasons.append("该标的今日此前已触发正T防守止损，表明处于强单边下泄行情，日内暂停同向做T防范二次磨损")
+                elif early_morning_buy_blocked:
+                    signal_desc = "早盘急跌抢跑·防下泄接飞刀保护"
+                    reasons.append(f"09:45前属于早盘开盘竞价与集中下泄脉冲期，现价跌幅偏离({bias:.2f}%)未达极端恐慌超跌线({bias_buy_thresh*1.6:.2f}%)，等待开盘首波抛压衰竭与分时企稳再行研判")
+                elif is_macro_dump and not trend_allows_buy:
+                    signal_desc = "宏观系统性杀跌·暂停正T接飞刀"
+                    reasons.append(f"宏观大盘处于极度冰点系统性杀跌期(宏观敞口{int(market_exposure*100)}%)，系统性抛压沉重，禁止左侧逆势低吸正T防范深度套牢")
                 elif not trend_allows_buy:
                     if trend_direction == "BEAR":
                         signal_desc = "空头通道严禁接飞刀·等待底背离共振"

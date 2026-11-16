@@ -12,6 +12,18 @@ from notifier.dingtalk import format_batch_signals_markdown
 class TestT0RegimeAndDilution(unittest.TestCase):
     def setUp(self):
         t0_smart_engine.tracker.reset_today()
+        # 清理测试标的在历史成交中的持久化记录，防止测试用例相互干扰频次限制
+        hist_file = t0_smart_engine.tracker.history_file
+        if hist_file.exists():
+            import json
+            try:
+                with open(hist_file, "r", encoding="utf-8") as f:
+                    h = json.load(f)
+                h = [x for x in h if x.get("symbol") != "sh600000"]
+                with open(hist_file, "w", encoding="utf-8") as f:
+                    json.dump(h, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
     def test_01_evaluate_market_regime_bull(self):
         """测试严谨多因子牛市通道识别"""
