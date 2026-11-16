@@ -333,7 +333,6 @@ class DingTalkNotifier:
                 print(f"[DingTalk 频控保护拦截] 消息未外发以防封禁: {reason} | 标题: {title}")
                 return False
 
-        url = self._get_signed_url()
         payload = {
             "msgtype": "markdown",
             "markdown": {
@@ -341,32 +340,49 @@ class DingTalkNotifier:
                 "text": text
             }
         }
-        try:
-            resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=5)
-            if resp.status_code == 200:
-                res = resp.json()
-                errcode = res.get("errcode", -1)
-                errmsg = res.get("errmsg", "")
-                if errcode == 0:
-                    dingtalk_rate_limiter.record_success(self.webhook)
-                    return True
 
-                # 捕获钉钉官方 20条/分 频控报错，触发 10 分钟熔断保护
-                if errcode in [130101, 88] or "freq limit" in str(errmsg).lower() or "too many" in str(errmsg).lower():
-                    dingtalk_rate_limiter.trigger_cooldown(self.webhook, errmsg=errmsg, errcode=errcode)
-                    print(f"🚨 [DingTalk 频控超限] 触发官方每分钟20条上限 (errcode: {errcode}, errmsg: {errmsg})！已自动启动10分钟熔断。")
+        # 具备重试机制、Connection: close与自适应超时的健壮推送 (最大3次重试，指数避退，根治网络抖动/SSLEOFError)
+        max_retries = 3
+        for attempt in range(max_retries):
+            url = self._get_signed_url()
+            try:
+                resp = requests.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json", "Connection": "close"},
+                    timeout=12
+                )
+                if resp.status_code == 200:
+                    res = resp.json()
+                    errcode = res.get("errcode", -1)
+                    errmsg = res.get("errmsg", "")
+                    if errcode == 0:
+                        dingtalk_rate_limiter.record_success(self.webhook)
+                        return True
+
+                    # 捕获钉钉官方 20条/分 频控报错，触发 10 分钟熔断保护 (不重试以防延长封禁)
+                    if errcode in [130101, 88] or "freq limit" in str(errmsg).lower() or "too many" in str(errmsg).lower():
+                        dingtalk_rate_limiter.trigger_cooldown(self.webhook, errmsg=errmsg, errcode=errcode)
+                        print(f"🚨 [DingTalk 频控超限] 触发官方每分钟20条上限 (errcode: {errcode}, errmsg: {errmsg})！已自动启动10分钟熔断。")
+                        return False
+                    else:
+                        print(f"钉钉推送失败 (第{attempt+1}次): errcode={errcode}, errmsg={errmsg}")
+                        if errcode not in [300001, 200002]:
+                            return False
+                elif resp.status_code == 429:
+                    dingtalk_rate_limiter.trigger_cooldown(self.webhook, errmsg="HTTP 429 Too Many Requests", errcode=429)
+                    print("🚨 [DingTalk 429] 触发HTTP 429限流，已启动10分钟熔断。")
                     return False
                 else:
-                    print(f"钉钉推送失败: errcode={errcode}, errmsg={errmsg}")
-                    return False
-            elif resp.status_code == 429:
-                dingtalk_rate_limiter.trigger_cooldown(self.webhook, errmsg="HTTP 429 Too Many Requests", errcode=429)
-                print("🚨 [DingTalk 429] 触发HTTP 429限流，已启动10分钟熔断。")
-                return False
-            return False
-        except Exception as e:
-            print(f"钉钉推送失败: {e}")
-            return False
+                    print(f"钉钉推送HTTP异常 (第{attempt+1}次): status_code={resp.status_code}")
+            except Exception as e:
+                print(f"钉钉网络请求异常 (第{attempt+1}/{max_retries}次): {e}")
+
+            if attempt < max_retries - 1:
+                backoff_time = 0.8 * (attempt + 1)
+                time.sleep(backoff_time)
+
+        return False
 
     def send_batch_signals(self, signals: List[Dict[str, Any]], group_name: str = "", wait: bool = True, max_wait: float = 5.0) -> bool:
         """

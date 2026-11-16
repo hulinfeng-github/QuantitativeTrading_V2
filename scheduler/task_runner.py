@@ -563,11 +563,13 @@ class QuantScheduler2:
 
             try:
                 notifier = DingTalkNotifier(webhook, secret)
-                notifier.send_markdown(group_title, group_md)
-                pushed_group_webhooks.add(webhook)
-                print(f"[PostReview] 成功推送定制复盘至分组: {group_name}")
+                if notifier.send_markdown(group_title, group_md):
+                    pushed_group_webhooks.add(webhook)
+                    print(f"[PostReview] 成功推送定制复盘至分组: {group_name}")
+                else:
+                    print(f"[PostReview] 推送定制复盘至分组 {group_name} 失败 (网络/响应异常)")
             except Exception as e:
-                print(f"[PostReview] 推送定制复盘至分组 {group_name} 失败: {e}")
+                print(f"[PostReview] 推送定制复盘至分组 {group_name} 异常: {e}")
 
         # 2. 推送全局通用复盘至微信(若启用)以及尚未接收到的全局钉钉配置
         full_report = res.get("report_md", "")

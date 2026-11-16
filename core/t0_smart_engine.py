@@ -115,7 +115,10 @@ def compute_intraday_divergence(
     if minute_frame is None or len(minute_frame) < min_bars:
         return False, False, ""
         
-    prices = pd.to_numeric(minute_frame["price"], errors="coerce").dropna().to_numpy(dtype=float)
+    price_col = "price" if "price" in minute_frame.columns else ("close" if "close" in minute_frame.columns else None)
+    if not price_col:
+        return False, False, ""
+    prices = pd.to_numeric(minute_frame[price_col], errors="coerce").dropna().to_numpy(dtype=float)
     if len(prices) < min_bars:
         return False, False, ""
         
@@ -847,6 +850,9 @@ class T0SmartEngine:
             buy_reversal_confirmed = reversal_up(minute_closes, current_price) and _vol_confirm(minute_volumes)
             sell_reversal_confirmed = reversal_down(minute_closes, current_price) and _vol_confirm(minute_volumes)
 
+            # 计算分时动能背离预测 (MACD 5m 底/顶背离 + KDJ 极值拐点)
+            buy_div, sell_div, div_desc = compute_intraday_divergence(minute_frame if minute_data_ok else None, current_price)
+
             if not minute_data_ok and df_minute is None:
                 signal_desc = "分时数据不足或延迟·观望"
                 reasons.append("需要有效分时数据以精确计算VWAP均价通道")
@@ -856,10 +862,7 @@ class T0SmartEngine:
             elif today_trade_count >= max_daily_trades:
                 signal_desc = f"达单日做T上限({max_daily_trades}次)·观望"
                 reasons.append(f"该标的今日已完成 {today_trade_count} 笔做T，已达单日频次上限({max_daily_trades}次)，防范过度交易磨损")
-            # 计算分时动能背离预测 (MACD 5m 底/顶背离 + KDJ 极值拐点)
-            buy_div, sell_div, div_desc = compute_intraday_divergence(minute_frame if minute_data_ok else None, current_price)
-
-            if (bias <= bias_buy_thresh and current_price <= dyn_lower) if require_dual_resonance else (bias <= bias_buy_thresh or current_price <= dyn_lower):
+            elif (bias <= bias_buy_thresh and current_price <= dyn_lower) if require_dual_resonance else (bias <= bias_buy_thresh or current_price <= dyn_lower):
                 # 正T买入判定：
                 # 1. 牛市通道 (BULL) 或 震荡平衡 (NEUTRAL)：顺势逢低吸纳做正T；
                 # 2. 熊市通道 (BEAR)：严格防范盲目接飞刀！必须满足分时背离预测(MACD底背离/KDJ超卖金叉)且分时止跌企稳确认！
@@ -1039,11 +1042,15 @@ class T0SmartEngine:
         尾盘时段 (14:48 - 14:55) 集中安全审查
         对冲所有日内已开仓、但直到收盘前仍未闭环的做T头寸，严格防止做T被动演变为加仓
         """
+        from core.t0_group_manager import t0_group_manager
         open_positions = self.tracker.get_open_positions()
         signals = []
         for pos in open_positions:
             sym = pos["symbol"]
             name = pos["name"]
+            target_grps = t0_group_manager.get_groups_for_stock(sym)
+            grp_name = target_grps[0].get("name", "") if target_grps else ""
+            grp_id = target_grps[0].get("id", "") if target_grps else ""
             direction = pos["direction"]
             entry_p = float(pos.get("entry_price", 0.0))
             shares = int(pos.get("shares", 100))
@@ -1062,6 +1069,8 @@ class T0SmartEngine:
                 sig = {
                     "symbol": sym,
                     "name": name,
+                    "group_name": grp_name,
+                    "group_id": grp_id,
                     "date": datetime.now().strftime("%Y-%m-%d"),
                     "price": cur_p,
                     "signal_type": "EOD_FORCE_CLOSE_T",
@@ -1099,6 +1108,8 @@ class T0SmartEngine:
                 sig = {
                     "symbol": sym,
                     "name": name,
+                    "group_name": grp_name,
+                    "group_id": grp_id,
                     "date": datetime.now().strftime("%Y-%m-%d"),
                     "price": cur_p,
                     "signal_type": "EOD_HEDGE_ALERT_T",

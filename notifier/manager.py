@@ -200,6 +200,8 @@ class NotificationManager:
             else:
                 target_groups = t0_group_manager.get_groups_for_stock(sym) if sym else []
                 if target_groups:
+                    if not sig.get("group_name"):
+                        sig["group_name"] = target_groups[0].get("name", "")
                     for grp in target_groups:
                         if not grp.get("enabled", True):
                             continue
