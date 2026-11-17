@@ -1684,8 +1684,6 @@ async function loadSettings() {
 
     document.getElementById("cfgT0Buy").value = cfg.t0_bias_buy ?? -1.5;
     document.getElementById("cfgT0Sell").value = cfg.t0_bias_sell ?? 2.0;
-    const filterEl = document.getElementById("cfgT0TrendFilter");
-    if (filterEl) filterEl.checked = cfg.t0_trend_filter_enabled !== false;
 
     document.getElementById("cfgDingEnabled").checked = !!cfg.dingtalk_enabled;
     document.getElementById("cfgDingWebhook").value = cfg.dingtalk_webhook ?? "";
@@ -1708,7 +1706,7 @@ async function saveSettings() {
 
     t0_bias_buy: parseFloat(document.getElementById("cfgT0Buy").value),
     t0_bias_sell: parseFloat(document.getElementById("cfgT0Sell").value),
-    t0_trend_filter_enabled: document.getElementById("cfgT0TrendFilter") ? document.getElementById("cfgT0TrendFilter").checked : true,
+    t0_trend_filter_enabled: true,
 
     dingtalk_enabled: document.getElementById("cfgDingEnabled").checked,
     dingtalk_webhook: document.getElementById("cfgDingWebhook").value.trim(),
