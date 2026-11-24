@@ -88,15 +88,15 @@ class QuantScheduler2:
         cfg = load_config()
 
         if not force:
-            # 动态感知市场博弈节奏与自适应巡检频控
-            if "09:30" <= curr_hm <= "09:40" and cfg.get("opening_high_freq_enabled", True):
-                step_interval = 60  # 开盘脉冲黄金期：提频至 60 秒高灵敏巡检，捕捉日内高低极值
-            elif "14:35" <= curr_hm <= "15:00" and cfg.get("closing_high_freq_enabled", True):
-                step_interval = 120 # 尾盘决胜决断期：提频至 120 秒，防范尾盘突袭或强平滞后
+            # 动态感知市场博弈节奏与自适应巡检频控 (缩短拉取间隔，秒级捕捉微观结构拐点)
+            if "09:30" <= curr_hm <= "10:00" and cfg.get("opening_high_freq_enabled", True):
+                step_interval = 30  # 开盘脉冲黄金期：提频至 30 秒高灵敏巡检，捕捉早盘尖点极值
+            elif "14:40" <= curr_hm <= "15:00" and cfg.get("closing_high_freq_enabled", True):
+                step_interval = 30  # 尾盘决胜决断期：提频至 30 秒，确保14:48强平对冲与尾盘决断精准执行
             elif "09:25" <= curr_hm < "09:30":
-                step_interval = 180 # 集合竞价等待期：维持 3 分钟
+                step_interval = 60  # 集合竞价等待期：维持 60 秒
             else:
-                step_interval = cfg.get("scan_interval_minutes", 5) * 60 # 常态交易时段：默认 5 分钟
+                step_interval = int(cfg.get("scan_interval_seconds", cfg.get("scan_interval_minutes", 1) * 60)) # 常态交易时段：默认 60 秒高频跟踪
 
             if (time.time() - self._last_intraday_check) < (step_interval - 5):
                 return

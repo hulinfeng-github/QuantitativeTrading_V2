@@ -101,24 +101,38 @@ DEFAULT_CONFIG = {
     "t0_band_min_pct": 0.6,             # 自适应带宽下限 (%)
     "t0_band_max_pct": 2.8,             # 自适应带宽上限 (%)
     "t0_sell_asymmetry": 1.15,          # 倒T(卖出)带宽 = 正T带宽 * 该系数 (上轨略宽)
-    "t0_bias_buy": -1.2,                # 正T低吸分时VWAP负偏离阈值 (实证-1.2%兼顾弹性与胜率)
-    "t0_bias_sell": 2.5,                # 倒T高抛分时VWAP正偏离阈值 (实证+2.5%高确定性防多头卖飞)
+    "t0_bias_buy": -0.9,                # 个股正T基准偏离阈值(%) (常态-0.9%，超跌反弹-0.75%，熊市极端-1.6%)
+    "t0_bias_sell": 1.1,                # 个股倒T基准偏离阈值(%) (常态+1.1%，弱市顺势+0.85%，多头+2.2%)
     "t0_require_dual_resonance": True,  # 开启双重共振 (偏离阈值 AND 动态布林触轨同时满足，规避单边假信号)
     "t0_golden_window_only": True,      # 仅在黄金交易窗口开新仓 (自动屏蔽 11:00-11:30 假突破陷阱期)
     "t0_avoid_early_morning_short": True, # 开启早盘防倒T保护 (09:45前主力抢筹脉冲期严格限制倒T，非极端不抛底仓)
-    "t0_divergence_filter_enabled": True, # 开启分时多因子背离预测 (5m MACD底背离/顶背离 + KDJ极值拐点，防熊市接飞刀)
-    "t0_agile_trailing_enabled": True,  # 开启敏捷动态移动止盈 (0.6%锁定 + 0.2%回撤，小步快跑积少成多解套)
-    "t0_agile_trailing_active": 0.6,    # 敏捷移动止盈激活阈值(%) (主板0.6%，ETF自适应0.4%)
-    "t0_agile_trailing_callback": 0.2,  # 敏捷移动止盈回撤锁定阈值(%) (0.2%)
+    "t0_divergence_filter_enabled": True, # 开启分时右侧动能拐点与共振预测 (MACD绿柱缩短/金叉/底背离)
+    "t0_agile_trailing_enabled": True,  # 开启敏捷动态移动止盈 (扣费后高正期望保护)
+    "t0_agile_trailing_active": 0.70,   # 个股敏捷移动止盈激活阈值(%) (0.7%起步)
+    "t0_agile_trailing_callback": 0.25, # 基础敏捷移动止盈回撤锁定阈值(%) (0.25%)
+    "t0_agile_trailing_tiered": True,   # 开启阶梯动态移动止盈 (分层放宽回撤容忍度，让利润奔跑，防盘口假反弹过早洗出)
+    "t0_agile_callback_tier1": 0.25,    # 个股初级浮盈(0.7%~1.2%)回撤容忍阈值(%) (0.25%锁定正利保本)
+    "t0_agile_callback_tier2": 0.40,    # 个股中高浮盈(>1.2%)回撤容忍阈值(%) (放宽至0.40%让波段利润奔跑)
+    "t0_agile_callback_etf_tier1": 0.18,# ETF初级浮盈(0.45%~0.8%)回撤容忍阈值(%)
+    "t0_agile_callback_etf_tier2": 0.28,# ETF高浮盈(>0.8%)回撤容忍阈值(%)
+    "t0_afternoon_buy_cutoff": "14:00", # 下午正T低吸开仓截止时间 (14:00后禁止新开正T，留足日内波段对冲时间，规避14:48强平摩擦)
+    "t0_afternoon_sell_cutoff": "14:15",# 下午倒T高抛开仓截止时间 (14:15后全天停止任何新做T开仓)
+    "t0_etf_share_ratio": 0.8,          # ETF做T建议股数占可用底仓的比例 (默认80%底仓弹性轮动，普通个股按单批次控制)
+    "t0_etf_bias_buy": -0.55,           # ETF正T偏离阈值(%) (-0.55%)
+    "t0_etf_bias_sell": 0.65,           # ETF倒T偏离阈值(%) (+0.65%)
+    "t0_etf_agile_active": 0.45,        # ETF敏捷移动止盈激活阈值(%) (ETF波动平滑，0.45%起步)
+    "t0_etf_take_profit_pct": 0.8,      # ETF静态目标止盈幅度(%) (0.8%)
+    "t0_etf_stop_loss_pct": 0.85,       # ETF硬止损保护幅度(%) (0.85%)
     "t0_cost_dilution_notify": True,    # 开启持仓成本动态摊薄与解套进度追踪通知
-    "t0_reversal_bars": 1,              # 反转确认所需连续同向分钟K线数 (1=更灵敏，2=更严格)
-    "t0_reversal_volume_confirm": False, # 反转放量确认 (默认关闭以保证信号频率，可改 True 加强质量)
-    "t0_reversal_volume_mult": 1.0,     # 放量确认倍数 (反转分钟量 >= 近期均量 × 该系数)
-    "t0_vwap_slope_filter": False,      # 日内容均价VWAP斜率过滤 (默认关闭；开启后趋势日不逆势做T，但信号更少)
+    "t0_reversal_bars": 2,              # 反转确认所需连续同向分钟K线数 (2根不创新低/不创新高)
+    "t0_reversal_volume_confirm": True, # 反转放量确认 (微观结构量能确认)
+    "t0_reversal_volume_mult": 0.85,    # 放量确认倍数 (反转分钟量 >= 近期均量 × 0.85)
+    "t0_vwap_slope_filter": True,       # 日内均价VWAP斜率平走保护 (陡峭下泄严禁接飞刀，单边急涨严禁倒T)
     "t0_vwap_slope_lookback": 15,       # VWAP斜率回看分钟数
-    "t0_max_vwap_slope_pct": 0.8,       # VWAP斜率绝对值上限(%)，超过视为单边趋势日
-    "t0_stop_loss_pct": 1.5,            # 做T防守保护止损比例 (%)
-    "t0_take_profit_vwap_pct": 0.25,    # 目标止盈 = 回到VWAP上下方该比例 (%)
+    "t0_max_vwap_slope_pct": 0.50,      # VWAP斜率绝对值上限(%)，超过视为单边急跌/急涨
+    "t0_stop_loss_pct": 1.5,            # 个股做T防守保护止损比例 (%)
+    "t0_take_profit_pct": 1.5,          # 个股做T静态目标止盈比例 (%)
+    "t0_take_profit_vwap_pct": 0.30,    # 目标止盈 = 回到VWAP上下方该比例 (%)
     "t0_time_decay_enabled": True,      # 开启尾盘时间衰减 (剩余时间越少目标越贴近、止损越紧)
     "t0_late_window_start": "14:00",    # 此后进入尾盘时间衰减
     "t0_late_target_scale": 0.6,        # 尾盘目标止盈缩放 (更贴近现价)
@@ -132,9 +146,9 @@ DEFAULT_CONFIG = {
     "t0_min_market_exposure": 0.35,     # 仅在市场状态不低于该风险敞口时生成新T0信号
                                          # 0.35=多头震荡及以上允许(空头震荡也允许做T摊薄)；0.65=仅多头；0=不限制
     "t0_min_market_exposure_sell": 0.0, # 倒T(高抛)的市场敞口下限；0=弱市也允许高抛防御，仅要求指数数据可用
-    "t0_max_trades_per_day": 1,         # 单只标的每日做T最大次数 (实证证明单日1笔胜率最高达54.5%，避免过度交易)
+    "t0_max_trades_per_day": 2,         # 单只标的每日做T最大次数 (以1笔为主，出现高确定性极值允许第2笔，硬封顶2笔)
     "t0_daily_stop_circuit_breaker": True, # 开启单日同向止损熔断 (当日止损后不再开同向仓位)
-    "t0_single_direction_only": True,   # 单日做T单向严格锁定
+    "t0_single_direction_only": False,  # 允许顺势日内多空反转波段
     "t0_trend_filter_enabled": True,    # 开启大趋势过滤 (顺势做T)
     "t0_eod_force_close_enabled": True, # 开启尾盘风险核验提醒；不会自动平仓
     "t0_eod_check_time": "14:48",       # 尾盘做T强平核查时间 (14:45-14:55之间)
@@ -150,9 +164,10 @@ DEFAULT_CONFIG = {
     
     # ---------------- 6. 自动化后台调度 ----------------
     "scheduler_enabled": True,
-    "scan_interval_minutes": 5,          # 盘中常态自选池与做T巡检间隔 (分钟)
-    "opening_high_freq_enabled": True,   # 开启早盘开盘脉冲期(09:30-09:40)高频巡检(1分钟高灵敏度)
-    "closing_high_freq_enabled": True,   # 开启尾盘决胜期(14:35-15:00)提频巡检(2分钟)
+    "scan_interval_minutes": 1,          # 盘中常态自选池与做T巡检间隔 (分钟，提频至1分钟杜绝尖点拐点错过)
+    "scan_interval_seconds": 60,         # 盘中常态巡检秒数
+    "opening_high_freq_enabled": True,   # 开启早盘开盘脉冲期(09:30-10:00)高频巡检(30秒高灵敏度)
+    "closing_high_freq_enabled": True,   # 开启尾盘决胜期(14:40-15:00)提频巡检(30秒)
     "auction_snapshot_enabled": True,    # 开启集合竞价(09:25:05)定价秒级感知
     "market_review_time": "15:10",       # 收盘后全景复盘与参数自迭代时间
     "market_close_scan_time": "15:30",   # 盘后全市场智能精选时间
