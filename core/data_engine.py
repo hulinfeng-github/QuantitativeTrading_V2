@@ -12,12 +12,16 @@ import json
 import time
 import threading
 import requests
+from requests.adapters import HTTPAdapter
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-from config import BASE_DIR, DATA_DIR, load_config
+from config import DATA_DIR
+from core.logger import get_logger
 from core.persistence import atomic_write_json, safe_read_json
+
+logger = get_logger("data_engine")
 
 STOCK_LIST_CACHE = DATA_DIR / "main_board_stocks.json"
 PLATES_CACHE_FILE = DATA_DIR / "stock_plates_cache.json"
@@ -26,22 +30,36 @@ class DataEngine:
     def __init__(self):
         self.session = requests.Session()
         self.session.trust_env = False  # 绕过本地VPN/代理，直连国内金融行情服务器
+        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": "https://finance.qq.com"
         })
         self._lock = threading.RLock()
         self._quote_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._minute_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._kline_5m_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
         self._trading_dates_cache: Tuple[float, List[str]] = (0.0, [])
         self._plates_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl = 2.0  # 行情内存缓存 2 秒
+        self._minute_cache_ttl = 4.0  # 分时高频轮询缓存 4 秒
         self._load_plates_cache()
 
     def _load_plates_cache(self):
         data = safe_read_json(PLATES_CACHE_FILE, {})
         if isinstance(data, dict):
             self._plates_cache = data
+
+    @staticmethod
+    def _prune_cache(cache_dict: Dict[str, Any], max_size: int, keep_size: int):
+        """按写入时间戳保留最新条目，防止长驻运行导致内存缓存无限增长。"""
+        if len(cache_dict) <= max_size:
+            return
+        items = sorted(cache_dict.items(), key=lambda kv: kv[1][0], reverse=True)[:keep_size]
+        cache_dict.clear()
+        cache_dict.update(items)
 
     @staticmethod
     def clean_code(code: str) -> str:
@@ -103,11 +121,12 @@ class DataEngine:
         clean_syms = [self.format_symbol(s) for s in symbols if s]
         now = time.time()
         to_fetch = []
-        for s in clean_syms:
-            if s in self._quote_cache and (now - self._quote_cache[s][0]) < self._cache_ttl:
-                results[s] = self._quote_cache[s][1]
-            else:
-                to_fetch.append(s)
+        with self._lock:
+            for s in clean_syms:
+                if s in self._quote_cache and (now - self._quote_cache[s][0]) < self._cache_ttl:
+                    results[s] = self._quote_cache[s][1]
+                else:
+                    to_fetch.append(s)
 
         if not to_fetch:
             return results
@@ -121,6 +140,9 @@ class DataEngine:
             try:
                 resp = self.session.get(url, timeout=3.5)
                 if resp.status_code != 200:
+                    logger.warning(f"腾讯实时行情HTTP状态异常({resp.status_code})，切换新浪备用通道")
+                    fallback_results = self._fetch_sina_quotes_fallback(chunk)
+                    results.update(fallback_results)
                     continue
                 text = resp.content.decode("gbk", errors="ignore")
                 for line in text.strip().split(";"):
@@ -191,9 +213,12 @@ class DataEngine:
                         "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     results[sym] = q_data
-                    self._quote_cache[sym] = (now, q_data)
+                    with self._lock:
+                        self._quote_cache[sym] = (now, q_data)
+                        self._prune_cache(self._quote_cache, max_size=1000, keep_size=800)
             except Exception as e:
                 # 腾讯异常时，尝试从新浪备选拉取
+                logger.warning(f"腾讯实时行情接口异常，切换新浪备用通道: {e}")
                 fallback_results = self._fetch_sina_quotes_fallback(chunk)
                 results.update(fallback_results)
 
@@ -232,9 +257,14 @@ class DataEngine:
                         price = float(parts[3]) if parts[3] else 0.0
                         high = float(parts[4]) if parts[4] else price
                         low = float(parts[5]) if parts[5] else price
-                        vol = float(parts[8]) / 100.0 if parts[8] else 0.0
-                        amt = float(parts[9]) if parts[9] else 0.0
+                        vol = float(parts[8]) / 100.0 if parts[8] else 0.0  # 股转手，与腾讯字段对齐
+                        amt = float(parts[9]) if parts[9] else 0.0          # 成交额(元)
                         pct = round((price - prev_c) / prev_c * 100.0, 2) if prev_c > 0 else 0.0
+                        vwap = round(amt / (vol * 100.0), 3) if (vol > 0 and amt > 0) else price
+                        is_st = "ST" in str(name).upper()
+                        limit_pct = 0.05 if is_st else 0.10
+                        limit_up_price = round(prev_c * (1.0 + limit_pct), 2) if prev_c > 0 else 0.0
+                        limit_down_price = round(prev_c * (1.0 - limit_pct), 2) if prev_c > 0 else 0.0
 
                         data = {
                             "symbol": sym,
@@ -248,12 +278,19 @@ class DataEngine:
                             "volume": vol,
                             "turnover": amt,
                             "change_pct": pct,
+                            "vwap": vwap,
+                            "limit_up_price": limit_up_price,
+                            "limit_down_price": limit_down_price,
+                            "turnover_rate": 0.0,
+                            "vol_ratio": 0.0,
                             "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         }
                         results[sym] = data
-                        self._quote_cache[sym] = (time.time(), data)
-        except Exception:
-            pass
+                        with self._lock:
+                            self._quote_cache[sym] = (time.time(), data)
+                            self._prune_cache(self._quote_cache, max_size=1000, keep_size=800)
+        except Exception as e:
+            logger.warning(f"新浪实时行情备用通道请求异常: {e}")
         return results
 
     def get_daily_kline(self, symbol: str, count: int = 650) -> Optional[pd.DataFrame]:
@@ -285,8 +322,8 @@ class DataEngine:
                         df['date'] = pd.to_datetime(df['date'])
                         df = df.sort_values('date').reset_index(drop=True)
                         return df
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"新浪指数日线通道异常 ({sym}): {e}")
 
         # 2. 个股类通道 (腾讯接口)
         url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{count},qfq"
@@ -313,8 +350,8 @@ class DataEngine:
                     df['date'] = pd.to_datetime(df['date'])
                     df = df.sort_values('date').reset_index(drop=True)
                     return df
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"腾讯日K通道异常 ({sym}): {e}")
 
         # 3. 腾讯受阻时备选新浪通道 (新浪个股通道同样支持 datalen 大额拉取，勿截断到120)
         try:
@@ -337,17 +374,23 @@ class DataEngine:
                     df['date'] = pd.to_datetime(df['date'])
                     df = df.sort_values('date').reset_index(drop=True)
                     return df
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"日K双通道均获取失败 ({sym}): {e}")
 
         return None
 
     def get_minute_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """
         获取股票当日分时数据并聚合分时成交均价 (VWAP)
-        主通道：腾讯分时 query；备选：腾讯 m1 K线最近交易日聚合
+        主通道：腾讯分时 query；备选：腾讯 m1 K线最近交易日聚合（带4秒并发防击穿缓存）
         """
         sym = self.format_symbol(symbol)
+        now_ts = time.time()
+        with self._lock:
+            cached = self._minute_cache.get(sym)
+            if cached and (now_ts - cached[0] < self._minute_cache_ttl):
+                return cached[1].copy()
+
         url = f"http://web.ifzq.gtimg.cn/appstock/app/minute/query?code={sym}"
         try:
             resp = self.session.get(url, timeout=5)
@@ -373,9 +416,13 @@ class DataEngine:
                             "vwap": round(vwap, 3)
                         })
                     if records:
-                        return pd.DataFrame(records)
+                        df = pd.DataFrame(records)
+                        with self._lock:
+                            self._minute_cache[sym] = (time.time(), df)
+                            self._prune_cache(self._minute_cache, max_size=300, keep_size=200)
+                        return df.copy()
         except Exception as e:
-            print(f"获取 {sym} 分时数据异常: {e}")
+            logger.warning(f"获取 {sym} 分时主通道异常: {e}")
 
         # 备选：腾讯 m1 分钟K线提取最新交易日完整分时
         try:
@@ -406,9 +453,13 @@ class DataEngine:
                             "vwap": round(vwap, 3)
                         })
                     if records:
-                        return pd.DataFrame(records)
-        except Exception:
-            pass
+                        df = pd.DataFrame(records)
+                        with self._lock:
+                            self._minute_cache[sym] = (time.time(), df)
+                            self._prune_cache(self._minute_cache, max_size=300, keep_size=200)
+                        return df.copy()
+        except Exception as e:
+            logger.warning(f"获取 {sym} m1备选分时通道异常: {e}")
         return None
 
     def get_intraday_kline_5m(self, symbol: str, count: int = 1200) -> Optional[pd.DataFrame]:
@@ -451,7 +502,8 @@ class DataEngine:
                             "close": float(item["close"]),
                             "volume": float(item.get("volume", 0.0)),  # 股
                         })
-        except Exception:
+        except Exception as e:
+            logger.debug(f"新浪5分钟K线通道异常 ({sym}): {e}")
             records = []
 
         # 通道 2: 腾讯 mkline 5 分钟备选
@@ -478,7 +530,8 @@ class DataEngine:
                             "low": float(row[4]),
                             "volume": float(row[5]) * 100.0,  # 手转股
                         })
-            except Exception:
+            except Exception as e:
+                logger.warning(f"腾讯5分钟备选通道异常 ({sym}): {e}")
                 records = []
 
         if not records:
@@ -497,6 +550,7 @@ class DataEngine:
 
         with self._lock:
             self._kline_5m_cache[cache_key] = (now_ts, df)
+            self._prune_cache(self._kline_5m_cache, max_size=200, keep_size=150)
         return df.copy()
 
     def get_trading_dates(self, count: int = 90) -> List[str]:
@@ -557,8 +611,8 @@ class DataEngine:
                             zt_num = int(m.group(1))
                             max_sector_zt = max(max_sector_zt, zt_num)
                             hot_concepts.append(f"{cname}({tag})")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"读取板块概念接口异常 ({sym}): {e}")
 
         result = {
             "symbol": sym,
@@ -589,7 +643,7 @@ class DataEngine:
         sh_idx = quotes.get("sh000001", {})
         hs300 = quotes.get("sh000300", {})
 
-        # 获取全市场涨跌统计（通过东财汇总API）
+        # 根据上证与沪深300涨跌定调宏观环境
         breadth = {
             "sh_price": sh_idx.get("price", 0.0),
             "sh_pct": sh_idx.get("change_pct", 0.0),
@@ -604,15 +658,6 @@ class DataEngine:
             "total_turnover_billion": 0.0,
             "regime": "震荡分化"
         }
-
-        try:
-            url = "https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=1.000001,0.399001&fields=f2,f3,f4,f6"
-            resp = self.session.get(url, timeout=3)
-            # 东财全市场涨跌分布
-            url_dist = "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=1&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f3"
-            # 简化统计
-        except Exception:
-            pass
 
         # 根据上证与沪深300涨跌与均线定调宏观牛熊环境
         sh_pct = breadth["sh_pct"]
@@ -663,8 +708,8 @@ class DataEngine:
                                 and "ST" not in str(stock.get("name", "")).upper()
                                 and "退" not in str(stock.get("name", ""))
                             ]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"读取主板股票池缓存异常: {e}")
 
         stocks = []
         # 通道 1: 新浪行情中心 (极速、无防爬断连、夜间高可用)
@@ -705,8 +750,8 @@ class DataEngine:
                         })
                     if len(items) < 100:
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"新浪股票池全量通道异常: {e}")
 
         # 通道 2: 若新浪通道获取标的偏少，使用东财通道补充
         if len(stocks) < 500:
@@ -752,8 +797,8 @@ class DataEngine:
                         })
                     if len(diff) < 100:
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"东财股票池补充通道异常: {e}")
 
         # 通道 3: 本地永续缓存防击穿保护
         # 若因断网或接口异常未能拉取到足够标的，坚决禁止用 33 只种子覆写已有的上千只标的！
@@ -763,8 +808,8 @@ class DataEngine:
                     cached_stocks = json.load(f)
                     if len(cached_stocks) > len(stocks):
                         stocks = cached_stocks
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"股票池本地兜底缓存读取失败: {e}")
 
         # 通道 4: 极端无缓存冷启动兜底
         if len(stocks) < 100:
@@ -878,8 +923,8 @@ class DataEngine:
                     real_name = quotes[sym]["name"]
                     if real_name and not real_name.isdigit():
                         return {"code": code, "symbol": sym, "name": real_name}
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"解析标的实时名称失败 ({sym}): {e}")
             return {"code": code, "symbol": sym, "name": code}
 
         # 3. 模糊名称或别名搜索匹配

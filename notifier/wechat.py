@@ -8,7 +8,12 @@
 import time
 import math
 import requests
-from typing import Dict, Any
+from requests.adapters import HTTPAdapter
+from typing import Dict, Any, Callable
+from core.logger import get_logger
+
+logger = get_logger("wechat")
+
 
 def fmt_p(p) -> str:
     try:
@@ -28,10 +33,44 @@ def fmt_metric(value, suffix: str = "", signed: bool = False, decimals: int = 1)
     formatted = f"{number:+.{decimals}f}" if signed else f"{number:.{decimals}f}"
     return f"{formatted}{suffix}"
 
+
 class WeChatNotifier:
     def __init__(self, provider: str = "pushplus", token: str = ""):
         self.provider = (provider or "pushplus").lower()
         self.token = token.strip() if token else ""
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def _post_with_retry(
+        self,
+        url: str,
+        success_checker: Callable[[Dict[str, Any]], bool],
+        label: str,
+        json_payload: Dict[str, Any] = None,
+        form_payload: Dict[str, Any] = None,
+        max_retries: int = 3
+    ) -> bool:
+        for attempt in range(max_retries):
+            try:
+                if json_payload is not None:
+                    resp = self.session.post(url, json=json_payload, timeout=6)
+                else:
+                    resp = self.session.post(url, data=form_payload, timeout=6)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if success_checker(data):
+                        return True
+                    logger.warning(f"微信通道({label})返回业务失败 (第{attempt + 1}/{max_retries}次): {data}")
+                else:
+                    logger.warning(f"微信通道({label})HTTP异常 (第{attempt + 1}/{max_retries}次): status={resp.status_code}")
+            except Exception as e:
+                logger.warning(f"微信通道({label})请求异常 (第{attempt + 1}/{max_retries}次): {e}")
+
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+        return False
 
     def send_markdown(self, title: str, text: str) -> bool:
         if not self.token:
@@ -53,24 +92,22 @@ class WeChatNotifier:
             "content": text,
             "template": "markdown"
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=6)
-            if resp.status_code == 200:
-                return resp.json().get("code") == 200
-            return False
-        except Exception:
-            return False
+        return self._post_with_retry(
+            url,
+            success_checker=lambda d: d.get("code") == 200,
+            label="PushPlus",
+            json_payload=payload
+        )
 
     def _send_serverchan(self, title: str, text: str) -> bool:
         url = f"https://sctapi.ftqq.com/{self.token}.send"
         payload = {"title": title[:50], "desp": text}
-        try:
-            resp = requests.post(url, data=payload, timeout=6)
-            if resp.status_code == 200:
-                return resp.json().get("code") == 0
-            return False
-        except Exception:
-            return False
+        return self._post_with_retry(
+            url,
+            success_checker=lambda d: d.get("code") == 0,
+            label="Server酱",
+            form_payload=payload
+        )
 
     def _send_wecom(self, title: str, text: str) -> bool:
         url = self.token if self.token.startswith("http") else f"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key={self.token}"
@@ -78,13 +115,12 @@ class WeChatNotifier:
             "msgtype": "markdown",
             "markdown": {"content": f"### {title}\n{text}"}
         }
-        try:
-            resp = requests.post(url, json=payload, timeout=6)
-            if resp.status_code == 200:
-                return resp.json().get("errcode") == 0
-            return False
-        except Exception:
-            return False
+        return self._post_with_retry(
+            url,
+            success_checker=lambda d: d.get("errcode") == 0,
+            label="企业微信",
+            json_payload=payload
+        )
 
     def send_trade_signal(self, signal: Dict[str, Any]) -> bool:
         name = signal.get("name", "")
@@ -125,7 +161,7 @@ class WeChatNotifier:
             title = f"{icon} 尾盘策略持仓时段提醒: {name}"
         elif sig_type == "LIMIT_UP":
             icon = "⚡"
-            title = f"{icon} 游资打板信号: {name} ({signal.get('board_type', '主板涨停')})"
+            title = f"{icon} 游资打板信号: {name} ({signal.get('board_type', '弱转强打板')})"
         else:
             icon = "🎯"
             title = f"{icon} 量化信号: {name} {desc}"
@@ -232,16 +268,25 @@ class WeChatNotifier:
                 "请核对实际持仓、可卖数量与委托成交；本提醒不会下单或记录卖出成交。"
             ])
 
-        # 7. Daily-bar limit-up candidate research summary (LIMIT_UP)
+        # 7. Weak-to-strong limit-up candidate summary (LIMIT_UP)
         elif sig_type == "LIMIT_UP":
-            b_type = signal.get("board_type", "首板突破")
+            b_type = signal.get("board_type", "弱转强打板")
             ladder = signal.get("ladder_count", 1)
+            s_time = signal.get("seal_time") or "实时跟踪中"
+            o_cnt = signal.get("open_count")
+            s_tr = signal.get("seal_turnover_ratio")
+            t1_div = signal.get("t1_divergence_type")
+            meta_parts = [f"上板/触发时间: **{s_time}**"]
+            if t1_div:
+                meta_parts.append(f"T-1前置: **{t1_div}**")
+            if o_cnt is not None:
+                meta_parts.append(f"炸板次数: **{o_cnt}次**")
+            if s_tr is not None:
+                meta_parts.append(f"买一封成比: **{s_tr:.1f}%**")
             lines.extend([
-                f"**板型结构**: **{b_type}** ({ladder}板) | 日线技术规则分: **{signal.get('hardness_score', '不可用')}** (非封板硬度)",
-                f"**候选参考价**: **{fmt_p(price)} 元** (不代表可成交价格)",
-                "",
-                "仅使用日线数据生成的候选信号。系统没有封单队列、真实封板时间、炸板次数、实际成交和涨跌停排队信息。",
-                "该信号不是买卖指令；后续行情跟踪不代表本账户成交或策略净收益。"
+                f"**弱转强形态**: **{b_type}** ({ladder}板) | 置信度: **{signal.get('hardness_score', '不可用')} 分**",
+                f"**分时微结构**: {' | '.join(meta_parts)}",
+                f"**候选参考价**: **{fmt_p(price)} 元** (仅作弱转强模型观察，请结合真实板块地位与排板流动性决策)"
             ])
 
         if reasons:

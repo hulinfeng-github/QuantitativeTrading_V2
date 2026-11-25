@@ -30,3 +30,4 @@ storage/*
 .DS_Store
 Thumbs.db
 scratch/
+archive/

@@ -8,16 +8,22 @@ A股智能量化系统 2.0 - 高胜率日内做T智能引擎 (T0SmartEngine 2.0)
 5. 单日做T频次硬约束与冷却期机制 (支持多波段高确定性T+0);
 6. 持仓状态机持久化 (线程安全 + 原子写盘) 与已平仓样本历史沉淀 (供绩效统计)。
 """
-import os
-import json
 import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple
 import pandas as pd
 import numpy as np
-from config import T0_TRADES_FILE, T0_HISTORY_FILE, load_config
+from config import T0_TRADES_FILE, T0_HISTORY_FILE, calc_round_trip_fees, get_trading_fee_params, load_config
 from core.data_engine import data_engine
+from core.persistence import atomic_write_json, safe_read_json
+
+_T0_REGIME_SCALE = {
+    "BEAR":    {"buy": 1.78, "sell": 0.77, "tp": 0.70},
+    "BULL":    {"buy": 0.83, "sell": 1.80, "tp": 1.20},
+    "REBOUND": {"buy": 0.83, "sell": 1.45, "tp": 1.00},
+    "NEUTRAL": {"buy": 1.00, "sell": 1.00, "tp": 0.90},
+}
 
 def round_price_dynamic(price: float, symbol: str = "") -> float:
     """
@@ -289,33 +295,22 @@ class T0PositionTracker:
 
     def _load(self):
         today_str = datetime.now().strftime("%Y-%m-%d")
-        try:
-            if self.storage_file.exists():
-                with open(self.storage_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        self._trades = {k: v for k, v in data.items() if v.get("date") == today_str}
-        except Exception:
-            self._trades = {}
+        with self._lock:
+            data = safe_read_json(self.storage_file, {})
+            if isinstance(data, dict):
+                self._trades = {k: v for k, v in data.items() if isinstance(v, dict) and v.get("date") == today_str}
+            else:
+                self._trades = {}
 
     def _save(self):
         # 原子写盘：先写临时文件再替换，避免进程中断时写坏 JSON
-        try:
-            tmp = self.storage_file.with_name(self.storage_file.name + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._trades, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.storage_file)
-        except Exception as e:
-            print(f"保存做T持仓状态失败: {e}")
+        with self._lock:
+            atomic_write_json(self.storage_file, self._trades, indent=2)
 
     def _append_history(self, pos: Dict[str, Any]):
-        try:
-            hist: List[Dict[str, Any]] = []
-            if self.history_file.exists():
-                with open(self.history_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        hist = data
+        with self._lock:
+            data = safe_read_json(self.history_file, [])
+            hist: List[Dict[str, Any]] = data if isinstance(data, list) else []
             key = (pos.get("symbol"), pos.get("date"), pos.get("entry_time"), pos.get("direction"))
             replaced = False
             for i, h in enumerate(hist):
@@ -327,12 +322,7 @@ class T0PositionTracker:
             if not replaced:
                 hist.append(pos)
             hist = hist[-5000:]
-            tmp = self.history_file.with_name(self.history_file.name + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(hist, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.history_file)
-        except Exception as e:
-            print(f"保存做T历史样本失败: {e}")
+            atomic_write_json(self.history_file, hist, indent=2)
 
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -352,15 +342,8 @@ class T0PositionTracker:
             ]
 
     def load_history(self) -> List[Dict[str, Any]]:
-        try:
-            if self.history_file.exists():
-                with open(self.history_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        return data
-        except Exception:
-            pass
-        return []
+        data = safe_read_json(self.history_file, [])
+        return data if isinstance(data, list) else []
 
     def open_position(
         self,
@@ -434,33 +417,24 @@ class T0PositionTracker:
             pos["gross_pnl_amt"] = round(gross_amt, 2)
             pos["pnl_type"] = "signal_proxy_gross_excluding_fees"
 
-            # 净收益口径：双边佣金(含最低5元) + 印花税(仅卖出) + 滑点(双边)估算
+            # 净收益口径：复用全局统一成本引擎 (双边佣金含最低5元门槛 + 卖出印花税 + 双边滑点 + 过户费)
             try:
                 cfg = load_config()
-                comm_r = float(cfg.get("t0_commission_rate", 0.00025))
-                min_comm = float(cfg.get("t0_min_commission", 5.0))
-                stamp_r = float(cfg.get("t0_stamp_tax_rate", 0.0005))
-                slip_r = float(cfg.get("t0_slippage_rate", 0.0005))
             except Exception:
-                comm_r, min_comm, stamp_r, slip_r = 0.00025, 5.0, 0.0005, 0.0005
+                cfg = None
 
             entry_amt = entry_p * shares
-            exit_amt = exit_price * shares
             sym_lower = str(symbol).lower()
             is_etf = any(sym_lower.startswith(p) for p in ["sh5", "sz15", "sz16", "sh51", "sh56", "sh58", "sh50", "sz18"])
-            
-            if is_etf:
-                # 场内ETF免征印花税，多数券商ETF佣金免除最低5元限制
-                stamp_amt = 0.0
-                comm_entry = entry_amt * comm_r
-                comm_exit = exit_amt * comm_r
-            else:
-                comm_entry = max(min_comm, entry_amt * comm_r)
-                comm_exit = max(min_comm, exit_amt * comm_r)
-                stamp_amt = (exit_amt if direction == "BUY_T" else entry_amt) * stamp_r
-
-            slip_amt = (entry_amt + exit_amt) * slip_r
-            fees = comm_entry + comm_exit + stamp_amt + slip_amt
+            fee_info = calc_round_trip_fees(
+                entry_price=entry_p,
+                exit_price=exit_price,
+                shares=shares,
+                direction=direction,
+                is_etf=is_etf,
+                cfg=cfg,
+            )
+            fees = fee_info["fee_amt"]
             net_amt = gross_amt - fees
             net_pct = net_amt / entry_amt * 100.0 if entry_amt > 0 else 0.0
             pos["fees_amt"] = round(fees, 2)
@@ -488,13 +462,7 @@ class T0PositionTracker:
     def get_statistics(self, window_days: Optional[int] = None) -> Dict[str, Any]:
         """按实际结算口径统计做T历史绩效"""
         history = self.load_history()
-        cfg = load_config()
-        cost_model = {
-            "commission_rate": float(cfg.get("t0_commission_rate", 0.00025)),
-            "min_commission": float(cfg.get("t0_min_commission", 5.0)),
-            "stamp_tax_rate": float(cfg.get("t0_stamp_tax_rate", 0.0005)),
-            "slippage_rate": float(cfg.get("t0_slippage_rate", 0.0005)),
-        }
+        cost_model = get_trading_fee_params(load_config())
         if not history:
             return {
                 "sample_size": 0, "win_rate": None, "profit_loss_ratio": None,
@@ -660,7 +628,7 @@ class T0SmartEngine:
         daily_kline: Optional[pd.DataFrame] = None,
         holding_cost: float = 0.0,
         holding_shares: int = 0,
-        available_shares: int = 0,
+        available_shares: Optional[int] = None,
         market_exposure: Optional[float] = None
     ) -> Dict[str, Any]:
         """
@@ -710,21 +678,22 @@ class T0SmartEngine:
         signal_cooldown_minutes = max(1, int(cfg.get("t0_signal_cooldown_minutes", 20)))
 
         holding_shares = max(0, int(holding_shares or 0))
-        if available_shares <= 0 and holding_shares > 0:
-            available_shares = holding_shares
-        available_shares = min(max(0, int(available_shares or 0)), holding_shares)
+        if available_shares is None:
+            avail_shares = holding_shares
+        else:
+            avail_shares = min(max(0, int(available_shares)), holding_shares)
 
-        # 针对 ETF / 宽基低波动品种自适应调整偏离阈值 (ETF天然波动率较小，日内罕见 -1.5% 偏离)
+        # 针对 ETF / 个股读取对应用户配置基准 (配置真实生效，避免后续被硬编码覆写)
         sym_lower = str(symbol).lower()
         is_etf = any(sym_lower.startswith(p) for p in ["sh5", "sz15", "sz16", "sh51", "sh56", "sh58", "sh50", "sz18"])
         if is_etf:
-            bias_buy_thresh = round(bias_buy_thresh * 0.6, 2)
-            bias_sell_thresh = round(bias_sell_thresh * 0.6, 2)
-            take_profit_pct = round(take_profit_pct * 0.6, 2)
-            stop_pct = round(stop_pct * 0.6, 2)
+            bias_buy_thresh = -abs(float(cfg.get("t0_etf_bias_buy", -0.55)))
+            bias_sell_thresh = abs(float(cfg.get("t0_etf_bias_sell", 0.65)))
+            take_profit_pct = float(cfg.get("t0_etf_take_profit_pct", 0.8))
+            stop_pct = float(cfg.get("t0_etf_stop_loss_pct", 0.85))
+            agile_active_pct = float(cfg.get("t0_etf_agile_active", 0.45))
             band_min_pct = round(band_min_pct * 0.6, 2)
             band_max_pct = round(band_max_pct * 0.65, 2)
-            agile_active_pct = round(agile_active_pct * 0.6, 2)
             agile_callback_pct = round(agile_callback_pct * 0.75, 2)
 
         # ---- 交易时段守卫：仅在未传入 df_minute 时拦截非交易时段 ----
@@ -807,71 +776,22 @@ class T0SmartEngine:
         # 2. 严谨多因子趋势通道与牛熊市状态识别 (双均线+斜率+迟滞滤波防频繁切换)
         trend_direction, ma20, regime_reason = evaluate_market_regime(daily_kline, current_price, symbol, as_of_date=None, market_exposure=market_exposure)
 
-        # 自适应非对称倾斜通道与参数分层调整 (针对ETF/个股及牛/反弹/熊/震荡四种形态)
-        if is_etf:
-            if trend_direction == "BEAR":
-                bias_sell_thresh = 0.55
-                bias_buy_thresh = -1.10
-                take_profit_pct = 0.70
-                band_lower_base = 0.80
-                band_upper_base = 0.50
-            elif trend_direction == "BULL":
-                bias_buy_thresh = -0.45
-                bias_sell_thresh = 1.30
-                take_profit_pct = 1.10
-                band_lower_base = 0.45
-                band_upper_base = 1.20
-            elif trend_direction == "REBOUND":
-                bias_buy_thresh = -0.45
-                bias_sell_thresh = 0.95
-                take_profit_pct = 0.90
-                band_lower_base = 0.45
-                band_upper_base = 0.90
-            else:  # NEUTRAL
-                bias_buy_thresh = -0.55
-                bias_sell_thresh = 0.65
-                take_profit_pct = 0.80
-                band_lower_base = 0.55
-                band_upper_base = 0.65
-            agile_active_pct = 0.45
-            min_fee_pct = 0.10
-            stop_pct = 0.85
-            max_intraday_chg_sell = 2.80
-        else:
-            if trend_direction == "BEAR":
-                bias_sell_thresh = 0.85
-                bias_buy_thresh = -1.60
-                take_profit_pct = 1.00
-                band_lower_base = 1.50
-                band_upper_base = 0.80
-            elif trend_direction == "BULL":
-                bias_buy_thresh = -0.75
-                bias_sell_thresh = 2.20
-                take_profit_pct = 1.80
-                band_lower_base = 0.75
-                band_upper_base = 2.00
-            elif trend_direction == "REBOUND":
-                bias_buy_thresh = -0.75
-                bias_sell_thresh = 1.60
-                take_profit_pct = 1.50
-                band_lower_base = 0.75
-                band_upper_base = 1.40
-            else:  # NEUTRAL
-                bias_buy_thresh = -0.90
-                bias_sell_thresh = 1.10
-                take_profit_pct = 1.30
-                band_lower_base = 0.90
-                band_upper_base = 1.10
-            agile_active_pct = 0.70
-            min_fee_pct = 0.25
-            stop_pct = 1.50
-            max_intraday_chg_sell = 4.50
+        # 自适应非对称倾斜通道与参数分层调整：围绕用户配置基准做四象限比例缩放
+        scale = _T0_REGIME_SCALE.get(trend_direction, _T0_REGIME_SCALE["NEUTRAL"])
+        bias_buy_thresh = round(-abs(bias_buy_thresh) * scale["buy"], 2)
+        bias_sell_thresh = round(abs(bias_sell_thresh) * scale["sell"], 2)
+        take_profit_pct = round(max(0.5 if is_etf else 0.7, take_profit_pct * scale["tp"]), 2)
+        band_lower_base = max(band_min_pct, round(abs(bias_buy_thresh) * 0.92, 2))
+        band_upper_base = max(band_min_pct, round(bias_sell_thresh * 0.90, 2))
+        max_intraday_chg_sell = 2.80 if is_etf else 4.50
 
-        # 根据行情状态动态刷新布林带通道
+        # 根据行情状态动态刷新布林带通道 (同时尊重 t0_band_dev_k 与 t0_sell_asymmetry)
         if use_dynamic_boll and vwap > 0 and len(minute_closes) > 0:
             std_intraday = float(np.std(minute_closes) / vwap * 100.0) if len(minute_closes) > 1 else 1.0
-            dyn_lower = round_price_dynamic(vwap * (1.0 - max(band_lower_base, min(std_intraday * 1.1, band_max_pct)) / 100.0), symbol)
-            dyn_upper = round_price_dynamic(vwap * (1.0 + max(band_upper_base, min(std_intraday * 1.1, band_max_pct)) / 100.0), symbol)
+            lower_span = max(band_lower_base, min(std_intraday * band_dev_k, band_max_pct))
+            upper_span = max(band_upper_base, min(std_intraday * band_dev_k * sell_asymmetry, band_max_pct * sell_asymmetry))
+            dyn_lower = round_price_dynamic(vwap * (1.0 - lower_span / 100.0), symbol)
+            dyn_upper = round_price_dynamic(vwap * (1.0 + upper_span / 100.0), symbol)
 
         # 3. 检查现有持仓状态跟踪与冷却期解除
         # 检索当日同向止损风控熔断历史与单日做T频次统计
@@ -904,11 +824,16 @@ class T0SmartEngine:
         active_target = current_price
         active_stop = current_price
         active_entry = current_price
-        available_lot = (available_shares // 100) * 100
-        if is_etf:
-            suggested_shares = max(100, int((available_lot * etf_share_ratio) // 100) * 100) if available_lot >= 100 else 100
+        available_lot = (avail_shares // 100) * 100
+        t1_sell_locked = (holding_shares > 0 and available_lot < 100)
+        if available_lot >= 100:
+            if is_etf:
+                suggested_shares = max(100, int((available_lot * etf_share_ratio) // 100) * 100)
+            else:
+                suggested_shares = available_lot
         else:
-            suggested_shares = available_lot if available_lot >= 100 else 100
+            # 持股但今日可用不足 1 手（T+1 锁定）时严禁赋 100 股兜底；仅纯观察模式(holding_shares==0)给 100 股模拟
+            suggested_shares = 100 if holding_shares == 0 else 0
         active_shares = suggested_shares
 
         in_session = self.is_trading_session()
@@ -948,6 +873,11 @@ class T0SmartEngine:
                 if direction == "BUY_T":
                     curr_profit_pct = (current_price - entry_p) / entry_p * 100.0 if entry_p > 0 else 0.0
                     peak_profit_pct = (peak_p - entry_p) / entry_p * 100.0 if entry_p > 0 else 0.0
+                    rt_fee_pct = calc_round_trip_fees(
+                        entry_price=entry_p, exit_price=current_price,
+                        shares=pos_shares or 100, direction="BUY_T", is_etf=is_etf, cfg=cfg
+                    )["fee_pct"]
+                    eff_min_fee_pct = round(rt_fee_pct + (0.04 if is_etf else 0.05), 3)
 
                     # 1. 触发防守硬止损
                     if round(current_price, 3) <= round(stop_p, 3) + 1e-4:
@@ -955,20 +885,19 @@ class T0SmartEngine:
                         signal_desc = "正T防守止损对冲平仓"
                         reasons.append(f"跌破正T防守底线 {stop_p}元(-{stop_pct}%)，建议立即卖出底仓止损保护！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
-                    # 2. 敏捷动态移动止盈 (严格扣费后正净利保护，A股个股0.85%起步，ETF 0.6%起步，防止扣费反噬负利)
-                    elif agile_trailing_enabled and peak_profit_pct >= (etf_agile_active if is_etf else max(agile_active_pct, 0.70)) and (peak_profit_pct - curr_profit_pct) >= _get_agile_callback(peak_profit_pct):
+                    # 2. 敏捷动态移动止盈 (按实际股数与最低 5 元佣金算得净保本门槛，彻底杜绝毛盈净亏)
+                    elif agile_trailing_enabled and peak_profit_pct >= agile_active_pct and (peak_profit_pct - curr_profit_pct) >= _get_agile_callback(peak_profit_pct):
                         eff_cb = _get_agile_callback(peak_profit_pct)
-                        min_fee_pct = 0.08 if is_etf else 0.25
-                        if curr_profit_pct > min_fee_pct:
+                        if curr_profit_pct > eff_min_fee_pct:
                             signal_action = "CLOSE_T"
                             signal_desc = "正T敏捷移动止盈对冲平仓"
                             tier_info = f"阶梯回落{eff_cb:.2f}%" if agile_trailing_tiered else f"回落{agile_callback_pct}%"
-                            reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后{tier_info}且扣费净利润锁定，敏捷移动锁定做T利润，摊薄持仓成本！")
+                            reasons.append(f"日内冲高至 {peak_p}元(+{peak_profit_pct:.2f}%)后{tier_info}且扣费(约{rt_fee_pct:.2f}%)净利润锁定，敏捷移动锁定做T利润，摊薄持仓成本！")
                             self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
                         else:
                             signal_action = "HOLDING_T"
-                            signal_desc = f"正T盈利冲高中 (当前浮动: +{curr_profit_pct:.2f}%)"
-                    # 2.1 横盘钝化保本减负平仓 (持仓超120分钟且下午14:00后平价锁定，规避尾盘强制平仓摩擦)
+                            signal_desc = f"正T盈利冲高中 (当前浮动: +{curr_profit_pct:.2f}%, 需越过含5元低佣成本 {eff_min_fee_pct:.2f}%)"
+                    # 2.1 横盘钝化保本减负平仓 (持仓超120分钟且下午14:00后扣费保本锁定，规避尾盘强制平仓摩擦)
                     elif current_hm >= "14:00" and existing_pos.get("entry_time"):
                         dur_mins = 0
                         try:
@@ -977,10 +906,10 @@ class T0SmartEngine:
                                 dur_mins = (int(current_hm[:2]) * 60 + int(current_hm[3:5])) - (int(e_ts[:2]) * 60 + int(e_ts[3:5]))
                         except Exception:
                             pass
-                        if dur_mins >= 120 and abs(curr_profit_pct) <= 0.35 and curr_profit_pct >= 0.05:
+                        if dur_mins >= 120 and abs(curr_profit_pct) <= max(0.50, rt_fee_pct + 0.15) and curr_profit_pct > rt_fee_pct:
                             signal_action = "CLOSE_T"
                             signal_desc = "正T横盘钝化·保本减负平仓"
-                            reasons.append(f"做T持仓已达{dur_mins}分钟且持续横盘钝化，在平价成本线微利平仓，平稳释放底仓并规避尾盘被动强平")
+                            reasons.append(f"做T持仓已达{dur_mins}分钟且持续横盘钝化，在扣费成本线(+{curr_profit_pct:.2f}% > {rt_fee_pct:.2f}%)微利平仓，平稳释放底仓并规避尾盘被动强平")
                             self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
                     # 3. 冲高回落动态浮动对冲止盈
                     elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
@@ -1001,6 +930,11 @@ class T0SmartEngine:
                 elif direction == "SELL_T":
                     curr_profit_pct = (entry_p - current_price) / entry_p * 100.0 if entry_p > 0 else 0.0
                     peak_profit_pct = (entry_p - peak_p) / entry_p * 100.0 if entry_p > 0 else 0.0
+                    rt_fee_pct = calc_round_trip_fees(
+                        entry_price=entry_p, exit_price=current_price,
+                        shares=pos_shares or 100, direction="SELL_T", is_etf=is_etf, cfg=cfg
+                    )["fee_pct"]
+                    eff_min_fee_pct = round(rt_fee_pct + (0.04 if is_etf else 0.05), 3)
 
                     # 1. 突破防守线止损买回
                     if round(current_price, 3) >= round(stop_p, 3) - 1e-4:
@@ -1008,19 +942,18 @@ class T0SmartEngine:
                         signal_desc = "倒T反抽止损买回归位"
                         reasons.append(f"价格反抽冲破防守线 {stop_p}元，为防底仓抛飞，建议立即以市价买回等量底仓（{pos_shares}股）止损对冲！")
                         self.tracker.close_position(symbol, "STOPPED", current_price, reasons[-1])
-# 2. 敏捷动态移动止盈 (严格扣费后正净利保护，A股个股0.85%起步，ETF 0.6%起步)
-                    elif agile_trailing_enabled and peak_profit_pct >= (etf_agile_active if is_etf else max(agile_active_pct, 0.70)) and (peak_profit_pct - curr_profit_pct) >= _get_agile_callback(peak_profit_pct):
+                    # 2. 敏捷动态移动止盈 (按实际股数与最低 5 元佣金算得净保本门槛，防止小仓位毛盈净亏)
+                    elif agile_trailing_enabled and peak_profit_pct >= agile_active_pct and (peak_profit_pct - curr_profit_pct) >= _get_agile_callback(peak_profit_pct):
                         eff_cb = _get_agile_callback(peak_profit_pct)
-                        min_fee_pct = 0.08 if is_etf else 0.25
-                        if curr_profit_pct > min_fee_pct:
+                        if curr_profit_pct > eff_min_fee_pct:
                             signal_action = "CLOSE_T"
                             signal_desc = "倒T敏捷移动止盈买回平仓"
                             tier_info = f"阶梯回升{eff_cb:.2f}%" if agile_trailing_tiered else f"回升{agile_callback_pct}%"
-                            reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后{tier_info}且扣费净利润锁定，敏捷买回等量底仓锁定差价，摊薄持仓成本！")
+                            reasons.append(f"日内下探至 {peak_p}元(+{peak_profit_pct:.2f}%)后{tier_info}且扣费(约{rt_fee_pct:.2f}%)净利润锁定，敏捷买回等量底仓锁定差价，摊薄持仓成本！")
                             self.tracker.close_position(symbol, "FINISHED", current_price, reasons[-1])
                         else:
                             signal_action = "HOLDING_T"
-                            signal_desc = f"倒T浮盈持有中 (当前价差: +{curr_profit_pct:.2f}%)"
+                            signal_desc = f"倒T浮盈持有中 (当前价差: +{curr_profit_pct:.2f}%, 需越过含5元低佣成本 {eff_min_fee_pct:.2f}%)"
                     # 3. 探底回升动态止盈
                     elif peak_profit_pct >= take_profit_pct and (peak_profit_pct - curr_profit_pct) >= trailing_pct:
                         signal_action = "CLOSE_T"
@@ -1107,7 +1040,10 @@ class T0SmartEngine:
                 slope_thresh_buy = max_vwap_slope_pct * 0.5 if is_etf else max_vwap_slope_pct
                 vwap_slope_blocked_buy = vwap_slope_filter and (vwap_slope_pct is not None) and (vwap_slope_pct < -slope_thresh_buy)
 
-                if "BUY_T" in today_stopped_dirs:
+                if t1_sell_locked:
+                    signal_desc = "T+1锁定无旧底仓·暂停正T"
+                    reasons.append(f"当前持仓 {holding_shares}股 今日可用可卖为 {avail_shares}股（不足1手/T+1锁定），尾盘无法卖出旧底仓对冲闭环，禁止正T演变成被动加仓")
+                elif "BUY_T" in today_stopped_dirs:
                     signal_desc = "今日正T已止损·触发风控熔断"
                     reasons.append("该标的今日此前已触发正T防守止损，表明处于强单边下泄行情，日内暂停同向做T防范二次磨损")
                 elif early_morning_buy_blocked:
@@ -1174,7 +1110,10 @@ class T0SmartEngine:
                 intraday_chg_from_open = (current_price - open_p) / open_p * 100.0 if open_p > 0 else 0.0
                 momentum_surge_blocked = (intraday_chg_from_open > max_intraday_chg_sell)
 
-                if "SELL_T" in today_stopped_dirs:
+                if t1_sell_locked:
+                    signal_desc = "T+1锁定不可卖·禁止倒T"
+                    reasons.append(f"当前持仓 {holding_shares}股 中今日可用可卖数量为 {avail_shares}股（不足1手/T+1锁定），严禁发出倒T卖出信号")
+                elif "SELL_T" in today_stopped_dirs:
                     signal_desc = "今日倒T已止损·触发风控熔断"
                     reasons.append("该标的今日此前已触发倒T防守止损，表明处于强单边主升行情，日内暂停同向做T防范再次卖飞")
                 elif early_short_blocked:
@@ -1193,8 +1132,6 @@ class T0SmartEngine:
                     signal_desc = "触及高抛上轨·等待分时滞涨"
                     reasons.append(f"现价冲高触及动态上轨({dyn_upper}元)，但{rev_sell_msg}，等待滞涨形态")
                 elif divergence_filter_enabled and not sell_div and trend_direction != "BEAR":
-                    signal_desc = "触及高抛上轨·等待动能拐点共振"
-                    reasons.append(f"价格冲高触及动态上轨({dyn_upper}元)，但分时MACD红柱尚未收窄衰竭，等待滞涨拐点共振")
                     signal_desc = "触及高抛上轨·等待动能拐点共振"
                     reasons.append(f"价格冲高触及动态上轨({dyn_upper}元)，但分时MACD红柱尚未收窄衰竭，等待滞涨拐点共振")
                 else:

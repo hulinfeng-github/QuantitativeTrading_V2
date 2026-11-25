@@ -7,38 +7,85 @@ A股智能量化系统 2.0 - 收盘全景复盘与参数自进化引擎 (ReviewE
 4. 参数闭环自我迭代微调 (Self-Optimization)；
 5. 生成专业级 Markdown 长文复盘报告与图文卡片。
 """
-import os
 import json
 import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
 from config import (
-    DATA_DIR, load_config, save_config,
+    load_config, save_config,
     SIGNALS_FILE, WATCHLIST_FILE, REVIEW_FILE, OPTIMIZATION_FILE
 )
-from core.persistence import atomic_write_json, safe_read_json
+from core.logger import get_logger
+from core.persistence import atomic_write_json, load_watchlist, safe_read_json
 from core.data_engine import data_engine
 from core.sentiment_radar import sentiment_radar
 from core.multi_factor_strategy import multi_factor_strategy
+
+logger = get_logger("review_engine")
 
 class ReviewEngineV2:
     def __init__(self):
         pass
 
-    def run_daily_review(self, auto_optimize: bool = True) -> Dict[str, Any]:
-        """执行收盘全景量化复盘与自迭代"""
-        today_str = datetime.now().strftime("%Y-%m-%d")
+    @staticmethod
+    def _format_watchlist_review_row(w: Dict[str, Any]) -> str:
+        """统一格式化自选与持仓体检表行，避免停牌或无报价时误报 -100% 巨亏警报。"""
+        cost = float(w.get("holding_cost") or 0.0)
+        price = float(w.get("price") or 0.0)
+        raw_pnl_pct = w.get("pnl_pct")
+        raw_pnl_amt = w.get("pnl_amt")
+        pnl_pct = float(raw_pnl_pct) if raw_pnl_pct is not None else None
+        pnl_amt = float(raw_pnl_amt) if raw_pnl_amt is not None else None
+        shares = int(w.get("holding_shares") or 0)
+        status = w.get("control_status", "平稳")
+        price_available = bool(w.get("price_available", price > 0)) and price > 0
+
+        if not price_available:
+            price_str = "停牌/无报价"
+            chg_str = "-"
+            advice_str = "⏸️ 行情缺失·观望" if shares > 0 else "🔍 观察池标的"
+            cost_str = (f"{cost:.3f}元" if cost < 10 else f"{cost:.2f}元") if (shares > 0 and cost > 0) else "-"
+            pnl_str = "-"
+        else:
+            price_str = f"{price:.3f}元" if price < 10 else f"{price:.2f}元"
+            chg_str = f"{float(w.get('change_pct') or 0.0):+.2f}%"
+            if shares > 0:
+                if status == "主力破位杀跌" or (pnl_pct is not None and pnl_pct <= -8.0):
+                    advice_str = "🚨 破位杀跌·建议止损减仓"
+                elif status == "主力突破起爆":
+                    advice_str = "🚀 主力起爆·顺势持有"
+                elif status == "主力吸筹蓄势":
+                    advice_str = "🛡️ 密集蓄势·持有观望"
+                else:
+                    advice_str = "👀 区间震荡·结合做T"
+                cost_str = (f"{cost:.3f}元" if cost < 10 else f"{cost:.2f}元") if cost > 0 else "-"
+                if pnl_pct is not None and pnl_amt is not None and cost > 0:
+                    pnl_str = f"{pnl_pct:+.2f}% ({pnl_amt:+.0f}元)"
+                else:
+                    pnl_str = "-"
+            else:
+                advice_str = "🔍 观察池标的"
+                cost_str = "-"
+                pnl_str = "-"
+
+        return f"| {w['name']}({w['symbol']}) | {price_str} | {chg_str} | {cost_str} | {pnl_str} | {w.get('score', 50)}分 | {status} | {advice_str} |"
+
+    def run_daily_review(self, auto_optimize: bool = True, target_date: Optional[str] = None) -> Dict[str, Any]:
+        """执行收盘全景量化复盘与自迭代（断档补算时支持显式传入目标交易日 target_date）。"""
+        today_str = (str(target_date).strip()[:10] if target_date else datetime.now().strftime("%Y-%m-%d"))
         now_time = datetime.now().strftime("%H:%M:%S")
 
-        print(f"[{now_time}] 启动 2.0 收盘全景量化复盘与自我演进分析...")
+        logger.info(f"[{now_time}] 启动 2.0 收盘全景量化复盘与自我演进分析...")
 
         # 1. 市场宏观情绪复盘
         market_analysis = sentiment_radar.analyze_market_regime()
+        market_regime_bull = bool(
+            market_analysis.get("data_available") and market_analysis.get("target_exposure", 0.0) >= 0.65
+        )
 
         # 2. 自选持仓深度体检
-        watchlist_review = self._review_watchlist()
+        watchlist_review = self._review_watchlist(market_regime_bull=market_regime_bull)
 
         # 3. 历史信号胜率核查
         signal_tracking = self._track_recent_signals(days_window=10)
@@ -51,7 +98,7 @@ class ReviewEngineV2:
             limit_up_review_res = limit_up_engine.review_and_update_trades(today_str)
             limit_up_stats = limit_up_engine.calculate_model_stats()
         except Exception as e:
-            print(f"游资打板复盘结算异常: {e}")
+            logger.warning(f"游资打板复盘结算异常: {e}")
 
         # 5. 执行参数自迭代调优
         auto_optimize = bool(auto_optimize and load_config().get("review_auto_optimize_enabled", True))
@@ -87,16 +134,11 @@ class ReviewEngineV2:
         self._save_review_history(review_data)
         return review_data
 
-    def _review_watchlist(self) -> List[Dict[str, Any]]:
-        """对自选股进行逐一收盘诊断"""
+    def _review_watchlist(self, market_regime_bull: Optional[bool] = None) -> List[Dict[str, Any]]:
+        """对自选股进行逐一收盘诊断（使用锁保护读取，并在停牌/报价缺失时避免 -100% 误算）。"""
         results = []
-        if not WATCHLIST_FILE.exists():
-            return results
-
-        try:
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                items = json.load(f)
-        except Exception:
+        items = load_watchlist(WATCHLIST_FILE)
+        if not items:
             return results
 
         symbols = [item.get("symbol") for item in items if item.get("symbol")]
@@ -108,18 +150,37 @@ class ReviewEngineV2:
             cost = float(item.get("holding_cost") or item.get("entry_price") or 0.0)
             shares = int(item.get("holding_shares") or item.get("shares") or 0)
 
-            q = quotes.get(sym, {})
-            price = q.get("price", 0.0)
-            change_pct = q.get("change_pct", 0.0)
+            q = quotes.get(sym, {}) or {}
+            price = float(q.get("price") or 0.0)
+            change_pct = float(q.get("change_pct") or 0.0)
 
-            # 获取日K进行多因子评估
+            # 获取日K进行多因子评估，同时作为实时快照缺失时的最近收盘价兜底
             df = data_engine.get_daily_kline(sym, count=120)
+            if price <= 0 and df is not None and len(df) > 0:
+                try:
+                    last_close = float(df.iloc[-1]["close"])
+                    if last_close > 0:
+                        price = last_close
+                        if len(df) >= 2 and float(df.iloc[-2]["close"]) > 0:
+                            prev_c = float(df.iloc[-2]["close"])
+                            change_pct = round((last_close - prev_c) / prev_c * 100.0, 2)
+                except (KeyError, TypeError, ValueError):
+                    pass
+
+            price_available = price > 0
             analysis = None
             if df is not None and len(df) >= 30:
-                analysis = multi_factor_strategy.analyze(sym, name, df)
+                analysis = multi_factor_strategy.analyze(sym, name, df, market_regime_bull=market_regime_bull)
 
-            pnl_pct = round((price - cost) / cost * 100.0, 2) if cost > 0 else 0.0
-            pnl_amt = round((price - cost) * shares, 2) if cost > 0 else 0.0
+            if price_available and cost > 0:
+                pnl_pct: Optional[float] = round((price - cost) / cost * 100.0, 2)
+                pnl_amt: Optional[float] = round((price - cost) * shares, 2)
+            elif not price_available and cost > 0:
+                pnl_pct = None
+                pnl_amt = None
+            else:
+                pnl_pct = 0.0
+                pnl_amt = 0.0
 
             results.append({
                 "symbol": sym,
@@ -127,6 +188,7 @@ class ReviewEngineV2:
                 "holding_cost": cost,
                 "holding_shares": shares,
                 "price": price,
+                "price_available": price_available,
                 "change_pct": change_pct,
                 "pnl_pct": pnl_pct,
                 "pnl_amt": pnl_amt,
@@ -141,13 +203,8 @@ class ReviewEngineV2:
 
     def _track_recent_signals(self, days_window: int = 10) -> Dict[str, Any]:
         """统计近期买点与做T信号的前向行情变化，不代表实际成交表现。"""
-        if not SIGNALS_FILE.exists():
-            return {"total_signals": 0, "win_rate": None, "avg_return": None, "details": []}
-
-        try:
-            with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-                signals = json.load(f)
-        except Exception:
+        signals = safe_read_json(SIGNALS_FILE, []) if SIGNALS_FILE.exists() else []
+        if not isinstance(signals, list):
             signals = []
 
         # Exclude test identifiers from the signal-tracking sample.
@@ -269,34 +326,21 @@ class ReviewEngineV2:
                 "is_win": is_win
             })
 
-        # 当已结算历史信号样本不足30笔时，自动融合2:30尾盘策略与多因子策略前向实盘回测基准样本库，
-        # 确保大盘复盘与参数自进化拥有充足、真实的样本依据，杜绝“样本不足”拒绝调优或展示空白
+        # 仅统计真实推送历史中的已结算前向表现，禁止混入 2:30 离线回测交易触发 RSRS/ATR 参数自进化
+        tail_backtest_ref: Optional[Dict[str, Any]] = None
         if len(verified) < 30:
             try:
                 from core.strategy_tail_230 import tail_strategy_230
                 tail_backtest = tail_strategy_230.get_cached_or_run_backtest()
                 recent_trades = tail_backtest.get("recent_trades", [])
-                for t in recent_trades:
-                    if len(verified) >= 30:
-                        break
-                    t_sym = t.get("symbol", "")
-                    t_date = t.get("signal_date", "")
-                    if any(v["symbol"] == t_sym and v["date"] == t_date for v in verified):
-                        continue
-                    v_item = {
-                        "symbol": t_sym,
-                        "name": t.get("name", t_sym),
-                        "date": t_date,
-                        "rec_price": t.get("buy_price", 0.0),
-                        "current_price": t.get("sell_price", 0.0),
-                        "return_pct": t.get("return_pct", 0.0),
-                        "is_win": bool(t.get("is_win", False))
+                if recent_trades:
+                    tail_backtest_ref = {
+                        "total_trades": len(recent_trades),
+                        "win_rate": tail_backtest.get("win_rate"),
+                        "avg_return_pct": tail_backtest.get("avg_return_pct"),
                     }
-                    if v_item["is_win"]:
-                        win_count += 1
-                    verified.append(v_item)
             except Exception as e:
-                print(f"[ReviewEngine] 补充尾盘策略回测样本异常: {e}")
+                logger.warning(f"读取尾盘策略参考统计异常: {e}")
 
         win_rate = round(win_count / len(verified) * 100.0, 1) if verified else None
         avg_ret = round(float(np.mean([x["return_pct"] for x in verified])), 2) if verified else None
@@ -305,7 +349,8 @@ class ReviewEngineV2:
             "total_signals": len(verified),
             "win_rate": win_rate,
             "avg_return": avg_ret,
-            "details": verified
+            "details": verified,
+            "tail230_backtest_ref": tail_backtest_ref,
         }
 
     def _self_optimize_parameters(
@@ -425,32 +470,7 @@ class ReviewEngineV2:
             md.append("| 标的 | 收盘价 | 今日涨跌 | 持仓成本 | 浮动盈亏 | 综合评分 | 筹码状态 | 操盘建议 |")
             md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
             for w in watchlist:
-                cost = float(w.get('holding_cost', 0.0))
-                price = float(w.get('price', 0.0))
-                pnl_pct = float(w.get('pnl_pct', 0.0))
-                pnl_amt = float(w.get('pnl_amt', 0.0))
-                shares = int(w.get('holding_shares', 0))
-                status = w.get('control_status', '平稳')
-
-                # 明日建议
-                if shares > 0:
-                    if status == "主力破位杀跌" or pnl_pct <= -8.0:
-                        advice_str = "🚨 破位杀跌·建议止损减仓"
-                    elif status == "主力突破起爆":
-                        advice_str = "🚀 主力起爆·顺势持有"
-                    elif status == "主力吸筹蓄势":
-                        advice_str = "🛡️ 密集蓄势·持有观望"
-                    else:
-                        advice_str = "👀 区间震荡·结合做T"
-                    cost_str = f"{cost:.3f}元" if cost < 10 else f"{cost:.2f}元"
-                    pnl_str = f"{pnl_pct:+.2f}% ({pnl_amt:+.0f}元)"
-                else:
-                    advice_str = "🔍 观察池标的"
-                    cost_str = "-"
-                    pnl_str = "-"
-
-                price_str = f"{price:.3f}元" if price < 10 else f"{price:.2f}元"
-                md.append(f"| {w['name']}({w['symbol']}) | {price_str} | {w['change_pct']:+.2f}% | {cost_str} | {pnl_str} | {w['score']}分 | {status} | {advice_str} |")
+                md.append(self._format_watchlist_review_row(w))
         else:
             md.append("暂无自选监控标的。")
         md.append("")
@@ -492,8 +512,8 @@ class ReviewEngineV2:
                     f"平均 **{st['avg_pnl_pct']:+.2f}%** (盈 {st['avg_win_pct']:+.2f}% / 亏 {st['avg_loss_pct']:+.2f}%) | "
                     f"盈亏因子 **{pf if pf is not None else '∞'}** (净口径，含费用估算，非实盘)"
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"读取做T绩效摘要异常: {e}")
         md.append("")
 
         # 4. 游资龙虎打板模型复盘与隔日溢价战绩
@@ -589,31 +609,7 @@ class ReviewEngineV2:
             md.append("| 标的 | 收盘价 | 今日涨跌 | 持仓成本 | 浮动盈亏 | 综合评分 | 筹码状态 | 操盘建议 |")
             md.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
             for w in group_watchlist:
-                cost = float(w.get('holding_cost', 0.0))
-                price = float(w.get('price', 0.0))
-                pnl_pct = float(w.get('pnl_pct', 0.0))
-                pnl_amt = float(w.get('pnl_amt', 0.0))
-                shares = int(w.get('holding_shares', 0))
-                status = w.get('control_status', '平稳')
-
-                if shares > 0:
-                    if status == "主力破位杀跌" or pnl_pct <= -8.0:
-                        advice_str = "🚨 破位杀跌·建议止损减仓"
-                    elif status == "主力突破起爆":
-                        advice_str = "🚀 主力起爆·顺势持有"
-                    elif status == "主力吸筹蓄势":
-                        advice_str = "🛡️ 密集蓄势·持有观望"
-                    else:
-                        advice_str = "👀 区间震荡·结合做T"
-                    cost_str = f"{cost:.3f}元" if cost < 10 else f"{cost:.2f}元"
-                    pnl_str = f"{pnl_pct:+.2f}% ({pnl_amt:+.0f}元)"
-                else:
-                    advice_str = "🔍 观察池标的"
-                    cost_str = "-"
-                    pnl_str = "-"
-
-                price_str = f"{price:.3f}元" if price < 10 else f"{price:.2f}元"
-                md.append(f"| {w['name']}({w['symbol']}) | {price_str} | {w['change_pct']:+.2f}% | {cost_str} | {pnl_str} | {w['score']}分 | {status} | {advice_str} |")
+                md.append(self._format_watchlist_review_row(w))
         else:
             md.append("本组暂无关联自选标的。可在 Web 界面将自选股划入此分组。")
         md.append("")
@@ -658,8 +654,8 @@ class ReviewEngineV2:
                         f"- **做T累计绩效**: {st['total_trades']} 笔 | 胜率 **{st['win_rate']}%** | "
                         f"平均 **{st['avg_pnl_pct']:+.2f}%** | 盈亏因子 **{pf if pf is not None else '∞'}** (净口径，含费用估算，非实盘)"
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"读取分组做T绩效摘要异常: {e}")
             md.append("")
 
         # 4. 游资龙虎打板模型复盘与隔日溢价战绩 (如果启用了 push_limitup)
@@ -718,10 +714,11 @@ class ReviewEngineV2:
             if rev_date:
                 history = [h for h in history if h.get("date") != rev_date]
             history.insert(0, review_data)
+            history.sort(key=lambda x: str(x.get("date") or ""), reverse=True)
             history = history[:30]  # 保留近30次
             atomic_write_json(REVIEW_FILE, history)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"保存复盘历史失败: {e}")
 
     def _save_optimization_log(self, opt_entry: Dict[str, Any]):
         try:
@@ -731,7 +728,7 @@ class ReviewEngineV2:
             logs.insert(0, opt_entry)
             logs = logs[:50]
             atomic_write_json(OPTIMIZATION_FILE, logs)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"保存参数自迭代日志失败: {e}")
 
 review_engine_v2 = ReviewEngineV2()

@@ -10,14 +10,15 @@ import json
 import time
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime
 
-from config import DATA_DIR, load_config
+from config import DATA_DIR, calc_round_trip_fees
 from core.data_engine import data_engine
 from core.alpha_factors import calculate_alpha_features
 from core.rsrs_skew import calculate_rsrs_skew
 from core.multi_factor_strategy import multi_factor_strategy
+from core.persistence import atomic_write_json
 
 SIGNAL_STATS_FILE = DATA_DIR / "signal_stats.json"
 SIGNAL_RECORDS_FILE = DATA_DIR / "signal_records.json"
@@ -25,27 +26,26 @@ SIGNAL_RECORDS_FILE = DATA_DIR / "signal_records.json"
 VETO_STATUS = ("主力破位杀跌", "主力高位派发风险")
 
 
-def _friction(entry_price: float, exit_price: float, shares: int = 100) -> float:
-    cfg = load_config()
-    comm_r = float(cfg.get("commission_rate", 0.00025))
-    min_comm = float(cfg.get("min_commission", 5.0))
-    stamp_r = float(cfg.get("stamp_duty_rate", 0.0005))
-    slip_r = float(cfg.get("slippage_rate", 0.0005))
-    entry_amt = entry_price * shares
-    exit_amt = exit_price * shares
-    comm_entry = max(min_comm, entry_amt * comm_r)
-    comm_exit = max(min_comm, exit_amt * comm_r)
-    stamp = exit_amt * stamp_r
-    slip = (entry_amt + exit_amt) * slip_r
-    fees = comm_entry + comm_exit + stamp + slip
-    return fees / entry_amt * 100.0
+def _friction(entry_price: float, exit_price: float, shares: int = 100, is_etf: bool = False) -> float:
+    return calc_round_trip_fees(
+        entry_price=entry_price,
+        exit_price=exit_price,
+        shares=shares,
+        direction="BUY_T",
+        is_etf=is_etf,
+    )["fee_pct"]
 
 
 def _simulate_exit(df: pd.DataFrame, start_idx: int, end_idx: int,
                    entry: float, target: float, stop: float) -> tuple:
+    last_tradable_close = None
     for j in range(start_idx, min(end_idx, len(df) - 1) + 1):
         bar = df.iloc[j]
+        vol = float(bar.get("volume", 1.0) or 0.0)
+        if vol <= 0:
+            continue
         o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"])
+        last_tradable_close = float(bar["close"])
         if o >= target:
             return o, "开盘止盈"
         if o <= stop:
@@ -56,6 +56,8 @@ def _simulate_exit(df: pd.DataFrame, start_idx: int, end_idx: int,
             return target, "触目标"
         if l <= stop:
             return stop, "触止损"
+    if last_tradable_close is not None:
+        return last_tradable_close, "期末平仓"
     last = df.iloc[min(end_idx, len(df) - 1)]
     return float(last["close"]), "期末平仓"
 
@@ -185,7 +187,8 @@ def run_cross_sectional_stats(
             if res.get("control_status") in VETO_STATUS:
                 continue
             entry = float(df_calc.iloc[i + 1]["open"])
-            if entry <= 0:
+            entry_vol = float(df_calc.iloc[i + 1].get("volume", 1.0) or 0.0)
+            if entry <= 0 or entry_vol <= 0:
                 continue
             levels = res.get("trade_levels", {})
             target = float(levels.get("target_price") or close_i * 1.08)
@@ -208,12 +211,8 @@ def run_cross_sectional_stats(
             elif res.get("signal_type") == "SELL":
                 sell_signals.append(rec)
 
-    # 保存逐条记录
-    try:
-        with open(SIGNAL_RECORDS_FILE, "w", encoding="utf-8") as f:
-            json.dump(records, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"保存信号记录失败: {e}")
+    # 保存逐条记录 (原子写防截断)
+    atomic_write_json(SIGNAL_RECORDS_FILE, records, indent=None)
 
     gs = grid_search(records)
 
@@ -227,11 +226,7 @@ def run_cross_sectional_stats(
         "grid_search": gs,
         "note": "T日收盘信号、T+1开盘撮合、未来5日按目标/止损/期末收盘估算；含双边佣金/印花税/滑点；非实盘盈亏",
     }
-    try:
-        with open(SIGNAL_STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"保存信号统计失败: {e}")
+    atomic_write_json(SIGNAL_STATS_FILE, result, indent=2)
     return result
 
 

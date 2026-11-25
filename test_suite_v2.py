@@ -15,6 +15,7 @@ A股智能量化系统 2.0 - 全链路高覆盖度自动化测试套件 (TestSui
 """
 import sys
 import unittest
+import tests_support  # noqa: F401 - 必须在 config/core 导入前隔离测试数据目录
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -26,7 +27,7 @@ if sys.platform.startswith('win') and hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-from config import load_config, DEFAULT_CONFIG
+from config import BASE_DIR, DATA_DIR, load_config, DEFAULT_CONFIG
 from core.data_engine import data_engine
 from core.alpha_factors import calculate_alpha_features
 from core.rsrs_skew import calculate_rsrs_skew
@@ -200,6 +201,11 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         self.assertTrue(advice["allowed"])
         self.assertTrue(advice["suggested_shares"] >= 100)
         self.assertEqual(advice["suggested_shares"] % 100, 0)  # 整手
+        self.assertGreater(advice["position_pct"], 0.0)
+        self.assertLessEqual(advice["position_pct"], 25.0)
+        self.assertLessEqual(advice["suggested_capital"], 100000.0 * 0.25)
+        self.assertLessEqual(advice["risk_at_stop_pct"], 0.55)
+        self.assertNotEqual(DATA_DIR.resolve(), (BASE_DIR / "storage").resolve())
         print(f"  -> 仓位配比通过: 建议买入 {advice['suggested_shares']}股 (配比 {advice['position_pct']}%, 约 {advice['suggested_capital']}元)")
 
     def test_09_backtest_causality(self):

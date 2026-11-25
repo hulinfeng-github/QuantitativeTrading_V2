@@ -7,14 +7,19 @@ A股智能量化系统 2.0 - 做T标的分组与多钉钉群分流推送管理�
 4. 自选股与持仓标的的分组归属、支持不同分组包含重合股票 (多对多关联与精准多群分流)；
 5. 分组消息独立测试推送与连通性自检。
 """
-import json
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 
 from config import T0_GROUPS_FILE, WATCHLIST_FILE, load_config
-from core.persistence import atomic_write_json
+from core.persistence import (
+    atomic_write_json,
+    load_watchlist,
+    safe_read_json,
+    save_watchlist,
+)
 from notifier.dingtalk import DingTalkNotifier
 
 DEFAULT_MODULE_SWITCHES = {
@@ -29,75 +34,63 @@ class T0GroupManager:
     def __init__(self, storage_file: Optional[Path] = None, watchlist_file: Optional[Path] = None):
         self.storage_file = storage_file or T0_GROUPS_FILE
         self.watchlist_file = watchlist_file or WATCHLIST_FILE
+        self._lock = threading.RLock()
         self._ensure_initialized()
 
     def _ensure_initialized(self):
         """若分组配置文件不存在，则自动初始化（若存在全局钉钉配置则预填默认分组）"""
-        if not self.storage_file.exists():
-            cfg = load_config()
-            global_webhook = cfg.get("dingtalk_webhook", "").strip()
-            global_secret = cfg.get("dingtalk_secret", "").strip()
-            
-            initial_groups = [
-                {
-                    "id": "group_default",
-                    "name": "默认做T组",
-                    "dingtalk_webhook": global_webhook,
-                    "dingtalk_secret": global_secret,
-                    "enabled": True,
-                    "notes": "系统预设做T分组 (关联全局默认钉钉机器人)",
-                    "push_t0": True,
-                    "push_screener": True,
-                    "push_tail230": True,
-                    "push_limitup": True,
-                    "push_review": True,
-                    "stock_symbols": [],
-                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-            ]
-            try:
-                self.storage_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.storage_file, "w", encoding="utf-8") as f:
-                    json.dump(initial_groups, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[T0GroupManager] 初始化分组文件失败: {e}")
+        with self._lock:
+            if not self.storage_file.exists():
+                cfg = load_config()
+                global_webhook = cfg.get("dingtalk_webhook", "").strip()
+                global_secret = cfg.get("dingtalk_secret", "").strip()
+                
+                initial_groups = [
+                    {
+                        "id": "group_default",
+                        "name": "默认做T组",
+                        "dingtalk_webhook": global_webhook,
+                        "dingtalk_secret": global_secret,
+                        "enabled": True,
+                        "notes": "系统预设做T分组 (关联全局默认钉钉机器人)",
+                        "push_t0": True,
+                        "push_screener": True,
+                        "push_tail230": True,
+                        "push_limitup": True,
+                        "push_review": True,
+                        "stock_symbols": [],
+                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                ]
+                atomic_write_json(self.storage_file, initial_groups)
 
     def _read_raw_groups(self) -> List[Dict[str, Any]]:
-        if not self.storage_file.exists():
-            self._ensure_initialized()
-        try:
-            with open(self.storage_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    # 确保旧数据平滑升级，拥有所有模块开关与股票列表默认值
-                    for g in data:
-                        for k, v in DEFAULT_MODULE_SWITCHES.items():
-                            if k not in g:
-                                g[k] = v
-                        if "stock_symbols" not in g or not isinstance(g["stock_symbols"], list):
-                            g["stock_symbols"] = []
-                    return data
-        except Exception as e:
-            print(f"[T0GroupManager] 读取分组配置异常: {e}")
-        return []
+        with self._lock:
+            if not self.storage_file.exists():
+                self._ensure_initialized()
+            data = safe_read_json(self.storage_file, [])
+            if isinstance(data, list):
+                # 确保旧数据平滑升级，拥有所有模块开关与股票列表默认值
+                for g in data:
+                    if not isinstance(g, dict):
+                        continue
+                    for k, v in DEFAULT_MODULE_SWITCHES.items():
+                        if k not in g:
+                            g[k] = v
+                    if "stock_symbols" not in g or not isinstance(g["stock_symbols"], list):
+                        g["stock_symbols"] = []
+                return data
+            return []
 
     def _save_raw_groups(self, groups: List[Dict[str, Any]]) -> bool:
-        return atomic_write_json(self.storage_file, groups)
+        with self._lock:
+            return atomic_write_json(self.storage_file, groups)
 
     def _read_watchlist(self) -> List[Dict[str, Any]]:
-        if not self.watchlist_file.exists():
-            return []
-        try:
-            with open(self.watchlist_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            pass
-        return []
+        return load_watchlist(self.watchlist_file)
 
     def _save_watchlist(self, watchlist: List[Dict[str, Any]]) -> bool:
-        return atomic_write_json(self.watchlist_file, watchlist)
+        return save_watchlist(self.watchlist_file, watchlist)
 
     def get_groups(self, include_stocks: bool = True) -> List[Dict[str, Any]]:
         """获取所有分组详情，包含各组关联的股票信息与统计（支持不同分组包含重合股票）"""
@@ -194,127 +187,127 @@ class T0GroupManager:
         push_t0, push_screener, push_tail230, push_limitup, push_review,
         stock_symbols (关联股票代码列表)
         """
-        groups = self._read_raw_groups()
-        gid = data.get("id", "").strip()
-        name = data.get("name", "").strip() or "未命名做T组"
-        webhook = data.get("dingtalk_webhook", "").strip()
-        secret = data.get("dingtalk_secret", "").strip()
-        enabled = bool(data.get("enabled", True))
-        notes = data.get("notes", "").strip()
+        with self._lock:
+            groups = self._read_raw_groups()
+            gid = data.get("id", "").strip()
+            name = data.get("name", "").strip() or "未命名做T组"
+            webhook = data.get("dingtalk_webhook", "").strip()
+            secret = data.get("dingtalk_secret", "").strip()
+            enabled = bool(data.get("enabled", True))
+            notes = data.get("notes", "").strip()
 
-        # 各业务模块独立推送使能开关
-        push_t0 = bool(data.get("push_t0", True))
-        push_screener = bool(data.get("push_screener", True))
-        push_tail230 = bool(data.get("push_tail230", True))
-        push_limitup = bool(data.get("push_limitup", True))
-        push_review = bool(data.get("push_review", True))
+            # 各业务模块独立推送使能开关
+            push_t0 = bool(data.get("push_t0", True))
+            push_screener = bool(data.get("push_screener", True))
+            push_tail230 = bool(data.get("push_tail230", True))
+            push_limitup = bool(data.get("push_limitup", True))
+            push_review = bool(data.get("push_review", True))
 
-        stock_symbols = data.get("stock_symbols")
+            stock_symbols = data.get("stock_symbols")
 
-        is_new = False
-        target_group = None
+            target_group = None
 
-        if gid:
-            for grp in groups:
-                if grp.get("id") == gid:
-                    target_group = grp
-                    break
+            if gid:
+                for grp in groups:
+                    if grp.get("id") == gid:
+                        target_group = grp
+                        break
 
-        if not target_group:
-            is_new = True
-            gid = gid or f"grp_{int(time.time() * 1000)}"
-            target_group = {
-                "id": gid,
-                "name": name,
-                "dingtalk_webhook": webhook,
-                "dingtalk_secret": secret,
-                "enabled": enabled,
-                "notes": notes,
-                "push_t0": push_t0,
-                "push_screener": push_screener,
-                "push_tail230": push_tail230,
-                "push_limitup": push_limitup,
-                "push_review": push_review,
-                "stock_symbols": [],
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            groups.append(target_group)
-        else:
-            target_group["name"] = name
-            target_group["dingtalk_webhook"] = webhook
-            target_group["dingtalk_secret"] = secret
-            target_group["enabled"] = enabled
-            target_group["notes"] = notes
-            target_group["push_t0"] = push_t0
-            target_group["push_screener"] = push_screener
-            target_group["push_tail230"] = push_tail230
-            target_group["push_limitup"] = push_limitup
-            target_group["push_review"] = push_review
-            target_group["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not target_group:
+                gid = gid or f"grp_{int(time.time() * 1000)}"
+                target_group = {
+                    "id": gid,
+                    "name": name,
+                    "dingtalk_webhook": webhook,
+                    "dingtalk_secret": secret,
+                    "enabled": enabled,
+                    "notes": notes,
+                    "push_t0": push_t0,
+                    "push_screener": push_screener,
+                    "push_tail230": push_tail230,
+                    "push_limitup": push_limitup,
+                    "push_review": push_review,
+                    "stock_symbols": [],
+                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                groups.append(target_group)
+            else:
+                target_group["name"] = name
+                target_group["dingtalk_webhook"] = webhook
+                target_group["dingtalk_secret"] = secret
+                target_group["enabled"] = enabled
+                target_group["notes"] = notes
+                target_group["push_t0"] = push_t0
+                target_group["push_screener"] = push_screener
+                target_group["push_tail230"] = push_tail230
+                target_group["push_limitup"] = push_limitup
+                target_group["push_review"] = push_review
+                target_group["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 核心改动：支持分组股票非互斥重叠！
-        if stock_symbols is not None and isinstance(stock_symbols, list):
-            clean_syms = list(dict.fromkeys([s.strip().lower() for s in stock_symbols if s and s.strip()]))
-            target_group["stock_symbols"] = clean_syms
+            # 核心改动：支持分组股票非互斥重叠！
+            if stock_symbols is not None and isinstance(stock_symbols, list):
+                clean_syms = list(dict.fromkeys([s.strip().lower() for s in stock_symbols if s and s.strip()]))
+                target_group["stock_symbols"] = clean_syms
 
-            # 同步更新 watchlist.json 中的 group_ids
-            watchlist = self._read_watchlist()
-            sym_set = set(clean_syms)
-            changed = False
-            for item in watchlist:
-                sym = item.get("symbol", "").strip().lower()
-                gids = item.get("group_ids")
-                if not isinstance(gids, list):
-                    gids = [item.get("group_id")] if item.get("group_id") else []
+                # 同步更新 watchlist.json 中的 group_ids
+                watchlist = self._read_watchlist()
+                sym_set = set(clean_syms)
+                changed = False
+                for item in watchlist:
+                    sym = item.get("symbol", "").strip().lower()
+                    gids = item.get("group_ids")
+                    if not isinstance(gids, list):
+                        gids = [item.get("group_id")] if item.get("group_id") else []
 
-                if sym in sym_set:
-                    # 分配给自定义组时，从默认组脱离并加入该组
-                    if gid != "group_default":
-                        gids = [g for g in gids if g != "group_default"]
-                    if gid not in gids:
-                        gids.append(gid)
-                        changed = True
-                else:
-                    if gid in gids:
-                        gids = [g for g in gids if g != gid]
-                        changed = True
+                    if sym in sym_set:
+                        # 分配给自定义组时，从默认组脱离并加入该组
+                        if gid != "group_default":
+                            gids = [g for g in gids if g != "group_default"]
+                        if gid not in gids:
+                            gids.append(gid)
+                            changed = True
+                    else:
+                        if gid in gids:
+                            gids = [g for g in gids if g != gid]
+                            changed = True
 
-                item["group_ids"] = gids
-                item["group_id"] = gids[0] if gids else ""
+                    item["group_ids"] = gids
+                    item["group_id"] = gids[0] if gids else ""
 
-            if changed:
-                self._save_watchlist(watchlist)
+                if changed:
+                    self._save_watchlist(watchlist)
 
-        self._save_raw_groups(groups)
+            self._save_raw_groups(groups)
 
-        target_group["stock_count"] = len(target_group.get("stock_symbols", []))
-        return target_group
+            target_group["stock_count"] = len(target_group.get("stock_symbols", []))
+            return target_group
 
     def delete_group(self, group_id: str) -> bool:
         """删除分组，并从各股票所属的 group_ids 集合中移除该分组（不影响股票在其他组的归属）"""
-        groups = self._read_raw_groups()
-        filtered = [g for g in groups if g.get("id") != group_id]
-        if len(filtered) == len(groups):
-            return False
+        with self._lock:
+            groups = self._read_raw_groups()
+            filtered = [g for g in groups if g.get("id") != group_id]
+            if len(filtered) == len(groups):
+                return False
 
-        self._save_raw_groups(filtered)
+            self._save_raw_groups(filtered)
 
-        watchlist = self._read_watchlist()
-        changed = False
-        for item in watchlist:
-            gids = item.get("group_ids")
-            if isinstance(gids, list) and group_id in gids:
-                item["group_ids"] = [g for g in gids if g != group_id]
-                item["group_id"] = item["group_ids"][0] if item["group_ids"] else ""
-                changed = True
-            elif item.get("group_id") == group_id:
-                item["group_id"] = ""
-                item["group_ids"] = []
-                changed = True
-        if changed:
-            self._save_watchlist(watchlist)
+            watchlist = self._read_watchlist()
+            changed = False
+            for item in watchlist:
+                gids = item.get("group_ids")
+                if isinstance(gids, list) and group_id in gids:
+                    item["group_ids"] = [g for g in gids if g != group_id]
+                    item["group_id"] = item["group_ids"][0] if item["group_ids"] else ""
+                    changed = True
+                elif item.get("group_id") == group_id:
+                    item["group_id"] = ""
+                    item["group_ids"] = []
+                    changed = True
+            if changed:
+                self._save_watchlist(watchlist)
 
-        return True
+            return True
 
     def get_groups_for_stock(self, symbol: str) -> List[Dict[str, Any]]:
         """
@@ -395,29 +388,30 @@ class T0GroupManager:
         if not symbols:
             return False
         sym_set = {s.strip().lower() for s in symbols}
-        watchlist = self._read_watchlist()
-        changed = False
-        for item in watchlist:
-            s = item.get("symbol", "").strip().lower()
-            c = item.get("code", "").strip().lower()
-            if s in sym_set or c in sym_set:
-                gids = item.get("group_ids")
-                if not isinstance(gids, list):
-                    gids = [item.get("group_id")] if item.get("group_id") else []
-                if group_id and group_id != "group_default":
-                    gids = [g for g in gids if g != "group_default"]
-                    if group_id not in gids:
-                        gids.append(group_id)
+        with self._lock:
+            watchlist = self._read_watchlist()
+            changed = False
+            for item in watchlist:
+                s = item.get("symbol", "").strip().lower()
+                c = item.get("code", "").strip().lower()
+                if s in sym_set or c in sym_set:
+                    gids = item.get("group_ids")
+                    if not isinstance(gids, list):
+                        gids = [item.get("group_id")] if item.get("group_id") else []
+                    if group_id and group_id != "group_default":
+                        gids = [g for g in gids if g != "group_default"]
+                        if group_id not in gids:
+                            gids.append(group_id)
+                            changed = True
+                    elif not group_id or group_id == "group_default":
+                        gids = []
                         changed = True
-                elif not group_id or group_id == "group_default":
-                    gids = []
-                    changed = True
-                item["group_ids"] = gids
-                item["group_id"] = gids[0] if gids else ""
+                    item["group_ids"] = gids
+                    item["group_id"] = gids[0] if gids else ""
 
-        if changed:
-            return self._save_watchlist(watchlist)
-        return True
+            if changed:
+                return self._save_watchlist(watchlist)
+            return True
 
     def test_group_notification(
         self,

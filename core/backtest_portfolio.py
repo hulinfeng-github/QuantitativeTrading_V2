@@ -8,36 +8,48 @@ A股智能量化系统 2.0 - 全组合与单标的日线代理回测引擎
 5. 风险指标：夏普比率、索提诺比率、卡玛比率、最大回撤与时间切分末段收益；
 6. 输出每日净值时序对比数据，便于前端绘制专业对比收益曲线。
 """
-import math
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
+from typing import Dict, Any, List, Optional
 
+from config import get_trading_fee_params, load_config
 from core.data_engine import data_engine
 from core.alpha_factors import calculate_alpha_features
 from core.rsrs_skew import calculate_rsrs_skew
-from core.multi_factor_strategy import multi_factor_strategy, MultiFactorStrategy
+from core.multi_factor_strategy import multi_factor_strategy
 from core.portfolio_risk import portfolio_risk
 
 class BacktestEngineV2:
     def __init__(
         self,
         initial_capital: float = 100000.0,
-        commission_rate: float = 0.00025,
-        min_commission: float = 5.0,
-        stamp_duty_rate: float = 0.0005,
-        transfer_fee_rate: float = 0.00001,
-        slippage_rate: float = 0.001,
+        commission_rate: Optional[float] = None,
+        min_commission: Optional[float] = None,
+        stamp_duty_rate: Optional[float] = None,
+        transfer_fee_rate: Optional[float] = None,
+        slippage_rate: Optional[float] = None,
         oos_ratio: float = 0.30
     ):
         self.initial_capital = initial_capital
-        self.commission_rate = commission_rate
-        self.min_commission = min_commission
-        self.stamp_duty_rate = stamp_duty_rate
-        self.transfer_fee_rate = transfer_fee_rate
-        self.slippage_rate = slippage_rate
+        self._fee_overrides = {
+            "commission_rate": commission_rate,
+            "min_commission": min_commission,
+            "stamp_duty_rate": stamp_duty_rate,
+            "transfer_fee_rate": transfer_fee_rate,
+            "slippage_rate": slippage_rate,
+        }
         self.oos_ratio = oos_ratio
+        self.reload_config()
+
+    def reload_config(self):
+        """热加载全局交易费率配置，保留构造函数显式传入的覆盖值。"""
+        fee_cfg = get_trading_fee_params(load_config())
+        ov = self._fee_overrides
+        self.commission_rate = fee_cfg["commission_rate"] if ov["commission_rate"] is None else float(ov["commission_rate"])
+        self.min_commission = fee_cfg["min_commission"] if ov["min_commission"] is None else float(ov["min_commission"])
+        self.stamp_duty_rate = fee_cfg["stamp_duty_rate"] if ov["stamp_duty_rate"] is None else float(ov["stamp_duty_rate"])
+        self.transfer_fee_rate = fee_cfg["transfer_fee_rate"] if ov["transfer_fee_rate"] is None else float(ov["transfer_fee_rate"])
+        self.slippage_rate = fee_cfg["slippage_rate"] if ov["slippage_rate"] is None else float(ov["slippage_rate"])
 
     def run_single_stock_backtest(
         self,
@@ -68,10 +80,12 @@ class BacktestEngineV2:
         if benchmark_df is not None:
             benchmark_df = benchmark_df.sort_values("date").reset_index(drop=True)
             benchmark_df["ma20"] = benchmark_df["close"].rolling(20, min_periods=20).mean()
+            benchmark_df["ma60"] = benchmark_df["close"].rolling(60, min_periods=60).mean()
             for _, r in benchmark_df.iterrows():
                 bench_map[str(r['date'])[:10]] = {
                     "close": float(r["close"]),
-                    "ma20": float(r["ma20"]) if pd.notna(r["ma20"]) else None
+                    "ma20": float(r["ma20"]) if pd.notna(r["ma20"]) else None,
+                    "ma60": float(r["ma60"]) if pd.notna(r["ma60"]) else None,
                 }
 
         # 计算 Alpha 特征与 RSRS
@@ -105,6 +119,11 @@ class BacktestEngineV2:
             curr_close = float(curr_bar['close'])
             curr_high = float(curr_bar['high'])
             curr_low = float(curr_bar['low'])
+            curr_vol = float(curr_bar.get('volume', 0.0) or 0.0)
+            is_suspended = (curr_vol <= 0 or curr_open <= 0 or curr_close <= 0)
+            is_20pct_board = sym.startswith(("sh688", "sz300", "sz301"))
+            up_limit_mult = 1.195 if is_20pct_board else 1.095
+            down_limit_mult = 0.805 if is_20pct_board else 0.905
 
             # T-1 收盘信号在 T 日开盘执行；当日收盘风险信号顺延至下一交易日开盘。
             prev_analysis = multi_factor_strategy.analyze_bar(
@@ -142,10 +161,10 @@ class BacktestEngineV2:
                 if prev_analysis and prev_analysis.get("signal_type") == "SELL" and not pending_exit_reason:
                     pending_exit_reason = "T-1收盘多因子卖出信号"
                 prev_close = float(df_calc.iloc[i - 1]["close"])
-                # 近似按普通主板 10% 涨跌停识别一字跌停；ST、新股等历史状态并未逐日还原。
+                # 近似识别一字跌停；ST、新股等历史状态并未逐日还原。
                 is_locked_limit_down = (
                     np.isclose(curr_high, curr_low, atol=0.005)
-                    and curr_open <= prev_close * 0.905
+                    and curr_open <= prev_close * down_limit_mult
                 )
                 prior_stop = initial_stop
                 if peak_price >= entry_price * 1.05:
@@ -155,7 +174,7 @@ class BacktestEngineV2:
 
                 exit_reference = None
                 exit_reason = ""
-                if not is_locked_limit_down:
+                if not is_suspended and not is_locked_limit_down:
                     if pending_exit_reason:
                         exit_reference = curr_open
                         exit_reason = pending_exit_reason + " (次日开盘执行)"
@@ -203,9 +222,10 @@ class BacktestEngineV2:
             # ---------------- 2. T-1 收盘 BUY 信号在 T 日开盘尝试撮合 ----------------
 
             if shares == 0 and not exited_today and prev_analysis and prev_analysis.get("signal_type") == "BUY":
-                # 严控一字涨停无法买入情况 (今日最高等于最低且涨幅>=9.8%)
-                is_limit_up = (curr_high == curr_low) and (curr_open >= float(df_calc.iloc[i-1]['close']) * 1.095)
-                if not is_limit_up and cash >= 2000.0:
+                # 严控停牌及一字涨停无法买入情况
+                prev_c_buy = float(df_calc.iloc[i - 1]['close'])
+                is_limit_up = np.isclose(curr_high, curr_low, atol=0.005) and (curr_open >= prev_c_buy * up_limit_mult)
+                if not is_suspended and not is_limit_up and cash >= 2000.0:
                     exec_price = round(curr_open * (1.0 + self.slippage_rate), 2)
                     # 风险预算控制单笔最大损失，且不以近乎满仓代替组合仓位管理。
                     levels = prev_analysis.get("trade_levels", {})
@@ -219,11 +239,23 @@ class BacktestEngineV2:
                     actual_stop_fraction = max((exec_price - planned_stop) / exec_price, 0.001) if valid_entry else 0.0
                     risk_budget = cash * max(portfolio_risk.risk_per_trade_pct, 0.0) / 100.0
                     risk_limited_capital = risk_budget / actual_stop_fraction if valid_entry else 0.0
-                    allowed_exposure = (
-                        portfolio_risk.bull_exposure
-                        if not use_market_regime or prev_analysis.get("signal_type") == "BUY"
-                        else 0.0
-                    )
+                    if not use_market_regime:
+                        allowed_exposure = portfolio_risk.bull_exposure
+                    else:
+                        prev_date_str = str(df_calc.iloc[i - 1]["date"])[:10]
+                        b_prev = bench_map.get(prev_date_str)
+                        if b_prev and b_prev.get("ma20"):
+                            b_c = b_prev["close"]
+                            b_m20 = b_prev["ma20"]
+                            b_m60 = b_prev.get("ma60")
+                            if b_c >= b_m20 and (b_m60 is None or b_c >= b_m60):
+                                allowed_exposure = portfolio_risk.bull_exposure
+                            elif b_c >= b_m20 or (b_m60 is not None and b_c >= b_m60):
+                                allowed_exposure = portfolio_risk.osc_exposure
+                            else:
+                                allowed_exposure = portfolio_risk.bear_exposure
+                        else:
+                            allowed_exposure = portfolio_risk.osc_exposure
                     regime_capital = cash * min(
                         allowed_exposure,
                         portfolio_risk.max_single_pct,

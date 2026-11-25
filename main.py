@@ -296,7 +296,6 @@ from core.portfolio_risk import portfolio_risk
 from core.backtest_portfolio import backtest_engine_v2
 from core.review_engine_v2 import review_engine_v2
 from notifier.manager import notification_manager
-from scheduler.task_runner import quant_scheduler2
 
 BANNER = """
 ========================================================================================
@@ -431,6 +430,7 @@ def run_cli_notify_test():
     test_sig = {
         "symbol": "sh600519",
         "name": "贵州茅台",
+        "is_test": True,
         "signal_type": "BUY",
         "signal_desc": "2.0多因子共振突破买点(测试)",
         "price": 1680.00,

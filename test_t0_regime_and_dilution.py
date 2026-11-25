@@ -1,6 +1,7 @@
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 import unittest
+import tests_support  # noqa: F401 - 隔离测试存储目录
 import pandas as pd
 import numpy as np
 

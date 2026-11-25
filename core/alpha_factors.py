@@ -10,7 +10,6 @@ A股智能量化系统 2.0 - 启发式 Qlib Alpha 因子与技术特征库 (Alph
 """
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Tuple
 
 def calculate_ema(series: pd.Series, span: int) -> pd.Series:
     """计算指数移动平均 (EMA)"""

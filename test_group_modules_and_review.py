@@ -3,6 +3,7 @@
 """
 import unittest
 import json
+import tests_support  # noqa: F401 - 隔离测试存储目录
 from unittest.mock import patch, MagicMock
 
 from core.t0_group_manager import t0_group_manager

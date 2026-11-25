@@ -9,6 +9,7 @@
 """
 import unittest
 import time
+import tests_support  # noqa: F401 - 隔离测试存储目录
 from unittest.mock import patch, MagicMock
 
 from notifier.dingtalk import (
@@ -160,17 +161,27 @@ class TestDingTalkRateLimiter(unittest.TestCase):
 
     def test_08_manager_send_signals_batch_routing(self):
         """测试 NotificationManager.send_signals_batch 按不同目标群自动合并归集分流"""
+        from core.t0_group_manager import t0_group_manager
         nm = NotificationManager()
         sigs = [
             {"symbol": "sz002999", "name": "标的A", "signal_type": "BUY_T", "price": 10.0},
             {"symbol": "sz002999", "name": "标的A", "signal_type": "SELL_T", "price": 10.5}
         ]
 
-        with patch("notifier.dingtalk.DingTalkNotifier.send_batch_signals") as mock_batch:
-            mock_batch.return_value = True
+        test_groups = [{
+            "id": "grp_batch_test",
+            "name": "聚合路由测试群",
+            "dingtalk_webhook": self.test_webhook,
+            "dingtalk_secret": "",
+            "enabled": True,
+            "push_t0": True,
+        }]
+        with patch.object(t0_group_manager, "get_groups_for_stock", return_value=test_groups), \
+             patch("notifier.dingtalk.DingTalkNotifier.send_batch_signals", return_value=True) as mock_batch:
             res = nm.send_signals_batch(sigs, force=True)
             self.assertEqual(res["total"], 2)
             self.assertTrue(res["dingtalk"])
+            mock_batch.assert_called_once()
 
     def test_09_manager_get_dingtalk_status(self):
         """测试获取全局与各分组钉钉机器人的配额与频控状态"""

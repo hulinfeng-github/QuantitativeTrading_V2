@@ -6,6 +6,7 @@ import sys
 import json
 import tempfile
 import unittest
+import tests_support  # noqa: F401 - 隔离全局单例默认存储目录
 from pathlib import Path
 from datetime import datetime
 from unittest.mock import patch, MagicMock

@@ -5,11 +5,9 @@ A股智能量化系统 2.0 - 组合风险预算与动态仓位限制 (PortfolioR
 3. 大盘宏观自适应风险敞口 (Market Regime Exposure Control)；
 4. 单只个股集中度、总敞口和持仓数量上限。
 """
-import math
-import json
-import numpy as np
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple
 from config import WATCHLIST_FILE, load_config
+from core.persistence import WATCHLIST_LOCK, safe_read_json
 
 class PortfolioRiskManager:
     def __init__(self):
@@ -35,10 +33,10 @@ class PortfolioRiskManager:
         """
         equity = float(total_equity or self.initial_capital)
         try:
-            if not WATCHLIST_FILE.exists():
-                return {"holdings_count": 0, "exposure_pct": 0.0, "available": True}
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                items = json.load(f)
+            with WATCHLIST_LOCK:
+                if not WATCHLIST_FILE.exists():
+                    return {"holdings_count": 0, "exposure_pct": 0.0, "available": True}
+                items = safe_read_json(WATCHLIST_FILE, None)
             if not isinstance(items, list):
                 return {"holdings_count": 0, "exposure_pct": 100.0, "available": False}
         except Exception:
@@ -216,7 +214,7 @@ class PortfolioRiskManager:
                 "risk_budget_pct": risk_budget_pct
             }
 
-        suggested_capital = total_equity * effective_pct
+        suggested_capital = total_equity * (effective_pct / 100.0)
         # A股买入整手 (100股整数倍)
         raw_shares = int(suggested_capital / (price * 1.001))
         suggested_shares = (raw_shares // 100) * 100

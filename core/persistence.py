@@ -6,13 +6,43 @@ A股智能量化系统 2.0 - 原子持久化与断点状态存储引擎 (Persist
 """
 import os
 import json
+import logging
 import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+_PERSIST_LOGGER = logging.getLogger("qt2.persistence")
+
 
 _FILE_IO_LOCK = threading.RLock()
+WATCHLIST_LOCK = threading.RLock()
+
+
+def load_watchlist(path: Path) -> List[Dict[str, Any]]:
+    """线程安全读取自选股列表。"""
+    with WATCHLIST_LOCK:
+        data = safe_read_json(path, [])
+        return data if isinstance(data, list) else []
+
+
+def save_watchlist(path: Path, items: List[Dict[str, Any]]) -> bool:
+    """线程安全且原子地写入自选股列表。"""
+    with WATCHLIST_LOCK:
+        return atomic_write_json(path, items)
+
+
+def mutate_watchlist(path: Path, mutator) -> Any:
+    """在互斥锁内执行 read-modify-write，杜绝 Web 与分组管理器并发覆写丢失更新。"""
+    with WATCHLIST_LOCK:
+        data = safe_read_json(path, [])
+        items: List[Dict[str, Any]] = data if isinstance(data, list) else []
+        changed, result = mutator(items)
+        if changed:
+            ok = atomic_write_json(path, items)
+            if not ok:
+                raise IOError(f"原子写入自选文件失败: {path}")
+        return result
 
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> bool:
@@ -37,7 +67,7 @@ def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> bool
             os.replace(tmp_path, target)
             return True
         except Exception as e:
-            print(f"[Persistence] 原子写入失败 ({target}): {e}")
+            _PERSIST_LOGGER.warning(f"原子写入失败 ({target}): {e}")
             try:
                 if tmp_path.exists():
                     tmp_path.unlink()
@@ -53,7 +83,7 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> bool:
     try:
         payload = json.dumps(data, ensure_ascii=False, indent=indent)
     except Exception as e:
-        print(f"[Persistence] JSON 序列化失败 ({path}): {e}")
+        _PERSIST_LOGGER.warning(f"JSON 序列化失败 ({path}): {e}")
         return False
     return atomic_write_text(path, payload, encoding="utf-8")
 
@@ -69,7 +99,7 @@ def safe_read_json(path: Path, default: Any = None) -> Any:
         with open(target, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[Persistence] 读取 JSON 异常 ({target}): {e}")
+        _PERSIST_LOGGER.warning(f"读取 JSON 异常 ({target}): {e}")
         return default
 
 

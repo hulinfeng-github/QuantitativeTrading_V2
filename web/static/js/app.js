@@ -402,17 +402,29 @@ function renderWatchlistTable(items) {
       </div>
     `;
 
+    const quoteMissing = it.quote_available === false || !(Number(it.current_price) > 0);
+    const curPriceHtml = quoteMissing
+      ? `<span style="color: var(--text-dim); font-size: 12px;">停牌/无报价</span>`
+      : formatStockPrice(it.current_price);
+    const chgPctHtml = quoteMissing ? `<span style="color: var(--text-dim);">-</span>` : formatPct(it.change_pct);
+    const pnlPctHtml = (it.holding_cost > 0 && !quoteMissing && it.pnl_pct != null)
+      ? formatPct(it.pnl_pct)
+      : (it.holding_cost > 0 && quoteMissing ? `<span style="color: var(--text-dim);" title="停牌或行情暂不可用">-</span>` : '-');
+    const pnlValHtml = (it.holding_cost > 0 && !quoteMissing && it.pnl_val != null)
+      ? `<span class="${it.pnl_val >= 0 ? 'text-up' : 'text-down'}">${it.pnl_val > 0 ? '+' : ''}${Number(it.pnl_val).toFixed(2)}元</span>`
+      : (it.holding_cost > 0 && quoteMissing ? `<span style="color: var(--text-dim);" title="停牌或行情暂不可用">-</span>` : '-');
+
     html += `
       <tr>
         <td><strong style="color: #fff; cursor: pointer;" onclick="openStockDiagnose('${it.symbol}')">${it.name}</strong> <span style="font-size: 11px; color: var(--text-dim);">${it.symbol}</span></td>
         <td>${groupDisplay}</td>
-        <td>${formatStockPrice(it.current_price)}</td>
-        <td>${formatPct(it.change_pct)}</td>
+        <td>${curPriceHtml}</td>
+        <td>${chgPctHtml}</td>
         <td style="cursor: pointer;" onclick="openEditWatchlistModal('${it.symbol}')" title="点击快速修改持仓成本与股数">${it.holding_cost > 0 ? formatStockPrice(it.holding_cost) : '<span style="color: var(--text-dim); font-size: 12px;">未设 ✏️</span>'}</td>
         <td style="cursor: pointer;" onclick="openEditWatchlistModal('${it.symbol}')" title="点击快速修改持仓成本与股数">${it.holding_shares > 0 ? it.holding_shares : '<span style="color: var(--text-dim); font-size: 12px;">0 ✏️</span>'}</td>
         <td style="cursor: pointer;" onclick="openEditWatchlistModal('${it.symbol}')" title="按券商账户确认当日可卖数量">${it.available_shares > 0 ? it.available_shares : '<span style="color: var(--text-dim); font-size: 12px;">0 ✏️</span>'}</td>
-        <td>${it.holding_cost > 0 ? formatPct(it.pnl_pct) : '-'}</td>
-        <td>${it.holding_cost > 0 ? `<span class="${it.pnl_val >= 0 ? 'text-up' : 'text-down'}">${it.pnl_val > 0 ? '+' : ''}${it.pnl_val.toFixed(2)}元</span>` : '-'}</td>
+        <td>${pnlPctHtml}</td>
+        <td>${pnlValHtml}</td>
         <td>
           <button class="btn btn-secondary btn-sm" onclick="openStockDiagnose('${it.symbol}')">诊断</button>
           <button class="btn btn-primary btn-sm" onclick="openEditWatchlistModal('${it.symbol}')" title="修改持仓成本与持股数">✏️ 修改</button>
@@ -1698,6 +1710,22 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  const numChecks = [
+    ["cfgRsrsBuy", "RSRS 买入阈值"],
+    ["cfgRsrsSell", "RSRS 卖出阈值"],
+    ["cfgAtrStop", "ATR 止损倍数"],
+    ["cfgTrailing", "移动止盈回撤(%)"],
+    ["cfgT0Buy", "做T正T偏离阈值(%)"],
+    ["cfgT0Sell", "做T倒T偏离阈值(%)"]
+  ];
+  for (const [id, label] of numChecks) {
+    const val = parseFloat(document.getElementById(id).value);
+    if (!Number.isFinite(val)) {
+      alert(`配置项「${label}」必须为有效数字，不能留空或非法字符`);
+      return;
+    }
+  }
+
   const newCfg = {
     rsrs_buy_threshold: parseFloat(document.getElementById("cfgRsrsBuy").value),
     rsrs_sell_threshold: parseFloat(document.getElementById("cfgRsrsSell").value),

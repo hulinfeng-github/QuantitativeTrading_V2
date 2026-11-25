@@ -10,14 +10,45 @@ A股智能量化系统 2.0 - 市场情绪周期与宏观大势雷达 (SentimentR
    - 亢奋高潮 (76~100)
 4. 输出宏观风险敞口控制乘数 (Exposure Target)，指导组合总仓位动态防守。
 """
+import time
+import threading
+from datetime import datetime
 from typing import Dict, Any, Optional
 import pandas as pd
 import numpy as np
 from core.data_engine import data_engine
 
 class SentimentRadar:
+    TRANSIENT_FALLBACK_MAX_AGE_SECONDS = 900.0
+
     def __init__(self):
+        self._lock = threading.RLock()
         self._last_sentiment: Optional[Dict[str, Any]] = None
+        self._last_sentiment_ts: float = 0.0
+        self._last_sentiment_date: str = ""
+
+    def _fallback_or_default(self, live_price: float = 0.0, live_pct: float = 0.0) -> Dict[str, Any]:
+        """当实时快照可用且当日刚计算过有效均线结构（15分钟内），瞬时日K超时时平滑降级沿用同日结构；否则严格防守清零。"""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        with self._lock:
+            cached = dict(self._last_sentiment) if self._last_sentiment else None
+            cached_ts = self._last_sentiment_ts
+            cached_date = self._last_sentiment_date
+        if (
+            cached is not None
+            and cached.get("data_available")
+            and live_price > 0
+            and cached_date == today_str
+            and (time.time() - cached_ts) <= self.TRANSIENT_FALLBACK_MAX_AGE_SECONDS
+        ):
+            cached["index_price"] = round(live_price, 2)
+            cached["index_pct"] = live_pct
+            cached["data_stale"] = True
+            guide = str(cached.get("action_guide", ""))
+            if "瞬时抖动" not in guide:
+                cached["action_guide"] = f"{guide} (日K瞬时超时·沿用同日实时结构)" if guide else "日K瞬时超时·沿用同日实时结构"
+            return cached
+        return self._default_regime(live_price=live_price, live_pct=live_pct)
 
     def analyze_market_regime(self) -> Dict[str, Any]:
         """
@@ -28,15 +59,14 @@ class SentimentRadar:
         live_price = float(real_q.get("price", 0.0)) if real_q else 0.0
         live_pct = float(real_q.get("change_pct", 0.0)) if real_q else 0.0
 
-        # 1. 获取上证指数日K线
+        # 1. 获取上证指数日K线（剔除未使用的 sh000300 冗余请求，降低超时风险）
         sh_df = data_engine.get_daily_kline("sh000001", count=100)
-        hs300_df = data_engine.get_daily_kline("sh000300", count=100)
 
         if sh_df is None or len(sh_df) < 60:
-            return self._default_regime(live_price=live_price, live_pct=live_pct)
+            return self._fallback_or_default(live_price=live_price, live_pct=live_pct)
 
         if not {"date", "close"}.issubset(sh_df.columns):
-            return self._default_regime(live_price=live_price, live_pct=live_pct)
+            return self._fallback_or_default(live_price=live_price, live_pct=live_pct)
 
         # Stale index bars can produce plausible but unsafe moving averages.
         # Allow short weekends/holidays; reject data more than a week old.
@@ -46,11 +76,11 @@ class SentimentRadar:
             if age_days < 0 or age_days > 7:
                 return self._default_regime(live_price=live_price, live_pct=live_pct)
         except (KeyError, TypeError, ValueError):
-            return self._default_regime(live_price=live_price, live_pct=live_pct)
+            return self._fallback_or_default(live_price=live_price, live_pct=live_pct)
 
         close_series = pd.to_numeric(sh_df["close"], errors="coerce")
         if close_series.tail(60).isna().any() or not np.isfinite(close_series.tail(60)).all():
-            return self._default_regime(live_price=live_price, live_pct=live_pct)
+            return self._fallback_or_default(live_price=live_price, live_pct=live_pct)
 
         # 计算上证指数关键技术指标
         close = live_price if live_price > 0 else float(close_series.iloc[-1])
@@ -125,9 +155,13 @@ class SentimentRadar:
             "target_exposure": target_exposure,
             "action_guide": action_guide,
             "data_available": True,
+            "data_stale": False,
             "can_open_new_positions": True
         }
-        self._last_sentiment = result
+        with self._lock:
+            self._last_sentiment = result
+            self._last_sentiment_ts = time.time()
+            self._last_sentiment_date = datetime.now().strftime("%Y-%m-%d")
         return result
 
     def _default_regime(self, live_price: float = 0.0, live_pct: float = 0.0) -> Dict[str, Any]:

@@ -43,11 +43,20 @@ class MultiFactorStrategy:
         symbol: str,
         name: str,
         df: pd.DataFrame,
-        market_regime_bull: bool = False
+        market_regime_bull: Optional[bool] = None
     ) -> Optional[Dict[str, Any]]:
         """全量计算指标与策略因果研判（单股最新K线，集成技术面与基本面深度财报）"""
         if df is None or len(df) < 30:
             return None
+
+        self.reload_config()
+        if market_regime_bull is None:
+            try:
+                from core.sentiment_radar import sentiment_radar
+                macro = sentiment_radar.analyze_market_regime()
+                market_regime_bull = bool(macro.get('data_available') and macro.get('target_exposure', 0.0) >= 0.65)
+            except Exception:
+                market_regime_bull = False
 
         # 1. 扩充 Alpha 特征与 RSRS
         df_feat = calculate_alpha_features(df)
@@ -232,7 +241,23 @@ class MultiFactorStrategy:
             signal_desc = "减仓/清仓信号"
             all_reasons.append(f"RSRS破位下行({rsrs_norm:.2f} < {self.sell_threshold})或跌破MA20生命线")
         elif total_score >= 75.0 and rsrs_norm >= self.buy_threshold and close > ma20:
-            if not market_regime_bull:
+            overheated_rsrs = (
+                self.buy_upper_threshold is not None
+                and self.buy_upper_threshold > self.buy_threshold
+                and rsrs_norm >= self.buy_upper_threshold
+            )
+            overheated_score = (
+                self.score_buy_upper is not None
+                and self.score_buy_upper > 75.0
+                and total_score >= self.score_buy_upper
+            )
+            if overheated_rsrs or overheated_score:
+                signal_type = "WATCH"
+                signal_desc = "高位过热·防追高"
+                all_reasons.append(
+                    f"触发过热拦截：RSRS({rsrs_norm:.2f} / 上限{self.buy_upper_threshold})或综合评分({total_score:.1f} / 上限{self.score_buy_upper})已处于短线拥挤区，历史后续收益显著走弱"
+                )
+            elif not market_regime_bull:
                 if total_score < 80.0 or vol_ratio < 1.2:
                     signal_type = "WATCH"
                     signal_desc = "弱市压制·观望"

@@ -9,7 +9,7 @@ A股智能量化系统 2.0 - 高精度主力筹码分布与控盘引擎 (ChipEng
 """
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 
 class ChipEngine:
     def __init__(self, lookback_days: int = 120, price_bins: int = 100):

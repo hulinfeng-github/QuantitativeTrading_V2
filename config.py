@@ -4,6 +4,7 @@ A股智能量化投研与实战交易系统 2.0 全局配置中心
 """
 import os
 import json
+import math
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -64,34 +65,20 @@ DEFAULT_CONFIG = {
     "weight_alpha": 0.25,               # Qlib启发式动量与量价Alpha因子权重
     "weight_chip": 0.25,                # CYQ 2.0 高精主力筹码突破权重
     "weight_trend": 0.20,               # 多周期均线与动能配合权重
-    
-    # CYQ 筹码分布参数
-    "chip_lookback": 120,               # 筹码回溯历史天数 (约半年)
-    "chip_concentration_target": 0.12,  # 筹码集中度极限 (<=12% 为单峰密集)
-    "chip_profit_ratio_min": 70.0,      # 突破时获利盘最低比例 (%)
-    
-    # 均线与动量周期
-    "ma_short": 5,                      # 短期均线
-    "ma_mid": 20,                       # 中期生命线
-    "ma_long": 60,                      # 长期牛熊线
-    "atr_period": 14,                   # ATR波动周期
+
+    # 止损与动态止盈参数
     "atr_stop_multiplier": 2.0,         # 基础ATR硬止损倍数
     "trailing_stop_pct": 0.06,          # 最高点回撤动态止盈止损 (6%)
-    
+
     # ---------------- 2. 选股与流动性过滤 ----------------
     "min_turnover_amount": 100000000,   # 最小日成交额 (1亿元，过滤死水冷门标的)
-    "allow_main_board_only": True,      # 仅允许主板 (沪市60/深市00)
-    "exclude_st": True,                 # 过滤ST/*ST/退市风险股
-    "max_screener_results": 20,         # 每日精选输出上限
-    
+
     # ---------------- 3. 组合风险与仓位配置 (Barra + 现代组合理论) ----------------
     "initial_capital": 100000.0,        # 组合模拟基准资金 (元)
     "max_portfolio_positions": 5,       # 组合最大同时持仓只数
     "max_single_position_pct": 0.15,    # 单只个股持仓上限 (15%)
     "risk_per_trade_pct": 0.5,          # 单笔初始止损风险预算占净值比例 (0.5%)
     "hard_stop_loss_pct": 6.0,          # 持仓账户硬止损观察线 (-6%，隔夜跳空仍可能扩大损失)
-    "use_volatility_parity": True,      # 是否启用波动率平价仓位配比
-    "use_market_regime_adaptive": True, # 是否根据大盘牛熊自适应调整总仓位上限
     "bull_market_max_exposure": 0.65,   # 强多头大盘允许最高总仓位 (65%)
     "oscillation_max_exposure": 0.35,  # 震荡市允许最高总仓位 (35%)
     "bear_market_max_exposure": 0.10,  # 弱市/熊市防守最高总仓位 (10%)
@@ -126,7 +113,6 @@ DEFAULT_CONFIG = {
     "t0_etf_agile_active": 0.45,        # ETF敏捷移动止盈激活阈值(%) (ETF波动平滑，0.45%起步)
     "t0_etf_take_profit_pct": 0.8,      # ETF静态目标止盈幅度(%) (0.8%)
     "t0_etf_stop_loss_pct": 0.85,       # ETF硬止损保护幅度(%) (0.85%)
-    "t0_cost_dilution_notify": True,    # 开启持仓成本动态摊薄与解套进度追踪通知
     "t0_reversal_bars": 2,              # 反转确认所需连续同向分钟K线数 (2根不创新低/不创新高)
     "t0_reversal_volume_confirm": True, # 反转放量确认 (微观结构量能确认)
     "t0_reversal_volume_mult": 0.85,    # 放量确认倍数 (反转分钟量 >= 近期均量 × 0.85)
@@ -135,6 +121,7 @@ DEFAULT_CONFIG = {
     "t0_max_vwap_slope_pct": 0.50,      # VWAP斜率绝对值上限(%)，超过视为单边急跌/急涨
     "t0_stop_loss_pct": 1.5,            # 个股做T防守保护止损比例 (%)
     "t0_take_profit_pct": 1.5,          # 个股做T静态目标止盈比例 (%)
+    "t0_trailing_profit_pct": 0.5,      # 个股做T达到静态目标后高点回落移动止盈幅度 (%)
     "t0_take_profit_vwap_pct": 0.30,    # 目标止盈 = 回到VWAP上下方该比例 (%)
     "t0_time_decay_enabled": True,      # 开启尾盘时间衰减 (剩余时间越少目标越贴近、止损越紧)
     "t0_late_window_start": "14:00",    # 此后进入尾盘时间衰减
@@ -144,17 +131,12 @@ DEFAULT_CONFIG = {
     "t0_min_commission": 5.0,           # 单边最低佣金 (元)
     "t0_stamp_tax_rate": 0.0005,        # 印花税 (仅卖出，0.05%)
     "t0_slippage_rate": 0.0005,         # 单边滑点估算 (0.05%)
-    "t0_minute_min_bars": 30,           # 开仓信号最低有效分时条数
     "t0_minute_max_age_minutes": 5,     # 分时末条最大允许延迟分钟数
-    "t0_min_market_exposure": 0.35,     # 仅在市场状态不低于该风险敞口时生成新T0信号
-                                         # 0.35=多头震荡及以上允许(空头震荡也允许做T摊薄)；0.65=仅多头；0=不限制
-    "t0_min_market_exposure_sell": 0.0, # 倒T(高抛)的市场敞口下限；0=弱市也允许高抛防御，仅要求指数数据可用
+    "t0_signal_cooldown_minutes": 20,   # 平仓/止损后同标的再次开仓冷却分钟数
     "t0_max_trades_per_day": 2,         # 单只标的每日做T最大次数 (以1笔为主，出现高确定性极值允许第2笔，硬封顶2笔)
     "t0_daily_stop_circuit_breaker": True, # 开启单日同向止损熔断 (当日止损后不再开同向仓位)
-    "t0_single_direction_only": False,  # 允许顺势日内多空反转波段
     "t0_trend_filter_enabled": True,    # 开启大趋势过滤 (顺势做T)
     "t0_eod_force_close_enabled": True, # 开启尾盘风险核验提醒；不会自动平仓
-    "t0_eod_check_time": "14:48",       # 尾盘做T强平核查时间 (14:45-14:55之间)
     
     # ---------------- 5. 消息通知渠道配置 ----------------
     "dingtalk_enabled": False,
@@ -172,14 +154,12 @@ DEFAULT_CONFIG = {
     "opening_high_freq_enabled": True,   # 开启早盘开盘脉冲期(09:30-10:00)高频巡检(30秒高灵敏度)
     "closing_high_freq_enabled": True,   # 开启尾盘决胜期(14:40-15:00)提频巡检(30秒)
     "auction_snapshot_enabled": True,    # 开启集合竞价(09:25:05)定价秒级感知
-    "market_review_time": "15:10",       # 收盘后全景复盘与参数自迭代时间
     "market_close_scan_time": "15:30",   # 盘后全市场智能精选时间
     "review_auto_optimize_enabled": True,  # 自动调参仍需达到最小已结算样本门槛
     
     # ---------------- 7. 2:30 尾盘突袭战法参数 (分时微结构+筹码RSRS协同) ----------------
     "tail230_target_profit_pct": 2.5,   # 次日早盘冲高止盈目标 (%)
     "tail230_stop_loss_pct": 1.8,       # 次日防守底线止损线 (%)
-    "tail230_auto_track_top_n": 3,      # 每日14:32自动纳入次日卖出监控的前N只标的
     "tail230_morning_check_enabled": True, # 开启次日 09:28 集合竞价操盘计划预警
     "tail230_min_pct": 1.5,             # 最小日内涨幅 (%)
     "tail230_max_pct": 5.8,             # 最大日内涨幅 (%，防过热追高)
@@ -191,7 +171,6 @@ DEFAULT_CONFIG = {
     "tail230_backtest_universe_size": 50, # 回测代表性样本数 (基于真实5分钟K线因果回测)
     
     # ---------------- 8. 游资龙虎打板量化参数 (严格只做弱转强 Weak-to-Strong) ----------------
-    "limit_up_strategy_mode": "weak_to_strong_only", # 策略模式：严格仅限T-1分歧转T日走强
     "limit_up_auto_notify_enabled": True,  # 自动推送弱转强打板候选摘要
     "limit_up_scan_interval_minutes": 3,   # 盘中打板常态监控扫描间隔 (分钟)
     "limit_up_wzs_prime_interval_minutes": 2, # 早盘黄金弱转强窗口(09:30-10:30)高灵敏扫描间隔 (分钟)
@@ -242,12 +221,129 @@ def load_config() -> dict:
 
     return cfg
 
+def get_trading_fee_params(cfg: dict = None) -> dict:
+    """
+    统一读取全局与 T0 交易成本参数，消除多模块费率键名分歧：
+    - 优先读取显式全局键 commission_rate / min_commission / stamp_duty_rate / slippage_rate / transfer_fee_rate，
+      回退兼容 t0_commission_rate / t0_min_commission / t0_stamp_tax_rate / t0_slippage_rate。
+    """
+    c = cfg if isinstance(cfg, dict) else load_config()
+    return {
+        "commission_rate": float(c.get("commission_rate", c.get("t0_commission_rate", 0.00025))),
+        "min_commission": float(c.get("min_commission", c.get("t0_min_commission", 5.0))),
+        "stamp_duty_rate": float(c.get("stamp_duty_rate", c.get("t0_stamp_tax_rate", 0.0005))),
+        "slippage_rate": float(c.get("slippage_rate", c.get("t0_slippage_rate", 0.0005))),
+        "transfer_fee_rate": float(c.get("transfer_fee_rate", 0.00001)),
+    }
+
+
+def calc_round_trip_fees(
+    entry_price: float,
+    exit_price: float = None,
+    shares: int = 100,
+    direction: str = "BUY_T",
+    is_etf: bool = False,
+    cfg: dict = None,
+) -> dict:
+    """
+    统一计算 A 股双向交易成本（双边佣金+最低5元门槛、仅卖出印花税、双边滑点与过户费估算）。
+    """
+    fees = get_trading_fee_params(cfg)
+    ep = max(float(entry_price or 0.0), 0.0)
+    xp = max(float(exit_price if exit_price is not None else ep), 0.0)
+    qty = max(int(shares or 0), 0)
+    entry_amt = ep * qty
+    exit_amt = xp * qty
+
+    if is_etf:
+        comm_entry = entry_amt * fees["commission_rate"]
+        comm_exit = exit_amt * fees["commission_rate"]
+        stamp_amt = 0.0
+        transfer_amt = 0.0
+    else:
+        comm_entry = max(fees["min_commission"], entry_amt * fees["commission_rate"]) if entry_amt > 0 else 0.0
+        comm_exit = max(fees["min_commission"], exit_amt * fees["commission_rate"]) if exit_amt > 0 else 0.0
+        sell_amt = exit_amt if direction == "BUY_T" else entry_amt
+        stamp_amt = sell_amt * fees["stamp_duty_rate"]
+        transfer_amt = (entry_amt + exit_amt) * fees["transfer_fee_rate"]
+
+    slip_amt = (entry_amt + exit_amt) * fees["slippage_rate"]
+    total_fee = comm_entry + comm_exit + stamp_amt + transfer_amt + slip_amt
+    fee_pct = (total_fee / entry_amt * 100.0) if entry_amt > 0 else 0.0
+    return {
+        "fee_amt": total_fee,
+        "fee_pct": fee_pct,
+        "comm_amt": comm_entry + comm_exit,
+        "stamp_amt": stamp_amt,
+        "slip_amt": slip_amt,
+        "transfer_amt": transfer_amt,
+        "params": fees,
+    }
+
+
+def validate_config_patch(patch: dict) -> dict:
+    """
+    校验待保存的配置补丁：拒绝 None / NaN / Inf 与明显类型错误，避免前端空输入写坏 user_config.json。
+    """
+    if not isinstance(patch, dict):
+        raise ValueError("配置请求体必须为 JSON 对象")
+
+    cleaned = {}
+    for k, v in patch.items():
+        if k in DEFAULT_CONFIG:
+            default_v = DEFAULT_CONFIG[k]
+            if v is None:
+                raise ValueError(f"配置项 {k} 不能为空 (null/NaN)")
+            if isinstance(default_v, bool):
+                if isinstance(v, bool):
+                    cleaned[k] = v
+                elif isinstance(v, str) and v.strip().lower() in ("true", "false"):
+                    cleaned[k] = v.strip().lower() == "true"
+                else:
+                    raise ValueError(f"配置项 {k} 必须为布尔值")
+            elif isinstance(default_v, int):
+                if isinstance(v, bool):
+                    raise ValueError(f"配置项 {k} 必须为整数")
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    raise ValueError(f"配置项 {k} 必须为有效整数")
+                if not math.isfinite(fv):
+                    raise ValueError(f"配置项 {k} 不能为 NaN 或无穷大")
+                cleaned[k] = int(fv)
+            elif isinstance(default_v, float):
+                if isinstance(v, bool):
+                    raise ValueError(f"配置项 {k} 必须为数字")
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    raise ValueError(f"配置项 {k} 必须为有效数字")
+                if not math.isfinite(fv):
+                    raise ValueError(f"配置项 {k} 不能为 NaN 或无穷大")
+                cleaned[k] = fv
+            elif isinstance(default_v, str):
+                cleaned[k] = str(v).strip()
+            else:
+                cleaned[k] = v
+        else:
+            # 历史额外键仍透传保留（除非为 NaN/Inf）
+            if isinstance(v, float) and not math.isfinite(v):
+                raise ValueError(f"配置项 {k} 不能为 NaN 或无穷大")
+            cleaned[k] = v
+    return cleaned
+
+
 def save_config(new_config: dict) -> bool:
     try:
         from core.persistence import atomic_write_json
+        cleaned = validate_config_patch(new_config)
         cfg = load_config()
-        cfg.update(new_config)
+        cfg.update(cleaned)
         return atomic_write_json(CONFIG_FILE, cfg)
     except Exception as e:
-        print(f"保存配置失败: {e}")
+        try:
+            from core.logger import get_logger
+            get_logger("config").error(f"保存配置失败: {e}")
+        except Exception:
+            print(f"保存配置失败: {e}")
         return False

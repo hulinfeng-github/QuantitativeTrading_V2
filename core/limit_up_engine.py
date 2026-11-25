@@ -15,21 +15,22 @@ A股智能量化系统 2.0 - 游资弱转强打板专精引擎 (LimitUpEngine 2.
 """
 import csv
 import io
-import math
 import shutil
 import threading
 import concurrent.futures
-from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
 
-from config import DATA_DIR, LIMIT_UP_TRADES_FILE, LIMIT_UP_CSV_FILE, load_config
+from config import LIMIT_UP_TRADES_FILE, LIMIT_UP_CSV_FILE, load_config
+from core.logger import get_logger
 from core.data_engine import data_engine
 from core.sentiment_radar import sentiment_radar
 from core.persistence import atomic_write_json, atomic_write_text, safe_read_json
+
+logger = get_logger("limit_up")
 
 
 class LimitUpEngine:
@@ -139,7 +140,7 @@ class LimitUpEngine:
             atomic_write_text(LIMIT_UP_CSV_FILE, buf.getvalue(), encoding="utf-8-sig")
             return str(LIMIT_UP_CSV_FILE)
         except Exception as e:
-            print(f"[LimitUpEngine] 导出CSV表格异常: {e}")
+            logger.error(f"[LimitUpEngine] 导出CSV表格异常: {e}")
             return ""
 
     @staticmethod
@@ -676,6 +677,8 @@ class LimitUpEngine:
             "price": price,
             "seal_price": price,
             "board_type": b_type,
+            "t1_divergence_type": candidate.get("t1_divergence_type"),
+            "sector": candidate.get("sector"),
             "ladder_count": candidate.get("ladder_count", 1),
             "hardness_score": candidate.get("hardness_score"),
             "score_type": candidate.get("score_type", "弱转强量化置信度分"),
@@ -703,7 +706,7 @@ class LimitUpEngine:
         if not market_state.get("data_available", False):
             return []
         if float(market_state.get("temp_score", 0.0)) < 25.0 and float(market_state.get("index_pct", 0.0)) < -0.5:
-            print("[LimitUp-WZS] 市场处于极度冰点系统性杀跌未见修复，暂停弱转强扫板。")
+            logger.info("[LimitUp-WZS] 市场处于极度冰点系统性杀跌未见修复，暂停弱转强扫板。")
             return []
 
         stocks = data_engine.get_main_board_stock_list(force_refresh=force_refresh)
@@ -762,7 +765,8 @@ class LimitUpEngine:
     def calculate_wzs_backtest(
         self,
         sample_symbols: Optional[List[str]] = None,
-        days: int = 45
+        days: int = 45,
+        lookback_days: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         严格因果 5 分钟级【弱转强打板】历史回测：
@@ -809,6 +813,10 @@ class LimitUpEngine:
 
         trades: List[Dict[str, Any]] = []
         friction_pct = 0.20
+        cutoff_date_str: Optional[str] = None
+        if lookback_days is not None and int(lookback_days) > 0:
+            from datetime import timedelta
+            cutoff_date_str = (datetime.now() - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
 
         for sym, d_df in symbol_daily.items():
             info = data_engine.resolve_symbol(sym)
@@ -821,6 +829,8 @@ class LimitUpEngine:
 
             for i in range(10, len(d_df) - 1):
                 t_date = dates[i]
+                if cutoff_date_str and t_date < cutoff_date_str:
+                    continue
                 t1_next_date = dates[i + 1]
                 if t_date not in m5_by_date or t1_next_date not in m5_by_date:
                     continue

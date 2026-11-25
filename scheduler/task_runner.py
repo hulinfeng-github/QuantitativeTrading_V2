@@ -9,7 +9,6 @@
    重启时比对交易日历与时间窗——安全窗口内自动精准补跑，过期买入窗口绝不补发过时信号，历史T+1台账自动回溯对齐，杜绝重复推送。
 """
 import time
-import json
 import threading
 import sys
 import ctypes
@@ -19,6 +18,7 @@ from typing import List, Dict, Any, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from config import load_config, WATCHLIST_FILE, REVIEW_FILE, SCHEDULER_STATE_FILE
+from core.logger import get_logger
 from core.data_engine import data_engine
 from core.multi_factor_strategy import multi_factor_strategy
 from core.t0_smart_engine import t0_smart_engine
@@ -27,6 +27,8 @@ from core.strategy_tail_230 import tail_strategy_230, tail_trade_tracker
 from core.portfolio_risk import portfolio_risk
 from core.persistence import SchedulerCheckpointStore, safe_read_json
 from notifier.manager import notification_manager
+
+logger = get_logger("scheduler")
 
 
 def set_windows_sleep_prevention(enable: bool = True):
@@ -59,8 +61,21 @@ class QuantScheduler2:
         }
         self._last_intraday_check: float = 0.0
         self._last_limit_up_check: float = 0.0
+        self._last_alert_flush: float = 0.0
         self._op_lock = threading.RLock()
+        self._exec_lock = threading.RLock()
+        self._bg_executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="qt2-bg"
+        )
         self.checkpoint = SchedulerCheckpointStore(state_file or SCHEDULER_STATE_FILE)
+
+    def _submit_bg(self, fn, *args, **kwargs):
+        with self._exec_lock:
+            if self._bg_executor is None:
+                self._bg_executor = ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="qt2-bg"
+                )
+            return self._bg_executor.submit(fn, *args, **kwargs)
 
     @staticmethod
     def is_trading_time(now_dt: Optional[datetime] = None) -> bool:
@@ -78,12 +93,31 @@ class QuantScheduler2:
         data = safe_read_json(WATCHLIST_FILE, [])
         return data if isinstance(data, list) else []
 
+    def _flush_pending_alerts_throttled(self, now_dt: Optional[datetime] = None):
+        """按 30 秒节奏安全冲洗持久化延迟队列，盘中及收盘后 16:00 前均可执行，避免 14:52~14:55 限流警报跨收盘丢失。"""
+        now = now_dt or datetime.now()
+        if now.weekday() >= 5:
+            return
+        cur_hm = now.strftime("%H:%M")
+        if not ("09:20" <= cur_hm <= "16:00"):
+            return
+        now_ts = time.time()
+        if (now_ts - self._last_alert_flush) < 28.0:
+            return
+        self._last_alert_flush = now_ts
+        try:
+            notification_manager.flush_pending_critical_alerts()
+        except Exception as e:
+            logger.warning(f"[Scheduler 2.0] 补发延迟关键警报异常: {e}")
+
     def run_intraday_check(self, force: bool = False):
         """盘中自选股巡检：检查波段信号、日内做T与 2.30 昨日持仓次日分时止盈止损"""
-        if not self.is_trading_time():
+        now = datetime.now()
+        self._flush_pending_alerts_throttled(now)
+
+        if not self.is_trading_time(now):
             return
 
-        now = datetime.now()
         curr_hm = now.strftime("%H:%M")
         cfg = load_config()
 
@@ -108,24 +142,25 @@ class QuantScheduler2:
         if not watchlist and not active_tail_positions:
             return
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动盘中巡检 (自选 {len(watchlist)} 只, 2.30昨日持仓 {len(active_tail_positions)} 只)...")
+        logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] 启动盘中巡检 (自选 {len(watchlist)} 只, 2.30昨日持仓 {len(active_tail_positions)} 只)...")
         symbols = [item["symbol"] for item in watchlist if item.get("symbol")]
         tail_syms = [p["symbol"] for p in active_tail_positions if p.get("symbol")]
         all_symbols = list(set(symbols + tail_syms))
         quotes = data_engine.get_realtime_quotes(all_symbols)
 
         t0_market_exposure = None
-        if cfg.get("t0_monitor_enabled", True) and any(
-            item.get("t0_enabled", True) and data_engine.is_main_board(item.get("symbol", ""))
-            for item in watchlist
-        ):
-            try:
-                from core.sentiment_radar import sentiment_radar
-                market_state = sentiment_radar.analyze_market_regime()
-                if market_state.get("data_available") and market_state.get("target_exposure") is not None:
+        market_regime_bull = False
+        try:
+            from core.sentiment_radar import sentiment_radar
+            market_state = sentiment_radar.analyze_market_regime()
+            if market_state.get("data_available"):
+                if market_state.get("target_exposure") is not None:
                     t0_market_exposure = float(market_state["target_exposure"])
-            except Exception:
-                t0_market_exposure = None
+                market_regime_bull = bool(market_state.get("target_exposure", 0.0) >= 0.65)
+        except Exception as e:
+            logger.warning(f"[Scheduler 2.0] 读取市场情绪雷达失败: {e}")
+            t0_market_exposure = None
+            market_regime_bull = False
 
         for item in watchlist:
             try:
@@ -149,7 +184,9 @@ class QuantScheduler2:
                 df_kline = data_engine.get_daily_kline(sym, count=120)
                 analysis_res = None
                 if df_kline is not None and len(df_kline) >= 30:
-                    analysis_res = multi_factor_strategy.analyze(sym, name, df_kline)
+                    analysis_res = multi_factor_strategy.analyze(
+                        sym, name, df_kline, market_regime_bull=market_regime_bull
+                    )
 
                 # 1. 持仓硬止损检查
                 if cost > 0 and shares > 0:
@@ -216,7 +253,7 @@ class QuantScheduler2:
                             sig_payload["group_id"] = item.get("group_id")
                         notification_manager.send_signal(sig_payload)
             except Exception as e:
-                print(f"[Scheduler 2.0] 巡检个股 {item.get('symbol', '')} 异常: {e}")
+                logger.warning(f"[Scheduler 2.0] 巡检个股 {item.get('symbol', '')} 异常: {e}")
 
         # 4. 尾盘时段 (14:45-14:55) 检查未闭环做T头寸
         cur_hm = datetime.now().strftime("%H:%M")
@@ -234,67 +271,71 @@ class QuantScheduler2:
         """异步执行全市场主板智能精选"""
         if self.scan_status["is_scanning"]:
             return
-        t = threading.Thread(target=self._scan_market_worker, args=(limit, notify), daemon=True)
-        t.start()
+        self._submit_bg(self._scan_market_worker, limit, notify)
 
     def _scan_market_worker(self, limit: int = 100, notify: bool = True):
         self.scan_status["is_scanning"] = True
         self.scan_status["progress"] = 0
         self.scan_status["message"] = "正在拉取A股主板标的池..."
 
-        stocks = data_engine.get_main_board_stock_list()
-        total = min(len(stocks), limit)
-        self.scan_status["total"] = total
-        candidates = []
+        try:
+            stocks = data_engine.get_main_board_stock_list()
+            total = min(len(stocks), limit)
+            self.scan_status["total"] = total
+            candidates = []
 
-        cfg = load_config()
-        min_turnover = cfg.get("min_turnover_amount", 100000000)
-        from core.sentiment_radar import sentiment_radar
-        market = sentiment_radar.analyze_market_regime()
-        market_regime_bull = bool(
-            market.get("data_available") and market.get("target_exposure", 0.0) >= 0.65
-        )
+            cfg = load_config()
+            min_turnover = cfg.get("min_turnover_amount", 100000000)
+            from core.sentiment_radar import sentiment_radar
+            market = sentiment_radar.analyze_market_regime()
+            market_regime_bull = bool(
+                market.get("data_available") and market.get("target_exposure", 0.0) >= 0.65
+            )
 
-        valid_stocks = [s for s in stocks if float(s.get("turnover", 0)) >= min_turnover][:total]
-        self.scan_status["total"] = len(valid_stocks)
+            valid_stocks = [s for s in stocks if float(s.get("turnover", 0)) >= min_turnover][:total]
+            self.scan_status["total"] = len(valid_stocks)
 
-        def eval_stock(s):
-            sym = s.get("symbol")
-            name = s.get("name")
-            try:
-                df = data_engine.get_daily_kline(sym, count=180)
-                if df is not None and len(df) >= 30:
-                    res = multi_factor_strategy.analyze(
-                        sym, name, df, market_regime_bull=market_regime_bull
-                    )
-                    if res and res.get("score", 0) >= 60:
-                        return res
-            except Exception:
-                pass
-            return None
+            def eval_stock(s):
+                sym = s.get("symbol")
+                name = s.get("name")
+                try:
+                    df = data_engine.get_daily_kline(sym, count=180)
+                    if df is not None and len(df) >= 30:
+                        res = multi_factor_strategy.analyze(
+                            sym, name, df, market_regime_bull=market_regime_bull
+                        )
+                        if res and res.get("score", 0) >= 60:
+                            return res
+                except Exception as e:
+                    logger.debug(f"[Scheduler 2.0] 全市场扫描个股 {sym} 异常: {e}")
+                return None
 
-        completed = 0
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            future_to_stock = {executor.submit(eval_stock, s): s for s in valid_stocks}
-            for future in as_completed(future_to_stock):
-                completed += 1
-                self.scan_status["progress"] = completed
-                self.scan_status["message"] = f"正在扫描多因子特征 ({completed}/{len(valid_stocks)})..."
-                res = future.result()
-                if res:
-                    candidates.append(res)
+            completed = 0
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                future_to_stock = {executor.submit(eval_stock, s): s for s in valid_stocks}
+                for future in as_completed(future_to_stock):
+                    completed += 1
+                    self.scan_status["progress"] = completed
+                    self.scan_status["message"] = f"正在扫描多因子特征 ({completed}/{len(valid_stocks)})..."
+                    res = future.result()
+                    if res:
+                        candidates.append(res)
 
-        candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
-        self.latest_scan_results = candidates
-        self.scan_status["is_scanning"] = False
-        self.scan_status["message"] = f"扫描完成，筛选出 {len(candidates)} 只优质标的"
-        self.scan_status["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+            self.latest_scan_results = candidates
+            self.scan_status["message"] = f"扫描完成，筛选出 {len(candidates)} 只优质标的"
+            self.scan_status["last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        self.checkpoint.mark_task_completed("post_scan", today_str, status="DONE", note=f"{len(candidates)} picks")
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            self.checkpoint.mark_task_completed("post_scan", today_str, status="DONE", note=f"{len(candidates)} picks")
 
-        if notify:
-            self._notify_market_scan_results(candidates)
+            if notify:
+                self._notify_market_scan_results(candidates)
+        except Exception as e:
+            logger.exception(f"[Scheduler 2.0] 全市场扫描任务异常: {e}")
+            self.scan_status["message"] = f"扫描异常: {e}"
+        finally:
+            self.scan_status["is_scanning"] = False
 
     def _notify_market_scan_results(self, candidates: List[Dict[str, Any]]):
         """将收盘后多因子主板精选标的（含深度财报体检）幂等推送至钉钉/微信"""
@@ -405,11 +446,11 @@ class QuantScheduler2:
         market = sentiment_radar.analyze_market_regime()
         gate = tail_strategy_230.evaluate_market_gate(market)
         if not gate["allowed"]:
-            print(f"[Tail230] {gate['reason']}")
+            logger.info(f"[Tail230] {gate['reason']}")
             self.checkpoint.mark_task_completed("tail230_scan", date_str, status="BLOCKED_REGIME", note=gate["reason"])
             return
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 启动尾盘 2:30 战法(分时VWAP承接+筹码RSRS)扫描与推送 [{gate['mode']}]...")
+        logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] 启动尾盘 2:30 战法(分时VWAP承接+筹码RSRS)扫描与推送 [{gate['mode']}]...")
         candidates = tail_strategy_230.scan_today_candidates(limit=8, force_refresh=True)
         if not candidates:
             msg = (
@@ -490,7 +531,7 @@ class QuantScheduler2:
             return
 
         today_str = now.strftime("%Y-%m-%d")
-        print(f"[{now.strftime('%H:%M:%S')}] 触发 09:25:05 集合竞价秒级开盘定价感知扫描...")
+        logger.info(f"[{now.strftime('%H:%M:%S')}] 触发 09:25:05 集合竞价秒级开盘定价感知扫描...")
         self.run_intraday_check(force=True)
         self.checkpoint.mark_task_completed("morning_auction", today_str, status="DONE")
 
@@ -517,7 +558,7 @@ class QuantScheduler2:
         if not plans:
             return
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发尾盘策略实际成交记录行情提醒 ({len(plans)} 条)...")
+        logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] 触发尾盘策略实际成交记录行情提醒 ({len(plans)} 条)...")
         lines = [
             f"### 🌅 尾盘策略实际成交记录行情提醒 ({now.strftime('%Y-%m-%d 09:28')})\n",
             "> 以下记录由用户确认买入成交后建立；开盘若显著低开破位请严格执行止损，冲高回落破VWAP即锁利。\n",
@@ -547,7 +588,7 @@ class QuantScheduler2:
             return
         date_str = now.strftime("%Y-%m-%d")
 
-        print(f"[{now.strftime('%H:%M:%S')}] 启动尾盘未闭环做T头寸强制平仓/底仓抉择审查...")
+        logger.info(f"[{now.strftime('%H:%M:%S')}] 启动尾盘未闭环做T头寸强制平仓/底仓抉择审查...")
         signals = t0_smart_engine.check_eod_unclosed_positions()
         if signals:
             notification_manager.send_signals_batch(signals)
@@ -601,12 +642,12 @@ class QuantScheduler2:
             if not qualified:
                 return
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 触发盘中【弱转强专精打板】监控，精选出 {len(qualified)} 只标的...")
+            logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] 触发盘中【弱转强专精打板】监控，精选出 {len(qualified)} 只标的...")
 
             try:
                 limit_up_engine.record_board_hitting_trades(qualified, top_n=top_n)
             except Exception as e:
-                print(f"[LimitUp] 自动记账异常: {e}")
+                logger.warning(f"[LimitUp] 自动记账异常: {e}")
 
             pushed_count = 0
             for c in qualified:
@@ -615,16 +656,16 @@ class QuantScheduler2:
                     pushed_count += 1
 
             if pushed_count > 0:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 成功发送 {pushed_count} 条弱转强打板量化卡片。")
+                logger.info(f"[{datetime.now().strftime('%H:%M:%S')}] 成功发送 {pushed_count} 条弱转强打板量化卡片。")
         except Exception as e:
-            print(f"[Scheduler 2.0] 盘中弱转强打板监控异常: {e}")
+            logger.warning(f"[Scheduler 2.0] 盘中弱转强打板监控异常: {e}")
 
     def run_post_market_review(self, notify: bool = True, force: bool = False):
         """执行盘后 15:10 全景复盘与参数自进化（支持跨重启幂等不重推）"""
         now = datetime.now()
         if now.weekday() >= 5 and not force:
             return
-        print(f"[{now.strftime('%H:%M:%S')}] 启动收盘全景复盘与自动调优任务...")
+        logger.info(f"[{now.strftime('%H:%M:%S')}] 启动收盘全景复盘与自动调优任务...")
         res = review_engine_v2.run_daily_review(auto_optimize=True)
         date_str = res.get("date", now.strftime("%Y-%m-%d"))
         self.checkpoint.mark_task_completed("post_review", date_str, status="DONE")
@@ -632,7 +673,7 @@ class QuantScheduler2:
         if not notify:
             return
         if not force and self.checkpoint.is_task_completed("post_review_notify", date_str):
-            print(f"[PostReview] {date_str} 复盘报告已推送过，跳过重复推送。")
+            logger.info(f"[PostReview] {date_str} 复盘报告已推送过，跳过重复推送。")
             return
 
         from core.t0_group_manager import t0_group_manager
@@ -660,24 +701,24 @@ class QuantScheduler2:
                 if notifier.send_markdown(group_title, group_md):
                     pushed_group_webhooks.add(webhook)
                     any_sent = True
-                    print(f"[PostReview] 成功推送定制复盘至分组: {group_name}")
+                    logger.info(f"[PostReview] 成功推送定制复盘至分组: {group_name}")
                 else:
-                    print(f"[PostReview] 推送定制复盘至分组 {group_name} 失败 (网络/响应异常)")
+                    logger.warning(f"[PostReview] 推送定制复盘至分组 {group_name} 失败 (网络/响应异常)")
             except Exception as e:
-                print(f"[PostReview] 推送定制复盘至分组 {group_name} 异常: {e}")
+                logger.warning(f"[PostReview] 推送定制复盘至分组 {group_name} 异常: {e}")
 
         full_report = res.get("report_md", "")
         global_title = f"📊 A股收盘全景复盘与持仓体检 ({date_str})"
         cfg = load_config()
         global_webhook = cfg.get("dingtalk_webhook", "").strip()
 
-        if global_webhook and global_webhook not in pushed_group_webhooks and cfg.get("dingtalk_enabled", True):
+        if global_webhook and global_webhook not in pushed_group_webhooks and cfg.get("dingtalk_enabled", False):
             try:
                 notifier = DingTalkNotifier(global_webhook, cfg.get("dingtalk_secret", ""))
                 if notifier.send_markdown(global_title, full_report):
                     any_sent = True
             except Exception as e:
-                print(f"[PostReview] 推送全局钉钉复盘失败: {e}")
+                logger.warning(f"[PostReview] 推送全局钉钉复盘失败: {e}")
 
         if cfg.get("wechat_enabled"):
             try:
@@ -689,7 +730,7 @@ class QuantScheduler2:
                 if wechat_notifier.send_markdown(global_title, full_report):
                     any_sent = True
             except Exception as e:
-                print(f"[PostReview] 推送微信复盘失败: {e}")
+                logger.warning(f"[PostReview] 推送微信复盘失败: {e}")
 
         if any_sent:
             self.checkpoint.mark_task_completed("post_review_notify", date_str, status="DONE")
@@ -803,7 +844,7 @@ class QuantScheduler2:
         self.scheduler.start()
         self.is_running = True
         set_windows_sleep_prevention(True)
-        print("[Scheduler 2.0] 自动化后台调度引擎已就绪启动 (30s高敏心跳 + 断档自愈恢复已激活)。")
+        logger.info("[Scheduler 2.0] 自动化后台调度引擎已就绪启动 (30s高敏心跳 + 断档自愈恢复已激活)。")
 
         self.check_and_backfill_missed_tasks()
 
@@ -830,23 +871,23 @@ class QuantScheduler2:
 
             last_hb = self.checkpoint.get_last_heartbeat()
             gap_desc = f"上次运行水位: {last_hb.strftime('%Y-%m-%d %H:%M:%S')}" if last_hb else "首次启动/无历史水位"
-            print(f"[Scheduler 2.0] 启动断档自检与恢复 ({now.strftime('%Y-%m-%d %H:%M:%S')}, {gap_desc})...")
+            logger.info(f"[Scheduler 2.0] 启动断档自检与恢复 ({now.strftime('%Y-%m-%d %H:%M:%S')}, {gap_desc})...")
 
             # 1. 历史台账离线补结算（永远安全执行）
             try:
                 reconciled = tail_trade_tracker.reconcile_and_clean_expired_positions(current_dt=now)
                 if reconciled:
-                    print(f"[Scheduler 2.0] 成功自动回溯补结 {len(reconciled)} 笔离线期间过期的 2.30 头寸。")
+                    logger.info(f"[Scheduler 2.0] 成功自动回溯补结 {len(reconciled)} 笔离线期间过期的 2.30 头寸。")
             except Exception as e:
-                print(f"[Scheduler 2.0] 自检回溯 2.30 头寸异常: {e}")
+                logger.warning(f"[Scheduler 2.0] 自检回溯 2.30 头寸异常: {e}")
 
             try:
                 from core.limit_up_engine import limit_up_engine
                 lu_stats = limit_up_engine.review_and_update_trades(review_date=today_str)
                 if lu_stats.get("settled_count", 0) > 0:
-                    print(f"[Scheduler 2.0] 成功自动回溯核算 {lu_stats['settled_count']} 笔离线打板交易 T+1 表现。")
+                    logger.info(f"[Scheduler 2.0] 成功自动回溯核算 {lu_stats['settled_count']} 笔离线打板交易 T+1 表现。")
             except Exception as e:
-                print(f"[Scheduler 2.0] 自检核算打板交易异常: {e}")
+                logger.warning(f"[Scheduler 2.0] 自检核算打板交易异常: {e}")
 
             # 2. 基于真实交易日历校准“最近已收盘交易日”
             trading_dates = data_engine.get_trading_dates(count=30)
@@ -880,17 +921,19 @@ class QuantScheduler2:
                     try:
                         self.run_intraday_check(force=True)
                     except Exception as e:
-                        print(f"[Scheduler 2.0] 重启立即做T巡检异常: {e}")
+                        logger.warning(f"[Scheduler 2.0] 重启立即做T巡检异常: {e}")
                     try:
                         self.run_limit_up_intraday_scan(force=True)
                     except Exception as e:
-                        print(f"[Scheduler 2.0] 重启立即弱转强扫板异常: {e}")
+                        logger.warning(f"[Scheduler 2.0] 重启立即弱转强扫板异常: {e}")
             elif is_weekday and cur_hm > "15:00":
-                # 盘后启动时标记当日过时盘中买入窗口为已跳过
+                # 盘后启动时标记当日过时盘中买入/尾盘检查窗口为已跳过
                 if not self.checkpoint.is_task_completed("tail230_scan", today_str):
                     self.checkpoint.mark_task_completed("tail230_scan", today_str, status="SKIPPED_EXPIRED", now_dt=now)
                 if not self.checkpoint.is_task_completed("tail230_morning_plan", today_str):
                     self.checkpoint.mark_task_completed("tail230_morning_plan", today_str, status="SKIPPED_EXPIRED", now_dt=now)
+                if not self.checkpoint.is_task_completed("eod_t0_check", today_str):
+                    self.checkpoint.mark_task_completed("eod_t0_check", today_str, status="SKIPPED_EXPIRED", now_dt=now)
 
             # 4. 检查最近应复盘交易日是否缺失复盘与收盘选股池
             if target_review_date:
@@ -898,26 +941,25 @@ class QuantScheduler2:
                 dates_in_file = [x.get("date") for x in hist] if isinstance(hist, list) else []
                 review_done = self.checkpoint.is_task_completed("post_review", target_review_date) or (target_review_date in dates_in_file)
                 if not review_done:
-                    print(f"[Scheduler 2.0] 检测到 {target_review_date} 收盘复盘缺失，正在静默补跑...")
+                    logger.info(f"[Scheduler 2.0] 检测到 {target_review_date} 收盘复盘缺失，正在静默补跑...")
                     try:
-                        rev_res = review_engine_v2.run_daily_review(auto_optimize=True)
+                        rev_res = review_engine_v2.run_daily_review(auto_optimize=True, target_date=target_review_date)
                         self.checkpoint.mark_task_completed("post_review", rev_res.get("date", target_review_date), status="DONE_BACKFILL", now_dt=now)
                     except Exception as e:
-                        print(f"[Scheduler 2.0] 补跑收盘复盘异常: {e}")
+                        logger.warning(f"[Scheduler 2.0] 补跑收盘复盘异常: {e}")
 
             if (is_weekday and cur_hm >= "15:30") or (not is_weekday):
                 if not self.latest_scan_results and not sync:
-                    print("[Scheduler 2.0] 全市场多因子选股池为空，后台静默执行盘后补选...")
+                    logger.info("[Scheduler 2.0] 全市场多因子选股池为空，后台静默执行盘后补选...")
                     self.run_market_scan_async(limit=120, notify=False)
 
             self.checkpoint.record_heartbeat(trading_date=today_str, now_dt=now)
-            print("[Scheduler 2.0] 开机自检与断档恢复就绪，所有量化水位与台账已对齐。")
+            logger.info("[Scheduler 2.0] 开机自检与断档恢复就绪，所有量化水位与台账已对齐。")
 
         if sync:
             _backfill_worker()
         else:
-            t = threading.Thread(target=_backfill_worker, daemon=True)
-            t.start()
+            self._submit_bg(_backfill_worker)
 
     def stop(self):
         if self.is_running:
@@ -925,6 +967,11 @@ class QuantScheduler2:
             set_windows_sleep_prevention(False)
             self.scheduler.shutdown(wait=False)
             self.is_running = False
+        with self._exec_lock:
+            if self._bg_executor is not None:
+                self._bg_executor.shutdown(wait=False, cancel_futures=True)
+                self._bg_executor = None
+        logger.info("[Scheduler 2.0] 自动化后台调度引擎与工作线程池已关闭。")
 
 
 quant_scheduler2 = QuantScheduler2()

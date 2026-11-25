@@ -2,21 +2,21 @@
 A股智能量化系统 2.0 - FastAPI RESTful 核心服务层 (App 2.0)
 提供高并发行情监控、多因子波段选股、高精筹码分布、日内做T、因果回测与复盘自进化 API
 """
-import os
-import json
+import math
 import numpy as np
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Body, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
 
 from config import (
-    load_config, save_config, SIGNALS_FILE,
+    load_config, save_config, validate_config_patch, SIGNALS_FILE,
     WATCHLIST_FILE, REVIEW_FILE, OPTIMIZATION_FILE
 )
+from core.logger import get_logger
+from core.persistence import load_watchlist, mutate_watchlist, safe_read_json
 from core.data_engine import data_engine
 from core.sentiment_radar import sentiment_radar
 from core.multi_factor_strategy import multi_factor_strategy
@@ -28,6 +28,49 @@ from core.strategy_tail_230 import tail_strategy_230, tail_trade_tracker
 from notifier.manager import notification_manager
 from scheduler.task_runner import quant_scheduler2
 from core.t0_group_manager import t0_group_manager
+
+logger = get_logger("web")
+
+
+def _parse_float_field(raw: Any, field_name: str, default: Optional[float] = None, min_value: Optional[float] = None) -> float:
+    if raw is None or raw == "":
+        if default is not None:
+            val = float(default)
+        else:
+            raise HTTPException(status_code=400, detail=f"缺少或无效的数值字段: {field_name}")
+    else:
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"字段 {field_name} 必须为有效数字")
+    if not math.isfinite(val):
+        raise HTTPException(status_code=400, detail=f"字段 {field_name} 不能为 NaN 或无穷大")
+    if min_value is not None and val < min_value:
+        raise HTTPException(status_code=400, detail=f"字段 {field_name} 不能小于 {min_value}")
+    return val
+
+
+def _parse_int_field(raw: Any, field_name: str, default: Optional[int] = None, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
+    if raw is None or raw == "":
+        if default is not None:
+            val = int(default)
+        else:
+            raise HTTPException(status_code=400, detail=f"缺少或无效的整数字段: {field_name}")
+    else:
+        if isinstance(raw, bool):
+            raise HTTPException(status_code=400, detail=f"字段 {field_name} 必须为有效整数")
+        try:
+            fval = float(raw)
+            if not math.isfinite(fval):
+                raise ValueError("non-finite")
+            val = int(fval)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"字段 {field_name} 必须为有效整数")
+    if min_value is not None and val < min_value:
+        raise HTTPException(status_code=400, detail=f"字段 {field_name} 不能小于 {min_value}")
+    if max_value is not None and val > max_value:
+        raise HTTPException(status_code=400, detail=f"字段 {field_name} 不能大于 {max_value}")
+    return val
 
 
 def _resolve_available_from_payload(raw_value, holding_shares):
@@ -101,10 +144,17 @@ def get_config():
 
 @app.post("/api/config")
 def update_config(cfg: Dict[str, Any]):
-    success = save_config(cfg)
+    try:
+        cleaned_cfg = validate_config_patch(cfg)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    success = save_config(cleaned_cfg)
     if success:
         multi_factor_strategy.reload_config()
         portfolio_risk.reload_config()
+        tail_strategy_230.reload_config()
+        backtest_engine_v2.reload_config()
         return {"success": True, "message": "配置保存并热加载生效成功"}
     raise HTTPException(status_code=500, detail="保存配置失败")
 
@@ -113,6 +163,7 @@ def test_notification():
     test_signal = {
         "symbol": "sh600519",
         "name": "贵州茅台",
+        "is_test": True,
         "signal_type": "BUY",
         "signal_desc": "2.0多因子共振突破买点(测试通道)",
         "price": 1680.00,
@@ -146,13 +197,7 @@ def get_dingtalk_status():
 @app.get("/api/watchlist")
 def get_watchlist():
     """获取自选股清单与实时行情、多因子评分、持仓盈亏"""
-    items = []
-    if WATCHLIST_FILE.exists():
-        try:
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                items = json.load(f)
-        except Exception:
-            pass
+    items = load_watchlist(WATCHLIST_FILE)
 
     symbols = [x['symbol'] for x in items if x.get('symbol')]
     quotes = data_engine.get_realtime_quotes(symbols)
@@ -167,12 +212,20 @@ def get_watchlist():
         cost = float(it.get('holding_cost') or it.get('entry_price') or 0.0)
         shares = int(it.get('holding_shares') or it.get('shares') or 0)
 
-        q = quotes.get(sym, {})
-        cur_p = q.get('price', 0.0)
-        chg_pct = q.get('change_pct', 0.0)
+        q = quotes.get(sym, {}) or {}
+        cur_p = float(q.get('price') or 0.0)
+        chg_pct = float(q.get('change_pct') or 0.0)
+        quote_available = cur_p > 0
+        if not quote_available and float(q.get('prev_close') or 0.0) > 0:
+            cur_p = float(q.get('prev_close') or 0.0)
+            quote_available = cur_p > 0
 
-        pnl_pct = round((cur_p - cost) / cost * 100.0, 2) if cost > 0 else 0.0
-        pnl_val = round((cur_p - cost) * shares, 2) if cost > 0 else 0.0
+        if quote_available and cost > 0:
+            pnl_pct = round((cur_p - cost) / cost * 100.0, 2)
+            pnl_val = round((cur_p - cost) * shares, 2)
+        else:
+            pnl_pct = 0.0
+            pnl_val = 0.0
 
         gid = it.get('group_id', '')
         gname = groups_map.get(gid, "默认做T组" if gid == "group_default" else "未分组") if gid else "未分组"
@@ -185,6 +238,7 @@ def get_watchlist():
             "holding_shares": shares,
             "available_shares": portfolio_risk.resolve_available_shares(it),
             "current_price": cur_p,
+            "quote_available": quote_available,
             "change_pct": chg_pct,
             "turnover": q.get('turnover', 0.0),
             "pnl_pct": pnl_pct,
@@ -210,52 +264,51 @@ def add_to_watchlist(item: Dict[str, Any]):
     sym = resolved["symbol"]
     name = resolved["name"]
     code = resolved["code"]
-    group_id = item.get("group_id", "")
+    group_id = str(item.get("group_id", "") or "").strip()
     t0_enabled = bool(item.get("t0_enabled", True))
+    parsed_cost = _parse_float_field(item.get("holding_cost"), "holding_cost", default=0.0, min_value=0.0) if "holding_cost" in item else None
+    parsed_shares = _parse_int_field(item.get("holding_shares"), "holding_shares", default=0, min_value=0) if "holding_shares" in item else None
+    parsed_avail = _parse_int_field(item.get("available_shares"), "available_shares", default=None, min_value=0) if item.get("available_shares") is not None else None
 
-    items = []
-    if WATCHLIST_FILE.exists():
-        try:
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                items = json.load(f)
-        except Exception:
-            pass
+    def _upsert(items: List[Dict[str, Any]]):
+        for it in items:
+            if it.get("symbol") == sym:
+                it["holding_cost"] = parsed_cost if parsed_cost is not None else float(it.get("holding_cost", 0.0))
+                it["holding_shares"] = parsed_shares if parsed_shares is not None else int(it.get("holding_shares", 0))
+                raw_avail = parsed_avail if parsed_avail is not None else it.get("available_shares")
+                it["available_shares"] = _resolve_available_from_payload(raw_avail, it["holding_shares"])
+                it["notes"] = str(item.get("notes", it.get("notes", "")) or "")
+                if "group_id" in item:
+                    it["group_id"] = group_id
+                if "t0_enabled" in item:
+                    it["t0_enabled"] = t0_enabled
+                return True, {"exists": True, "item": it.copy()}
 
-    for it in items:
-        if it.get("symbol") == sym:
-            it["holding_cost"] = float(item.get("holding_cost", it.get("holding_cost", 0.0)))
-            it["holding_shares"] = int(item.get("holding_shares", it.get("holding_shares", 0)))
-            raw_avail = item.get("available_shares")
-            if raw_avail is None:
-                raw_avail = it.get("available_shares")
-            it["available_shares"] = _resolve_available_from_payload(raw_avail, it["holding_shares"])
-            it["notes"] = item.get("notes", it.get("notes", ""))
-            if "group_id" in item:
-                it["group_id"] = group_id
-            if "t0_enabled" in item:
-                it["t0_enabled"] = t0_enabled
-            with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False, indent=2)
-            return {"success": True, "message": "标的已在自选池，已更新持仓信息", "item": it}
+        init_cost = parsed_cost if parsed_cost is not None else 0.0
+        init_shares = parsed_shares if parsed_shares is not None else 0
+        new_item = {
+            "symbol": sym,
+            "code": code,
+            "name": name,
+            "holding_cost": init_cost,
+            "holding_shares": init_shares,
+            "available_shares": _resolve_available_from_payload(parsed_avail, init_shares),
+            "notes": str(item.get("notes", "") or ""),
+            "group_id": group_id,
+            "t0_enabled": t0_enabled
+        }
+        items.append(new_item)
+        return True, {"exists": False, "item": new_item.copy()}
 
-    new_item = {
-        "symbol": sym,
-        "code": code,
-        "name": name,
-        "holding_cost": float(item.get("holding_cost", 0.0)),
-        "holding_shares": int(item.get("holding_shares", 0)),
-        "available_shares": _resolve_available_from_payload(
-            item.get("available_shares"), item.get("holding_shares", 0)
-        ),
-        "notes": item.get("notes", ""),
-        "group_id": group_id,
-        "t0_enabled": t0_enabled
-    }
-    items.append(new_item)
-    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
+    try:
+        res = mutate_watchlist(WATCHLIST_FILE, _upsert)
+    except Exception as e:
+        logger.exception(f"保存自选股失败 ({sym}): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {"success": True, "message": f"成功添加 {name} 至自选池", "item": new_item}
+    if res["exists"]:
+        return {"success": True, "message": "标的已在自选池，已更新持仓信息", "item": res["item"]}
+    return {"success": True, "message": f"成功添加 {name} 至自选池", "item": res["item"]}
 
 @app.put("/api/watchlist/{symbol}")
 @app.post("/api/watchlist/{symbol}")
@@ -265,21 +318,19 @@ def update_watchlist_item(symbol: str, data: Dict[str, Any] = Body(...)):
     if not WATCHLIST_FILE.exists():
         raise HTTPException(status_code=404, detail="自选池为空")
 
-    try:
-        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-            items = json.load(f)
+    parsed_cost = _parse_float_field(data["holding_cost"], "holding_cost", min_value=0.0) if "holding_cost" in data else None
+    parsed_shares = _parse_int_field(data["holding_shares"], "holding_shares", min_value=0) if "holding_shares" in data else None
+    parsed_avail = _parse_int_field(data["available_shares"], "available_shares", min_value=0) if ("available_shares" in data and data["available_shares"] is not None) else None
 
-        found = False
-        target_item = None
+    def _update(items: List[Dict[str, Any]]):
         for it in items:
             if it.get("symbol") == sym:
-                found = True
-                if "holding_cost" in data:
-                    it["holding_cost"] = max(0.0, float(data["holding_cost"]))
-                if "holding_shares" in data:
-                    it["holding_shares"] = max(0, int(data["holding_shares"]))
-                if "available_shares" in data:
-                    it["available_shares"] = max(0, int(data["available_shares"]))
+                if parsed_cost is not None:
+                    it["holding_cost"] = parsed_cost
+                if parsed_shares is not None:
+                    it["holding_shares"] = parsed_shares
+                if parsed_avail is not None:
+                    it["available_shares"] = parsed_avail
                 elif it.get("available_shares") is None:
                     # 未显式填写过可卖数量时，默认沿用总持仓
                     it["available_shares"] = it.get("holding_shares", 0)
@@ -289,29 +340,33 @@ def update_watchlist_item(symbol: str, data: Dict[str, Any] = Body(...)):
                 )
                 if "notes" in data:
                     it["notes"] = str(data["notes"]).strip()
+                pending_gid = None
                 if "group_id" in data:
                     gid = str(data["group_id"]).strip()
                     it["group_id"] = gid
-                    t0_group_manager.set_stock_group(sym, gid)
+                    pending_gid = gid
                 if "t0_enabled" in data:
                     it["t0_enabled"] = bool(data["t0_enabled"])
-                target_item = it
-                break
+                return True, (True, it.copy(), pending_gid)
+        return False, (False, None, None)
 
+    try:
+        found, target_item, pending_gid = mutate_watchlist(WATCHLIST_FILE, _update)
         if not found:
             raise HTTPException(status_code=404, detail=f"自选池中未找到标的 {sym}")
-
-        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
-
+        # 锁顺序严格为 T0GroupManager._lock -> WATCHLIST_LOCK，避免与 mutate_watchlist 形成 AB-BA 死锁
+        if pending_gid is not None:
+            t0_group_manager.set_stock_group(sym, pending_gid)
+        refreshed = next((x for x in load_watchlist(WATCHLIST_FILE) if x.get("symbol") == sym), target_item)
         return {
             "success": True,
-            "message": f"已成功更新 {target_item.get('name', sym)} 的持仓信息",
-            "item": target_item
+            "message": f"已成功更新 {refreshed.get('name', sym)} 的持仓信息",
+            "item": refreshed
         }
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception(f"更新自选股持仓失败 ({sym}): {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/watchlist/{symbol}")
@@ -320,14 +375,18 @@ def delete_from_watchlist(symbol: str):
     if not WATCHLIST_FILE.exists():
         return {"success": True}
 
-    try:
-        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-            items = json.load(f)
+    def _delete(items: List[Dict[str, Any]]):
         filtered = [x for x in items if x.get("symbol") != sym]
-        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(filtered, f, ensure_ascii=False, indent=2)
+        if len(filtered) == len(items):
+            return False, None
+        items[:] = filtered
+        return True, None
+
+    try:
+        mutate_watchlist(WATCHLIST_FILE, _delete)
         return {"success": True, "message": f"已将 {sym} 移出自选池"}
     except Exception as e:
+        logger.exception(f"移出自选股失败 ({sym}): {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/t0/monitor")
@@ -336,13 +395,7 @@ def get_t0_monitor():
     if not load_config().get("t0_monitor_enabled", True):
         return []
 
-    watchlist = []
-    if WATCHLIST_FILE.exists():
-        try:
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-                watchlist = json.load(f)
-        except Exception:
-            pass
+    watchlist = load_watchlist(WATCHLIST_FILE)
 
     symbols = [
         x['symbol'] for x in watchlist
@@ -398,14 +451,6 @@ def get_t0_monitor():
         t0_res["group_name"] = gname
         t0_res["t0_enabled"] = it.get('t0_enabled', True)
         results.append(t0_res)
-
-        # 实时自动同步推送做T开仓/平仓/止损指令 (去重机制由 notification_manager 兜底，绝不重复刷屏)
-        act = t0_res.get("signal_action")
-        if act in ["BUY_T", "SELL_T", "CLOSE_T", "STOP_T"]:
-            sig_payload = t0_smart_engine.build_signal_payload(t0_res)
-            sig_payload["group_id"] = gid
-            sig_payload["group_name"] = gname
-            notification_manager.send_signal(sig_payload)
 
     return results
 
@@ -519,7 +564,7 @@ def get_financial_analysis(symbol: str, force_refresh: bool = False):
     return financial_engine.analyze(sym, name, force_refresh=force_refresh)
 
 @app.get("/api/stock/kline")
-def get_stock_kline(symbol: str, count: int = 150):
+def get_stock_kline(symbol: str, count: int = Query(default=150, ge=30, le=1200)):
     """获取K线序列（附带MA均线、MACD与主力筹码）供图表绘制"""
     sym = data_engine.format_symbol(symbol)
     df = data_engine.get_daily_kline(sym, count=count)
@@ -559,7 +604,7 @@ def get_stock_kline(symbol: str, count: int = 150):
     }
 
 @app.post("/api/scan/start")
-def start_scan(limit: int = 100, notify: bool = False):
+def start_scan(limit: int = Query(default=100, ge=10, le=500), notify: bool = False):
     quant_scheduler2.run_market_scan_async(limit=limit, notify=notify)
     return {"success": True, "message": "全市场主板智能选股已在后台启动"}
 
@@ -576,16 +621,11 @@ def search_stocks(query: str = Query(..., min_length=1)):
 
 @app.get("/api/signals/history")
 def get_signals_history():
-    if SIGNALS_FILE.exists():
-        try:
-            with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    data = safe_read_json(SIGNALS_FILE, [])
+    return data if isinstance(data, list) else []
 
 @app.get("/api/backtest")
-def run_backtest(symbol: str = "sh601138", days: int = 600):
+def run_backtest(symbol: str = "sh601138", days: int = Query(default=600, ge=60, le=2000)):
     """执行因果历史回测（对比沪深300基准）"""
     res = backtest_engine_v2.run_single_stock_backtest(symbol=symbol, days=days)
     if "error" in res:
@@ -594,25 +634,15 @@ def run_backtest(symbol: str = "sh601138", days: int = 600):
 
 @app.get("/api/review/latest")
 def get_latest_review():
-    if REVIEW_FILE.exists():
-        try:
-            with open(REVIEW_FILE, "r", encoding="utf-8") as f:
-                history = json.load(f)
-                if history:
-                    return history[0]
-        except Exception:
-            pass
+    history = safe_read_json(REVIEW_FILE, [])
+    if isinstance(history, list) and history:
+        return history[0]
     return review_engine_v2.run_daily_review(auto_optimize=False)
 
 @app.get("/api/review/history")
 def get_review_history():
-    if REVIEW_FILE.exists():
-        try:
-            with open(REVIEW_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    history = safe_read_json(REVIEW_FILE, [])
+    return history if isinstance(history, list) else []
 
 @app.post("/api/review/run")
 def run_review_now():
@@ -621,13 +651,8 @@ def run_review_now():
 
 @app.get("/api/optimization/log")
 def get_optimization_log():
-    if OPTIMIZATION_FILE.exists():
-        try:
-            with open(OPTIMIZATION_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    logs = safe_read_json(OPTIMIZATION_FILE, [])
+    return logs if isinstance(logs, list) else []
 
 # ==================== 尾盘 2:30 突袭战法专用 API ====================
 
@@ -670,16 +695,19 @@ def add_tail230_trade(data: Dict[str, Any] = Body(...)):
     """录入用户确认的主板实际买入成交，仅用于行情提醒。"""
     sym = data.get("symbol")
     name = data.get("name", sym)
-    price = float(data.get("buy_price") or data.get("price") or 0.0)
+    raw_price = data.get("buy_price") if "buy_price" in data else data.get("price")
+    price = _parse_float_field(raw_price, "buy_price", min_value=0.01) if raw_price is not None else 0.0
     if not sym or price <= 0 or not data_engine.is_main_board_equity(sym):
         raise HTTPException(status_code=400, detail="请输入沪深主板普通股代码及有效的实际成交价")
+    target_pct = _parse_float_field(data.get("target_pct"), "target_pct", default=2.5, min_value=0.1)
+    stop_pct = _parse_float_field(data.get("stop_pct"), "stop_pct", default=1.8, min_value=0.1)
     t = tail_trade_tracker.add_manual_trade(
         symbol=sym,
         name=name,
         buy_price=price,
         buy_date=data.get("buy_date"),
-        target_pct=float(data.get("target_pct", 2.5)),
-        stop_pct=float(data.get("stop_pct", 1.8))
+        target_pct=target_pct,
+        stop_pct=stop_pct
     )
     return {"success": True, "trade": t}
 
@@ -688,7 +716,7 @@ def close_tail230_trade(data: Dict[str, Any] = Body(...)):
     """录入用户确认的实际卖出成交价；行情提醒本身不会结算成交。"""
     sym = data.get("symbol")
     buy_date = data.get("buy_date")
-    price = float(data.get("exit_price", 0.0))
+    price = _parse_float_field(data.get("exit_price"), "exit_price", default=0.0, min_value=0.0)
     if price <= 0:
         raise HTTPException(status_code=400, detail="实际卖出成交价必须大于0")
     reason = data.get("exit_reason", "手动平仓离场")
@@ -728,7 +756,7 @@ def refresh_limitup_settlement():
 def record_limitup_trades(data: Dict[str, Any] = Body(default={})):
     """将今日精选打板候选股票一键录入实战跟踪账本"""
     from core.limit_up_engine import limit_up_engine
-    top_n = int(data.get("top_n", 3))
+    top_n = _parse_int_field(data.get("top_n"), "top_n", default=3, min_value=1, max_value=20)
     candidates = limit_up_engine.scan_today_candidates(limit=10)
     added = limit_up_engine.record_board_hitting_trades(candidates, top_n=top_n)
     return {"success": True, "added_count": len(added), "added": added}

@@ -14,29 +14,33 @@ A股智能量化系统 2.0 - 上市公司财报与经营状况全景分析引擎
 4. 成长性与真实主业景气度 (Growth Momentum): 营收、归母净利润与扣非净利润同比增速 (YoY)；
 5. 综合基本面得分 (0~100) 与企业经营画像 (Enterprise Persona).
 """
-import re
-import json
 import time
+import threading
 import requests
+from requests.adapters import HTTPAdapter
 import numpy as np
-import pandas as pd
-from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
-from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
 
-from config import DATA_DIR, load_config
+from config import DATA_DIR
 from core.data_engine import data_engine
+from core.logger import get_logger
+from core.persistence import atomic_write_json, safe_read_json
 
 FINANCIAL_CACHE_FILE = DATA_DIR / "financial_cache.json"
+logger = get_logger("financial_engine")
 
 class FinancialAnalysisEngine:
     def __init__(self):
         self.session = requests.Session()
         self.session.trust_env = False  # 绕过本地代理，直连行情源
+        adapter = HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": "https://emweb.securities.eastmoney.com"
         })
+        self._lock = threading.RLock()
         self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._cache_ttl = 3600 * 24  # 财报为季报/年报数据，内存缓存24小时
         self._load_local_cache()
@@ -56,29 +60,28 @@ class FinancialAnalysisEngine:
         return float(value) if cls._has_finite_value(value) else default
 
     def _load_local_cache(self):
-        try:
-            if FINANCIAL_CACHE_FILE.exists():
-                with open(FINANCIAL_CACHE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    now = time.time()
-                    for k, v in data.items():
-                        # 若缓存仍在 7 天有效期内，载入内存
-                        t = v.get("cached_at", 0)
-                        if now - t < 3600 * 24 * 7:
-                            self._cache[k] = (t, v.get("data", {}))
-        except Exception:
-            self._cache = {}
+        with self._lock:
+            data = safe_read_json(FINANCIAL_CACHE_FILE, {})
+            if isinstance(data, dict):
+                now = time.time()
+                loaded: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+                for k, v in data.items():
+                    if not isinstance(v, dict):
+                        continue
+                    t = v.get("cached_at", 0)
+                    if now - t < 3600 * 24 * 7:
+                        loaded[k] = (t, v.get("data", {}))
+                self._cache = loaded
+            else:
+                self._cache = {}
 
     def _save_local_cache(self):
-        try:
-            FINANCIAL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            export = {}
-            for k, (t, d) in self._cache.items():
-                export[k] = {"cached_at": t, "data": d}
-            with open(FINANCIAL_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(export, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"保存财报缓存异常: {e}")
+        with self._lock:
+            export = {
+                k: {"cached_at": t, "data": d}
+                for k, (t, d) in list(self._cache.items())
+            }
+        atomic_write_json(FINANCIAL_CACHE_FILE, export)
 
     def fetch_raw_financials(self, symbol: str, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -99,8 +102,11 @@ class FinancialAnalysisEngine:
 
         # 检查缓存 (支持 force_refresh 强制绕过缓存拉取最新财报)
         now = time.time()
-        if not force_refresh and em_code in self._cache and (now - self._cache[em_code][0]) < self._cache_ttl:
-            return self._cache[em_code][1]
+        if not force_refresh:
+            with self._lock:
+                cached_item = self._cache.get(em_code)
+                if cached_item and (now - cached_item[0]) < self._cache_ttl:
+                    return cached_item[1]
 
         result = {
             "is_etf": False,
@@ -118,7 +124,7 @@ class FinancialAnalysisEngine:
                 data = resp.json()
                 result["dupont_list"] = data.get("bgq", []) or data.get("data", [])
         except Exception as e:
-            pass
+            logger.warning(f"拉取 {em_code} 杜邦财务数据异常: {e}")
 
         # 2. 抓取主要财务指标（毛利、净利、扣非、每股现金流等）
         url_zyzb = f"https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/ZYZBAjaxNew?type=0&code={em_code}"
@@ -128,10 +134,11 @@ class FinancialAnalysisEngine:
                 data = resp.json()
                 result["indicator_list"] = data.get("data", []) or []
         except Exception as e:
-            pass
+            logger.warning(f"拉取 {em_code} 核心财务指标异常: {e}")
 
         if result["dupont_list"] or result["indicator_list"]:
-            self._cache[em_code] = (now, result)
+            with self._lock:
+                self._cache[em_code] = (now, result)
             self._save_local_cache()
             return result
 
@@ -360,13 +367,27 @@ class FinancialAnalysisEngine:
         }
 
         # 4. A股特色财务排雷避雷雷达 (Red Flags)
+        tot_assets_known = self._has_finite_value(latest_dp.get("TOTAL_ASSETS"))
+        tot_liab_known = self._has_finite_value(latest_dp.get("TOTAL_LIABILITIES"))
         tot_assets = self._finite_float(latest_dp.get("TOTAL_ASSETS"))
         tot_liab = self._finite_float(latest_dp.get("TOTAL_LIABILITIES"))
-        net_assets = max(tot_assets - tot_liab, 1.0)
+        raw_net_assets = tot_assets - tot_liab
+        balance_sheet_known = tot_assets_known and tot_liab_known
+        is_insolvent = balance_sheet_known and raw_net_assets <= 0.0
+        net_assets = raw_net_assets if (balance_sheet_known and raw_net_assets > 0.0) else 0.0
 
         goodwill_val = latest_dp.get("GOODWILL")
-        goodwill = self._finite_float(goodwill_val) if self._has_finite_value(goodwill_val) else 0.0
-        goodwill_ratio = round(goodwill / net_assets * 100.0, 2) if net_assets > 0 else 0.0
+        goodwill_disclosed = self._has_finite_value(goodwill_val)
+        goodwill = self._finite_float(goodwill_val) if goodwill_disclosed else 0.0
+        if goodwill_disclosed and is_insolvent and goodwill > 0:
+            goodwill_ratio = 100.0
+        elif balance_sheet_known and net_assets > 0:
+            # 东财接口对无商誉公司（如 600519）通常将 GOODWILL 置为 None；仅资产负债表完整时按 0 商誉估算并保留披露标志
+            goodwill_ratio = round(goodwill / net_assets * 100.0, 2)
+        elif goodwill_disclosed and balance_sheet_known:
+            goodwill_ratio = 0.0
+        else:
+            goodwill_ratio = None
 
         receivables_known = all(self._has_finite_value(latest_dp.get(k)) for k in ("ACCOUNTS_RECE", "TOTAL_OPERATE_INCOME"))
         inventory_known = all(self._has_finite_value(latest_dp.get(k)) for k in ("INVENTORY", "TOTAL_ASSETS"))
@@ -391,6 +412,11 @@ class FinancialAnalysisEngine:
 
         risk_tags = []
         has_major_risk = False
+
+        # 资不抵债红线
+        if is_insolvent:
+            risk_tags.append(f"🚨【严重资不抵债】总负债({tot_liab/1e8:.2f}亿)超出总资产({tot_assets/1e8:.2f}亿)，净资产为负，存在重大财务违约/退市风险！")
+            has_major_risk = True
 
         # 商誉风险
         if goodwill_ratio is not None and goodwill_ratio >= 35.0:
@@ -435,7 +461,12 @@ class FinancialAnalysisEngine:
             "has_major_risk": has_major_risk,
             "triggered_risks": risk_tags,
             "goodwill_ratio": goodwill_ratio,
-            "goodwill_risk": "数据缺失·无法判断" if goodwill_ratio is None else (f"商誉占比 {goodwill_ratio}% (安全)" if goodwill_ratio < 20.0 else f"商誉偏高 ({goodwill_ratio}%)"),
+            "goodwill_disclosed": goodwill_disclosed,
+            "is_insolvent": is_insolvent,
+            "goodwill_risk": "数据缺失·无法判断" if goodwill_ratio is None else (
+                f"商誉占比 {goodwill_ratio}% ({'安全' if goodwill_disclosed else '报表未单列商誉·按0计'})"
+                if goodwill_ratio < 20.0 else f"商誉偏高 ({goodwill_ratio}%)"
+            ),
             "receivables_ratio": receivables_ratio,
             "receivables_risk": "数据缺失·无法判断" if receivables_ratio is None else (f"应收占营收 {receivables_ratio}% (正常)" if receivables_ratio < 35.0 else f"应收偏高 ({receivables_ratio}%)"),
             "debt_ratio": debt_ratio if debt_known else None,
@@ -543,10 +574,10 @@ class FinancialAnalysisEngine:
             "data_available": True,
             "data_quality": {
                 "available": True,
-                "can_assess_risk": True,
+                "can_assess_risk": can_assess_risk,
                 "missing_risk_metrics": missing_risk_metrics,
-                "can_generate_composite_score": True,
-                "score_reason": ""
+                "can_generate_composite_score": can_assess_risk,
+                "score_reason": "" if can_assess_risk else ("缺少风险评估字段：" + "、".join(missing_risk_metrics))
             },
             "is_etf": False,
             "report_name": report_name,

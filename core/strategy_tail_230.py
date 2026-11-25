@@ -15,17 +15,20 @@ import concurrent.futures
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
 
 from config import load_config, TAIL_TRADES_FILE, TAIL_SIGNALS_CACHE_FILE
+from core.logger import get_logger
 from core.data_engine import data_engine
 from core.sentiment_radar import sentiment_radar
 from core.chip_engine import chip_engine
 from core.rsrs_skew import calculate_rsrs_skew
 from core.persistence import atomic_write_json, safe_read_json
+
+logger = get_logger("tail230")
 
 
 class TailStrategy230:
@@ -64,8 +67,8 @@ class TailStrategy230:
             symbols = [s["symbol"] for s in elig[:self.backtest_universe_size]]
             if symbols:
                 return symbols
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[Tail230] 构建默认流动性回测池异常: {e}")
         return [
             "sh601138", "sh600519", "sh601899", "sh600036",
             "sz002475", "sh600900", "sz000333", "sh600276",
@@ -561,7 +564,7 @@ class TailStrategy230:
             market = sentiment_radar.analyze_market_regime()
             gate = self.evaluate_market_gate(market)
             if not gate["allowed"]:
-                print(f"[Tail230] {gate['reason']}")
+                logger.info(f"[Tail230] {gate['reason']}")
                 self._cached_candidates = []
                 self._candidates_cache_time = datetime.now()
                 return []
@@ -604,8 +607,8 @@ class TailStrategy230:
                         res["name"] = name
                         res["symbol"] = sym
                         return res
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[Tail230] 扫描个股 {sym} 异常: {e}")
                 return None
 
             candidates = []
@@ -677,7 +680,8 @@ class TailStrategy230:
     def calculate_strategy_win_rate(
         self,
         sample_symbols: Optional[List[str]] = None,
-        days: int = 60
+        days: int = 60,
+        lookback_days: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         严格因果 5 分钟级历史回测（杜绝未来函数）：
@@ -729,6 +733,10 @@ class TailStrategy230:
 
         # A股真实双边交易摩擦：双边佣金(万2.5*2) + 印花税(万5) + 双边滑点(万5*2) ≈ 0.20%
         friction_pct = 0.20
+        cutoff_date_str: Optional[str] = None
+        if lookback_days is not None and int(lookback_days) > 0:
+            from datetime import timedelta
+            cutoff_date_str = (datetime.now() - timedelta(days=int(lookback_days))).strftime("%Y-%m-%d")
 
         for sym, daily_df in symbol_daily.items():
             info = data_engine.resolve_symbol(sym)
@@ -742,6 +750,8 @@ class TailStrategy230:
 
             for i in range(25, len(daily_df) - 1):
                 sig_date = dates[i]
+                if cutoff_date_str and sig_date < cutoff_date_str:
+                    continue
                 next_date = dates[i + 1]
                 if sig_date not in m5_by_date or next_date not in m5_by_date:
                     continue
