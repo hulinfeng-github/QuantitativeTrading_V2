@@ -43,6 +43,9 @@ OPTIMIZATION_FILE = DATA_DIR / "optimization_log.json"
 LIMIT_UP_TRADES_FILE = DATA_DIR / "limit_up_trades.json"
 LIMIT_UP_CSV_FILE = DATA_DIR / "limit_up_ledger.csv"
 T0_GROUPS_FILE = DATA_DIR / "t0_groups.json"
+SCHEDULER_STATE_FILE = DATA_DIR / "scheduler_state.json"
+PUSH_DEDUP_FILE = DATA_DIR / "push_dedup_cache.json"
+TAIL_SIGNALS_CACHE_FILE = DATA_DIR / "tail_candidates_cache.json"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -173,22 +176,32 @@ DEFAULT_CONFIG = {
     "market_close_scan_time": "15:30",   # 盘后全市场智能精选时间
     "review_auto_optimize_enabled": True,  # 自动调参仍需达到最小已结算样本门槛
     
-    # ---------------- 7. 2:30 尾盘突袭战法参数 ----------------
+    # ---------------- 7. 2:30 尾盘突袭战法参数 (分时微结构+筹码RSRS协同) ----------------
     "tail230_target_profit_pct": 2.5,   # 次日早盘冲高止盈目标 (%)
     "tail230_stop_loss_pct": 1.8,       # 次日防守底线止损线 (%)
     "tail230_auto_track_top_n": 3,      # 每日14:32自动纳入次日卖出监控的前N只标的
     "tail230_morning_check_enabled": True, # 开启次日 09:28 集合竞价操盘计划预警
-    "tail230_min_pct": 2.0,             # 最小日内涨幅 (%)
-    "tail230_max_pct": 5.5,             # 最大日内涨幅 (%，防过热追高)
-    "tail230_min_vol_ratio": 1.25,      # 最小量比 (主力抢筹特征)
+    "tail230_min_pct": 1.5,             # 最小日内涨幅 (%)
+    "tail230_max_pct": 5.8,             # 最大日内涨幅 (%，防过热追高)
+    "tail230_min_vol_ratio": 1.15,      # 最小全天折算量比 (主力抢筹特征)
     "tail230_min_turnover": 120000000.0,# 最小日成交额 (1.2亿元，保障流动性)
-    "tail230_backtest_universe_size": 80, # 回测代表性样本数 (按成交额取沪深主板流动性居前标的)
+    "tail230_min_vwap_hold_ratio": 0.60,# 分时站稳均价线(VWAP)最低时间占比
+    "tail230_min_tail_vol_mult": 0.95,  # 14:00后尾盘量能相对于盘中均量的最低脉冲倍数(拒收尾盘缩量萎靡)
+    "tail230_max_roc5_pct": 22.0,       # 5日最大累计涨幅上限 (防连续加速高位接盘)
+    "tail230_backtest_universe_size": 50, # 回测代表性样本数 (基于真实5分钟K线因果回测)
     
-    # ---------------- 8. 游资龙虎打板量化参数 ----------------
-    "limit_up_auto_notify_enabled": True,  # 自动推送涨停候选研究摘要
-    "limit_up_scan_interval_minutes": 10,  # 盘中打板监控扫描间隔 (分钟)
-    "limit_up_min_hardness": 80.0,         # 自动推送要求的最低封板硬度分
-    "limit_up_auto_track_top_n": 2,        # 每次自动推送并跟踪的精选标的数
+    # ---------------- 8. 游资龙虎打板量化参数 (严格只做弱转强 Weak-to-Strong) ----------------
+    "limit_up_strategy_mode": "weak_to_strong_only", # 策略模式：严格仅限T-1分歧转T日走强
+    "limit_up_auto_notify_enabled": True,  # 自动推送弱转强打板候选摘要
+    "limit_up_scan_interval_minutes": 3,   # 盘中打板常态监控扫描间隔 (分钟)
+    "limit_up_wzs_prime_interval_minutes": 2, # 早盘黄金弱转强窗口(09:30-10:30)高灵敏扫描间隔 (分钟)
+    "limit_up_min_hardness": 75.0,         # 自动推送要求的最低弱转强置信度评分
+    "limit_up_auto_track_top_n": 3,        # 每次自动推送并跟踪的精选弱转强标的数
+    "limit_up_wzs_min_open_pct": 1.5,      # 弱转强最低竞价高开幅度 (%，严格超预期高开)
+    "limit_up_wzs_max_open_pct": 8.0,      # 弱转强最高允许竞价高开幅度 (%，防一字板无买点)
+    "limit_up_wzs_max_t1_amp_pct": 16.0,   # T-1日最大允许振幅 (%，规避天地/地天剧烈妖股隔日核按钮)
+    "limit_up_wzs_max_seal_time": "11:00", # 弱转强最晚确认上板时点 (早盘上午转强确定性远高于午后偷袭)
+    "limit_up_wzs_min_early_vol_ratio": 0.12, # 早盘30分钟成交量占T-1全天成交量最低比例
     "tail230_auto_scan_enabled": True,     # 自动扫描尾盘研究候选；不自动记录成交
 
     # ---------------- 9. Web 服务配置 (默认 8089 避开冲突) ----------------
@@ -231,11 +244,10 @@ def load_config() -> dict:
 
 def save_config(new_config: dict) -> bool:
     try:
+        from core.persistence import atomic_write_json
         cfg = load_config()
         cfg.update(new_config)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        return True
+        return atomic_write_json(CONFIG_FILE, cfg)
     except Exception as e:
         print(f"保存配置失败: {e}")
         return False

@@ -4,39 +4,67 @@
 """
 import json
 import time
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
-from config import load_config, SIGNALS_FILE
+from config import load_config, SIGNALS_FILE, PUSH_DEDUP_FILE
+from core.persistence import atomic_write_json, safe_read_json
 from notifier.dingtalk import DingTalkNotifier
 from notifier.wechat import WeChatNotifier
 
 class NotificationManager:
     def __init__(self):
+        self._lock = threading.RLock()
         self._sent_cache = set()
+        self._sent_by_date: Dict[str, List[str]] = {}
         self._load_sent_cache()
 
     def _load_sent_cache(self):
-        """系统启动或重载时从 signals_history.json 预加载今日已发推送去重缓存，防止服务重启后重复刷屏"""
-        try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            if SIGNALS_FILE.exists():
-                with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-                    if isinstance(history, list):
-                        for sig in history:
-                            if isinstance(sig, dict) and sig.get("date") == today:
-                                sym = sig.get("symbol", "")
-                                st = sig.get("signal_type", "")
-                                if not (sym and st):
-                                    continue
-                                ts_raw = str(sig.get("timestamp") or "")
-                                try:
-                                    when = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
-                                except ValueError:
-                                    when = datetime.now()
-                                self._sent_cache.add(self._dedup_key(sym, st, when))
-        except Exception:
-            pass
+        """系统启动或重载时从 push_dedup_cache.json 与 signals_history.json 恢复今日已发推送去重缓存，彻底防止重启重复刷屏"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        with self._lock:
+            # 1. 从持久化去重账本恢复（包含 Markdown 摘要与全量信号 Key）
+            persisted = safe_read_json(PUSH_DEDUP_FILE, {})
+            if isinstance(persisted, dict):
+                cleaned: Dict[str, List[str]] = {}
+                for d, keys in persisted.items():
+                    if str(d) >= cutoff and isinstance(keys, list):
+                        cleaned[str(d)] = [str(k) for k in keys]
+                        if str(d) == today:
+                            self._sent_cache.update(cleaned[str(d)])
+                self._sent_by_date = cleaned
+
+            # 2. 兼容兜底：从 signals_history.json 补全今日历史信号 Key
+            history = safe_read_json(SIGNALS_FILE, [])
+            if isinstance(history, list):
+                for sig in history:
+                    if isinstance(sig, dict) and sig.get("date") == today:
+                        sym = sig.get("symbol", "")
+                        st = sig.get("signal_type", "")
+                        if not (sym and st):
+                            continue
+                        ts_raw = str(sig.get("timestamp") or "")
+                        try:
+                            when = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            when = datetime.now()
+                        k = self._dedup_key(sym, st, when)
+                        self._sent_cache.add(k)
+                        day_keys = self._sent_by_date.setdefault(today, [])
+                        if k not in day_keys:
+                            day_keys.append(k)
+
+    def _mark_dedup_sent(self, cache_key: str, day_str: Optional[str] = None):
+        today = day_str or datetime.now().strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        with self._lock:
+            self._sent_cache.add(cache_key)
+            self._sent_by_date = {d: ks for d, ks in self._sent_by_date.items() if d >= cutoff}
+            day_keys = self._sent_by_date.setdefault(today, [])
+            if cache_key not in day_keys:
+                day_keys.append(cache_key)
+                atomic_write_json(PUSH_DEDUP_FILE, self._sent_by_date)
 
     @staticmethod
     def _dedup_key(symbol: str, sig_type: str, when: Optional[datetime] = None) -> str:
@@ -65,8 +93,10 @@ class NotificationManager:
         today = datetime.now().strftime("%Y-%m-%d")
         cache_key = self._dedup_key(symbol, sig_type, datetime.now())
 
-        if not force and cache_key in self._sent_cache:
-            return {"dingtalk": False, "wechat": False, "skipped": True}
+        if not force:
+            with self._lock:
+                if cache_key in self._sent_cache:
+                    return {"dingtalk": False, "wechat": False, "skipped": True}
 
         cfg = load_config()
         results = {"dingtalk": False, "wechat": False, "skipped": False}
@@ -140,7 +170,7 @@ class NotificationManager:
             results["wechat"] = wx.send_trade_signal(signal)
 
         if results["dingtalk"] or results["wechat"]:
-            self._sent_cache.add(cache_key)
+            self._mark_dedup_sent(cache_key, today)
 
         # 记录到信号历史文件
         if sig_type and sig_type not in ["HOLD", "HOLDING", "HOLD_T", "HOLDING_T"]:
@@ -164,14 +194,15 @@ class NotificationManager:
         # 1. 过滤已发送去重缓存
         filtered_signals = []
         skipped_count = 0
-        for s in signals:
-            sym = s.get("symbol", "")
-            st = s.get("signal_type", "")
-            ck = self._dedup_key(sym, st, datetime.now())
-            if not force and ck in self._sent_cache:
-                skipped_count += 1
-                continue
-            filtered_signals.append(s)
+        with self._lock:
+            for s in signals:
+                sym = s.get("symbol", "")
+                st = s.get("signal_type", "")
+                ck = self._dedup_key(sym, st, datetime.now())
+                if not force and ck in self._sent_cache:
+                    skipped_count += 1
+                    continue
+                filtered_signals.append(s)
 
         if not filtered_signals:
             return {"total": len(signals), "sent": 0, "skipped": skipped_count, "dingtalk": False, "wechat": False}
@@ -249,7 +280,7 @@ class NotificationManager:
             sym = s.get("symbol", "")
             st = s.get("signal_type", "")
             if dt_sent or wx_sent:
-                self._sent_cache.add(self._dedup_key(sym, st, datetime.now()))
+                self._mark_dedup_sent(self._dedup_key(sym, st, datetime.now()), today)
             if st and st not in ["HOLD", "HOLDING", "HOLD_T", "HOLDING_T"]:
                 self._record_signal_history(s)
 
@@ -267,16 +298,24 @@ class NotificationManager:
         text: str,
         group_id: Optional[str] = None,
         broadcast_groups: bool = False,
-        module_filter: Optional[str] = None
-    ) -> Dict[str, bool]:
+        module_filter: Optional[str] = None,
+        dedup_key: Optional[str] = None,
+        force: bool = False
+    ) -> Dict[str, Any]:
         """
         发送 Markdown 消息
         - group_id: 指定特定做T分组的钉钉群
         - broadcast_groups: 是否向所有已开启的做T分组钉钉群广播
         - module_filter: 模块订阅过滤开关 (如 'push_screener', 'push_tail230', 'push_limitup', 'push_review')
+        - dedup_key: 跨重启幂等去重 Key（如 'tail230_scan:2026-11-25'）
         """
+        if dedup_key and not force:
+            with self._lock:
+                if dedup_key in self._sent_cache:
+                    return {"dingtalk": False, "wechat": False, "skipped": True}
+
         cfg = load_config()
-        results = {"dingtalk": False, "wechat": False}
+        results = {"dingtalk": False, "wechat": False, "skipped": False}
         from core.t0_group_manager import t0_group_manager
 
         if broadcast_groups:
@@ -319,6 +358,8 @@ class NotificationManager:
         if cfg.get("wechat_enabled") and cfg.get("wechat_token"):
             wx = WeChatNotifier(provider=cfg.get("wechat_provider", "pushplus"), token=cfg.get("wechat_token"))
             results["wechat"] = wx.send_markdown(title, text)
+        if dedup_key and (results["dingtalk"] or results["wechat"]):
+            self._mark_dedup_sent(dedup_key)
         return results
 
     def get_dingtalk_status(self) -> Dict[str, Any]:
@@ -369,16 +410,15 @@ class NotificationManager:
             if signal.get("is_test"):
                 return
 
-            history = []
-            if SIGNALS_FILE.exists():
-                with open(SIGNALS_FILE, "r", encoding="utf-8") as f:
-                    history = json.load(f)
-            entry = signal.copy()
-            entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            history.insert(0, entry)
-            history = history[:100]  # 保留最新100条
-            with open(SIGNALS_FILE, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+            with self._lock:
+                history = safe_read_json(SIGNALS_FILE, [])
+                if not isinstance(history, list):
+                    history = []
+                entry = signal.copy()
+                entry["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                history.insert(0, entry)
+                history = history[:150]  # 保留最新150条
+                atomic_write_json(SIGNALS_FILE, history)
         except Exception:
             pass
 

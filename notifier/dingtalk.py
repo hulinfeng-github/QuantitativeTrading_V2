@@ -289,7 +289,10 @@ def format_batch_signals_markdown(signals: List[Dict[str, Any]], group_name: str
         elif sig_type in ["TAIL_PROFIT_EXIT", "TAIL_STOP_EXIT", "TAIL_TIMED_EXIT", "TAIL_EOD_EXIT"]:
             item_lines.append(f"- **尾盘策略行情提醒**: 当前价 {fmt_p(price)}元，价格变化 {pnl_pct:+.2f}%（未扣费用）。提醒不代表委托或成交，请核对实际持仓。")
         elif sig_type == "LIMIT_UP":
-            item_lines.append(f"- **日线涨停候选**: 参考价 {fmt_p(price)}元 | 日线规则分 {signal.get('hardness_score', '不可用')} | 不是交易指令或盘口强度判断。")
+            s_time = signal.get("seal_time") or "-"
+            s_tr = signal.get("seal_turnover_ratio")
+            tr_str = f" | 封成比 {s_tr:.1f}%" if s_tr is not None else ""
+            item_lines.append(f"- **⚡ 弱转强专精打板**: 参考价 {fmt_p(price)}元 | 置信分 {signal.get('hardness_score', '-')} | 上板 {s_time}{tr_str}")
 
         reasons = signal.get("reasons", [])
         if reasons:
@@ -644,17 +647,22 @@ class DingTalkNotifier:
                 "- 请核对实际持仓、可卖数量与委托成交；本提醒不会下单或记录卖出成交。"
             ])
 
-        # 7. Daily-bar limit-up candidate research summary (LIMIT_UP)
+        # 7. Weak-to-strong limit-up candidate summary (LIMIT_UP)
         elif sig_type == "LIMIT_UP":
-            b_type = signal.get("board_type", "首板突破")
+            b_type = signal.get("board_type", "弱转强打板")
             ladder = signal.get("ladder_count", 1)
+            s_time = signal.get("seal_time") or "实时跟踪中"
+            o_cnt = signal.get("open_count")
+            s_tr = signal.get("seal_turnover_ratio")
+            meta_parts = [f"上板/触发时间: **{s_time}**"]
+            if o_cnt is not None:
+                meta_parts.append(f"炸板次数: **{o_cnt}次**")
+            if s_tr is not None:
+                meta_parts.append(f"买一封成比: **{s_tr:.1f}%**")
             lines.extend([
-                f"- **🎯 板型结构**: **{b_type}** (当前连板数: **{ladder}板**)",
-                f"- **日线技术规则分**: **{signal.get('hardness_score', '不可用')} 分** (非封板硬度或盘口数据)",
-                f"- **候选参考价**: **{fmt_p(price)} 元** (不代表可成交价格)",
-                "",
-                "仅使用日线数据生成的候选信号。系统没有封单队列、真实封板时间、炸板次数、实际成交和涨跌停排队信息。",
-                "该信号不是买卖指令；历史后续行情跟踪不代表本账户成交或策略净收益。请自行核对交易规则和风险。"
+                f"- **🎯 弱转强形态**: **{b_type}** (连板高度: **{ladder}板**)",
+                f"- **量化置信度**: **{signal.get('hardness_score', '不可用')} 分** | {' | '.join(meta_parts)}",
+                f"- **候选参考价**: **{fmt_p(price)} 元** (仅作模型观察，请结合真实板块地位与排板流动性决策)"
             ])
 
         if reasons:

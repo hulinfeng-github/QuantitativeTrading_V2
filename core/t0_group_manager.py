@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set
 
 from config import T0_GROUPS_FILE, WATCHLIST_FILE, load_config
+from core.persistence import atomic_write_json
 from notifier.dingtalk import DingTalkNotifier
 
 DEFAULT_MODULE_SWITCHES = {
@@ -81,14 +82,7 @@ class T0GroupManager:
         return []
 
     def _save_raw_groups(self, groups: List[Dict[str, Any]]) -> bool:
-        try:
-            self.storage_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.storage_file, "w", encoding="utf-8") as f:
-                json.dump(groups, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            print(f"[T0GroupManager] 保存分组配置失败: {e}")
-            return False
+        return atomic_write_json(self.storage_file, groups)
 
     def _read_watchlist(self) -> List[Dict[str, Any]]:
         if not self.watchlist_file.exists():
@@ -103,14 +97,7 @@ class T0GroupManager:
         return []
 
     def _save_watchlist(self, watchlist: List[Dict[str, Any]]) -> bool:
-        try:
-            self.watchlist_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.watchlist_file, "w", encoding="utf-8") as f:
-                json.dump(watchlist, f, ensure_ascii=False, indent=2)
-            return True
-        except Exception as e:
-            print(f"[T0GroupManager] 保存自选池失败: {e}")
-            return False
+        return atomic_write_json(self.watchlist_file, watchlist)
 
     def get_groups(self, include_stocks: bool = True) -> List[Dict[str, Any]]:
         """获取所有分组详情，包含各组关联的股票信息与统计（支持不同分组包含重合股票）"""

@@ -18,6 +18,7 @@ from config import (
     DATA_DIR, load_config, save_config,
     SIGNALS_FILE, WATCHLIST_FILE, REVIEW_FILE, OPTIMIZATION_FILE
 )
+from core.persistence import atomic_write_json, safe_read_json
 from core.data_engine import data_engine
 from core.sentiment_radar import sentiment_radar
 from core.multi_factor_strategy import multi_factor_strategy
@@ -710,27 +711,26 @@ class ReviewEngineV2:
 
     def _save_review_history(self, review_data: Dict[str, Any]):
         try:
-            history = []
-            if REVIEW_FILE.exists():
-                with open(REVIEW_FILE, "r", encoding="utf-8") as f:
-                    history = json.load(f)
+            history = safe_read_json(REVIEW_FILE, [])
+            if not isinstance(history, list):
+                history = []
+            rev_date = review_data.get("date")
+            if rev_date:
+                history = [h for h in history if h.get("date") != rev_date]
             history.insert(0, review_data)
             history = history[:30]  # 保留近30次
-            with open(REVIEW_FILE, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+            atomic_write_json(REVIEW_FILE, history)
         except Exception:
             pass
 
     def _save_optimization_log(self, opt_entry: Dict[str, Any]):
         try:
-            logs = []
-            if OPTIMIZATION_FILE.exists():
-                with open(OPTIMIZATION_FILE, "r", encoding="utf-8") as f:
-                    logs = json.load(f)
+            logs = safe_read_json(OPTIMIZATION_FILE, [])
+            if not isinstance(logs, list):
+                logs = []
             logs.insert(0, opt_entry)
             logs = logs[:50]
-            with open(OPTIMIZATION_FILE, "w", encoding="utf-8") as f:
-                json.dump(logs, f, ensure_ascii=False, indent=2)
+            atomic_write_json(OPTIMIZATION_FILE, logs)
         except Exception:
             pass
 

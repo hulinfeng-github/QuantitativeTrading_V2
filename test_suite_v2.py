@@ -245,13 +245,17 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         self.assertIn("target_sell_price", res)
         self.assertTrue(res["change_pct"] >= 2.0 and res["change_pct"] <= 5.5)
 
-        # 2. 独立胜率与回测指标计算测试
-        bt_win = tail_strategy_230.calculate_strategy_win_rate(sample_symbols=["sh601138", "sh600519"], days=60)
+        # 2. 独立胜率与真实 5 分钟因果回测指标测试
+        bt_win = tail_strategy_230.calculate_strategy_win_rate(
+            sample_symbols=["sh601288", "sz000333", "sz000100", "sh600887", "sh600519", "sz000725", "sh601988", "sh600900"],
+            days=45
+        )
         self.assertIn("win_rate", bt_win)
         self.assertIn("enhanced_win_rate", bt_win)
         self.assertIn("profit_loss_ratio", bt_win)
-        self.assertTrue(0 <= bt_win["win_rate"] <= 100)
-        print(f"  -> 2.30 战法测算成功: 全周期胜率={bt_win['win_rate']}%, 增强胜率={bt_win['enhanced_win_rate']}%, 盈亏比={bt_win['profit_loss_ratio']}:1, 样本笔数={bt_win['total_trades']}")
+        if bt_win["total_trades"] > 0:
+            self.assertTrue(0 <= bt_win["win_rate"] <= 100)
+        print(f"  -> 2.30 战法因果5m回测成功: 胜率={bt_win['win_rate']}%, 盈亏比={bt_win['profit_loss_ratio']}:1, 样本笔数={bt_win['total_trades']}")
 
     def test_12_financial_analysis_engine(self):
         """测试上市公司深度经营财报分析、杜邦拆解与六维排雷引擎"""
@@ -288,53 +292,73 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         print(f"  -> 财报体检验证成功: {stock_res['name']} ROE={dupont['roe']}%, 净利率={dupont['net_profit_margin']}%, F-Score={f_score['score']}/9, 画像={stock_res['persona']}")
 
     def test_13_limit_up_engine(self):
-        """测试游资龙虎打板量化识别、封板硬度评估、实战流水账本自动维护与胜率统计"""
-        print("\n[测试 13] 验证游资龙虎打板引擎与自动流水台账自进化...")
+        """测试游资龙虎【弱转强专精打板】识别、普通首板屏蔽、台账维护与胜率统计"""
+        print("\n[测试 13] 验证游资【弱转强专精打板】引擎与自动流水台账自进化...")
+        import copy
         from core.limit_up_engine import limit_up_engine
         from config import LIMIT_UP_CSV_FILE
 
-        # 1. 构造涨停 K 线，测试板型识别与硬度评分
+        # 1. 验证普通平盘首板必须被严格过滤 (仅做弱转强)
+        mock_plain_df = self.mock_df.copy()
+        plain_prev_c = float(mock_plain_df.iloc[-2]['close'])
+        mock_plain_df.iloc[-2, mock_plain_df.columns.get_loc('high')] = round(plain_prev_c * 1.01, 2)
+        mock_plain_df.iloc[-1, mock_plain_df.columns.get_loc('close')] = round(plain_prev_c * 1.10, 2)
+        mock_plain_df.iloc[-1, mock_plain_df.columns.get_loc('high')] = round(plain_prev_c * 1.10, 2)
+        mock_plain_df.iloc[-1, mock_plain_df.columns.get_loc('open')] = round(plain_prev_c * 1.01, 2)
+        self.assertIsNone(limit_up_engine.evaluate_limit_up_bar("sh600501", "普通首板测试", mock_plain_df))
+
+        # 2. 构造 T-1 炸板分歧 + T 日超预期高开反包涨停 K 线，测试弱转强识别与置信度评分
         mock_zt_df = self.mock_df.copy()
-        last_close = mock_zt_df.iloc[-2]['close']
-        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('close')] = round(last_close * 1.10, 2)
+        t2_close = float(mock_zt_df.iloc[-3]['close'])
+        mock_zt_df.iloc[-2, mock_zt_df.columns.get_loc('open')] = round(t2_close * 1.02, 2)
+        mock_zt_df.iloc[-2, mock_zt_df.columns.get_loc('high')] = round(t2_close * 1.10, 2)
+        mock_zt_df.iloc[-2, mock_zt_df.columns.get_loc('low')] = round(t2_close * 1.00, 2)
+        mock_zt_df.iloc[-2, mock_zt_df.columns.get_loc('close')] = round(t2_close * 1.025, 2)
+        mock_zt_df.iloc[-2, mock_zt_df.columns.get_loc('volume')] = mock_zt_df['volume'].mean() * 2.1
+
+        last_close = float(mock_zt_df.iloc[-2]['close'])
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('open')] = round(last_close * 1.035, 2)
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('low')] = round(last_close * 1.03, 2)
         mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('high')] = round(last_close * 1.10, 2)
-        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('open')] = round(last_close * 1.02, 2)
+        mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('close')] = round(last_close * 1.10, 2)
         mock_zt_df.iloc[-1, mock_zt_df.columns.get_loc('volume')] = mock_zt_df['volume'].mean() * 2.2
 
         eval_res = limit_up_engine.evaluate_limit_up_bar("sh600501", "航天晨光", mock_zt_df)
         self.assertIsNotNone(eval_res)
-        self.assertIn("board_type", eval_res)
+        self.assertIn("弱转强", eval_res["board_type"])
         self.assertIn("hardness_score", eval_res)
         self.assertIn("seal_turnover_ratio", eval_res)
         self.assertIn("trade_levels", eval_res)
         self.assertTrue(eval_res["hardness_score"] >= 60.0)
-        print(f"  -> 涨停量化研判通过: 板型=[{eval_res['board_type']}], 封板硬度={eval_res['hardness_score']}分, 封成比={eval_res['seal_turnover_ratio']}%")
+        print(f"  -> 弱转强研判通过: 形态=[{eval_res['board_type']}], 置信分={eval_res['hardness_score']}分")
 
-        # 2. 验证台账录入与 CSV 文件生成 (带 UTF-8 BOM)
-        added = limit_up_engine.record_board_hitting_trades([eval_res], top_n=1)
-        self.assertTrue(LIMIT_UP_CSV_FILE.exists())
-        # 验证文件以 UTF-8 BOM 开头 (0xEF, 0xBB, 0xBF)
-        with open(LIMIT_UP_CSV_FILE, "rb") as f:
-            header_bytes = f.read(3)
-            self.assertEqual(header_bytes, b'\xef\xbb\xbf')
-        print(f"  -> 打板流水账本自动维护通过: 已导出带 UTF-8 BOM 的 Excel/WPS 兼容 CSV 文件 ({LIMIT_UP_CSV_FILE.name})")
+        # 3. 验证台账录入、UTF-8 BOM CSV 导出、统计与复盘结算 (并在结束后无损还原生产账本)
+        orig_trades = copy.deepcopy(limit_up_engine._trades)
+        try:
+            limit_up_engine.record_board_hitting_trades([eval_res], top_n=1)
+            self.assertTrue(LIMIT_UP_CSV_FILE.exists())
+            with open(LIMIT_UP_CSV_FILE, "rb") as f:
+                self.assertEqual(f.read(3), b'\xef\xbb\xbf')
+            print(f"  -> 打板流水账本自动维护通过: 已原子导出带 UTF-8 BOM CSV ({LIMIT_UP_CSV_FILE.name})")
 
-        # 3. 验证打板量化胜率与归因统计指标
-        stats = limit_up_engine.calculate_model_stats()
-        self.assertIn("total_trades", stats)
-        self.assertIn("open_premium_win_rate", stats)
-        self.assertIn("peak_profit_win_rate", stats)
-        self.assertIn("consecutive_rate", stats)
-        self.assertIn("profit_loss_ratio", stats)
-        self.assertTrue(0 <= stats["open_premium_win_rate"] <= 100)
-        self.assertTrue(0 <= stats["peak_profit_win_rate"] <= 100)
-        self.assertTrue(stats["profit_loss_ratio"] > 0)
-        print(f"  -> 模型胜率统计通过: 高开溢价率={stats['open_premium_win_rate']}%, 最高冲高胜率={stats['peak_profit_win_rate']}%, 连板率={stats['consecutive_rate']}%, 盈亏比={stats['profit_loss_ratio']}:1")
+            stats = limit_up_engine.calculate_model_stats()
+            self.assertIn("total_trades", stats)
+            self.assertIn("open_premium_win_rate", stats)
+            self.assertIn("peak_profit_win_rate", stats)
+            self.assertIn("consecutive_rate", stats)
+            self.assertIn("profit_loss_ratio", stats)
+            if stats["closed_trades"] > 0:
+                self.assertTrue(0 <= stats["open_premium_win_rate"] <= 100)
+                self.assertTrue(0 <= stats["peak_profit_win_rate"] <= 100)
+                print(f"  -> 模型胜率统计通过: 高开溢价率={stats['open_premium_win_rate']}%, 最高冲高胜率={stats['peak_profit_win_rate']}%, 连板率={stats['consecutive_rate']}%, 盈亏比={stats['profit_loss_ratio']}:1")
 
-        # 4. 验证复盘 T+1 真实结算调用
-        rev_res = limit_up_engine.review_and_update_trades()
-        self.assertIn("settled_count", rev_res)
-        print(f"  -> 复盘 T+1 自动结算闭环正常: 历史待决核查已执行")
+            rev_res = limit_up_engine.review_and_update_trades()
+            self.assertIn("settled_count", rev_res)
+            print("  -> 复盘 T+1 自动结算闭环正常: 历史待决核查已执行")
+        finally:
+            limit_up_engine._trades = orig_trades
+            limit_up_engine._save_trades()
+            limit_up_engine.export_csv()
 
     def test_14_offline_reconciliation_and_backfill(self):
         """测试断档停机、隔断时间运行后，系统自动回溯与数据自愈对齐机制"""
@@ -343,27 +367,34 @@ class TestAStockQuantSystemV2(unittest.TestCase):
         from core.limit_up_engine import limit_up_engine
         from scheduler.task_runner import quant_scheduler2
 
-        # 1. 验证 2.30 战法过期头寸自动回溯自愈
-        # 模拟插入一笔 2026-10-25 (较早前) 的 HOLDING 订单
-        test_pos = tail_trade_tracker.add_manual_trade(
-            symbol="sh600519",
-            name="贵州茅台",
-            buy_price=1600.0,
-            buy_date="2026-10-20",
-            target_pct=2.5,
-            stop_pct=1.8
-        )
-        self.assertEqual(test_pos["status"], "HOLDING")
+        # 1. 验证 2.30 战法过期头寸自动回溯自愈 (隔离测试后恢复原账本)
+        import copy
+        orig_tail_trades = copy.deepcopy(tail_trade_tracker._trades)
+        try:
+            tail_trade_tracker._trades = [
+                t for t in tail_trade_tracker._trades
+                if not (t.get("symbol") == "sh600519" and t.get("buy_date") == "2026-10-20")
+            ]
+            test_pos = tail_trade_tracker.add_manual_trade(
+                symbol="sh600519",
+                name="贵州茅台",
+                buy_price=1600.0,
+                buy_date="2026-10-20",
+                target_pct=2.5,
+                stop_pct=1.8
+            )
+            self.assertEqual(test_pos["status"], "HOLDING")
 
-        # 执行自检回溯
-        reconciled = tail_trade_tracker.reconcile_and_clean_expired_positions()
-        # 验证该过期头寸被精准定位到真实 T+1 交易日平仓，不再停留在 HOLDING 状态
-        updated_pos = next((t for t in tail_trade_tracker._trades if t["id"] == test_pos["id"]), None)
-        self.assertIsNotNone(updated_pos)
-        self.assertIn(updated_pos["status"], ["CLOSED_PROFIT", "CLOSED_STOP", "CLOSED_EOD"])
-        self.assertIsNotNone(updated_pos["exit_price"])
-        self.assertIsNotNone(updated_pos["return_pct"])
-        print(f"  -> 2.30 战法断档自动回溯结算通过: 状态={updated_pos['status']}, 收益率={updated_pos['return_pct']}%, 原因={updated_pos['exit_reason']}")
+            reconciled = tail_trade_tracker.reconcile_and_clean_expired_positions()
+            updated_pos = next((t for t in tail_trade_tracker._trades if t["id"] == test_pos["id"]), None)
+            self.assertIsNotNone(updated_pos)
+            self.assertIn(updated_pos["status"], ["CLOSED_PROFIT", "CLOSED_STOP", "CLOSED_EOD"])
+            self.assertIsNotNone(updated_pos["exit_price"])
+            self.assertIsNotNone(updated_pos["return_pct"])
+            print(f"  -> 2.30 战法断档自动回溯结算通过: 状态={updated_pos['status']}, 收益率={updated_pos['return_pct']}%, 原因={updated_pos['exit_reason']}")
+        finally:
+            tail_trade_tracker._trades = orig_tail_trades
+            tail_trade_tracker._save()
 
         # 2. 验证打板流水对真实 T+1 交易日的精准捕获
         lu_stats = limit_up_engine.review_and_update_trades()

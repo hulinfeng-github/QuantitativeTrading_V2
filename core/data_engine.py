@@ -10,14 +10,17 @@ A股智能量化系统 2.0 - 多源韧性数据引擎 (DataEngine 2.0)
 import re
 import json
 import time
+import threading
 import requests
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from config import BASE_DIR, DATA_DIR, load_config
+from core.persistence import atomic_write_json, safe_read_json
 
 STOCK_LIST_CACHE = DATA_DIR / "main_board_stocks.json"
+PLATES_CACHE_FILE = DATA_DIR / "stock_plates_cache.json"
 
 class DataEngine:
     def __init__(self):
@@ -27,8 +30,18 @@ class DataEngine:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer": "https://finance.qq.com"
         })
+        self._lock = threading.RLock()
         self._quote_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._kline_5m_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+        self._trading_dates_cache: Tuple[float, List[str]] = (0.0, [])
+        self._plates_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_ttl = 2.0  # 行情内存缓存 2 秒
+        self._load_plates_cache()
+
+    def _load_plates_cache(self):
+        data = safe_read_json(PLATES_CACHE_FILE, {})
+        if isinstance(data, dict):
+            self._plates_cache = data
 
     @staticmethod
     def clean_code(code: str) -> str:
@@ -128,10 +141,27 @@ class DataEngine:
                     prev_close = float(fields[4]) if fields[4] else 0.0
                     open_price = float(fields[5]) if fields[5] else 0.0
                     volume = float(fields[6]) if fields[6] else 0.0
+                    outer_vol = float(fields[7]) if len(fields) > 7 and fields[7] else 0.0
+                    inner_vol = float(fields[8]) if len(fields) > 8 and fields[8] else 0.0
+                    bid1 = float(fields[9]) if len(fields) > 9 and fields[9] else 0.0
+                    bid1_vol = float(fields[10]) if len(fields) > 10 and fields[10] else 0.0
+                    ask1 = float(fields[19]) if len(fields) > 19 and fields[19] else 0.0
+                    ask1_vol = float(fields[20]) if len(fields) > 20 and fields[20] else 0.0
                     high = float(fields[33]) if len(fields) > 33 and fields[33] else price
                     low = float(fields[34]) if len(fields) > 34 and fields[34] else price
                     turnover = float(fields[37]) if len(fields) > 37 and fields[37] else 0.0
+                    turnover_rate = float(fields[38]) if len(fields) > 38 and fields[38] else 0.0
+                    amplitude = float(fields[43]) if len(fields) > 43 and fields[43] else 0.0
+                    float_mkt_cap = float(fields[44]) if len(fields) > 44 and fields[44] else 0.0
+                    limit_up_price = float(fields[47]) if len(fields) > 47 and fields[47] else (round(prev_close * 1.10, 2) if prev_close > 0 else 0.0)
+                    limit_down_price = float(fields[48]) if len(fields) > 48 and fields[48] else (round(prev_close * 0.90, 2) if prev_close > 0 else 0.0)
+                    vol_ratio = float(fields[49]) if len(fields) > 49 and fields[49] else 0.0
+                    vwap = float(fields[51]) if len(fields) > 51 and fields[51] else 0.0
                     change_pct = float(fields[32]) if len(fields) > 32 and fields[32] else 0.0
+
+                    turnover_yuan = turnover * 10000.0
+                    if vwap <= 0 and volume > 0 and turnover_yuan > 0:
+                        vwap = round(turnover_yuan / (volume * 100.0), 3)
 
                     q_data = {
                         "symbol": sym,
@@ -143,8 +173,21 @@ class DataEngine:
                         "high": high,
                         "low": low,
                         "volume": volume,
-                        "turnover": turnover * 10000.0,  # 转换为元
+                        "turnover": turnover_yuan,  # 转换为元
                         "change_pct": change_pct,
+                        "outer_vol": outer_vol,
+                        "inner_vol": inner_vol,
+                        "bid1": bid1,
+                        "bid1_vol": bid1_vol,
+                        "ask1": ask1,
+                        "ask1_vol": ask1_vol,
+                        "turnover_rate": turnover_rate,
+                        "amplitude": amplitude,
+                        "float_mkt_cap": float_mkt_cap,  # 亿元
+                        "limit_up_price": limit_up_price,
+                        "limit_down_price": limit_down_price,
+                        "vol_ratio": vol_ratio,
+                        "vwap": vwap,
                         "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
                     results[sym] = q_data
@@ -302,47 +345,239 @@ class DataEngine:
     def get_minute_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """
         获取股票当日分时数据并聚合分时成交均价 (VWAP)
+        主通道：腾讯分时 query；备选：腾讯 m1 K线最近交易日聚合
         """
         sym = self.format_symbol(symbol)
         url = f"http://web.ifzq.gtimg.cn/appstock/app/minute/query?code={sym}"
         try:
             resp = self.session.get(url, timeout=5)
-            if resp.status_code != 200:
-                return None
-            data = resp.json().get("data", {}).get(sym, {})
-            min_data = data.get("data", {}).get("data", [])
-            if not min_data:
-                return None
-
-            records = []
-            cum_vol = 0.0
-            cum_amt = 0.0
-
-            for row in min_data:
-                parts = row.split(" ")
-                if len(parts) < 3:
-                    continue
-                t_str = parts[0]
-                price = float(parts[1])
-                cum_volume = float(parts[2])  # 累计成交量(手)
-                amt = float(parts[3]) if len(parts) > 3 else (price * cum_volume * 100.0)
-
-                # 分时成交均价 VWAP 计算
-                vwap = (amt / (cum_volume * 100.0)) if cum_volume > 0 else price
-
-                records.append({
-                    "time": f"{t_str[:2]}:{t_str[2:]}",
-                    "price": price,
-                    "volume": cum_volume,
-                    "amount": amt,
-                    "vwap": round(vwap, 3)
-                })
-
-            df = pd.DataFrame(records)
-            return df
+            if resp.status_code == 200:
+                data = resp.json().get("data", {}).get(sym, {})
+                min_data = data.get("data", {}).get("data", [])
+                if min_data:
+                    records = []
+                    for row in min_data:
+                        parts = row.split(" ")
+                        if len(parts) < 3:
+                            continue
+                        t_str = parts[0]
+                        price = float(parts[1])
+                        cum_volume = float(parts[2])  # 累计成交量(手)
+                        amt = float(parts[3]) if len(parts) > 3 else (price * cum_volume * 100.0)
+                        vwap = (amt / (cum_volume * 100.0)) if cum_volume > 0 else price
+                        records.append({
+                            "time": f"{t_str[:2]}:{t_str[2:]}",
+                            "price": price,
+                            "volume": cum_volume,
+                            "amount": amt,
+                            "vwap": round(vwap, 3)
+                        })
+                    if records:
+                        return pd.DataFrame(records)
         except Exception as e:
             print(f"获取 {sym} 分时数据异常: {e}")
+
+        # 备选：腾讯 m1 分钟K线提取最新交易日完整分时
+        try:
+            mk_url = f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={sym},m1,,260"
+            resp = self.session.get(mk_url, timeout=5)
+            if resp.status_code == 200:
+                arr = resp.json().get("data", {}).get(sym, {}).get("m1", [])
+                if arr:
+                    latest_day = str(arr[-1][0])[:8]
+                    day_bars = [row for row in arr if str(row[0]).startswith(latest_day)]
+                    records = []
+                    cum_vol = 0.0
+                    cum_amt = 0.0
+                    for row in day_bars:
+                        ts = str(row[0])
+                        hhmm = f"{ts[8:10]}:{ts[10:12]}"
+                        price = float(row[2])
+                        bar_vol = float(row[5]) if len(row) > 5 else 0.0  # 手
+                        bar_amt_wan = float(row[7]) if len(row) > 7 else (price * bar_vol / 100.0)
+                        cum_vol += bar_vol
+                        cum_amt += bar_amt_wan * 10000.0
+                        vwap = (cum_amt / (cum_vol * 100.0)) if cum_vol > 0 else price
+                        records.append({
+                            "time": hhmm,
+                            "price": price,
+                            "volume": cum_vol,
+                            "amount": cum_amt,
+                            "vwap": round(vwap, 3)
+                        })
+                    if records:
+                        return pd.DataFrame(records)
+        except Exception:
+            pass
+        return None
+
+    def get_intraday_kline_5m(self, symbol: str, count: int = 1200) -> Optional[pd.DataFrame]:
+        """
+        获取多交易日 5 分钟历史K线（用于两点半战法与弱转强打板的严格因果分钟级回测）：
+        返回字段：datetime, date_str, time_str, open, high, low, close, volume, vwap
+        主通道：新浪财经 getKLineData(scale=5, 最大可达 2000 根 ≈ 41 个交易日)
+        备选：腾讯 mkline(m5,,320 ≈ 6.6 个交易日)
+        """
+        sym = self.format_symbol(symbol)
+        cache_key = f"{sym}_{count}"
+        now_ts = time.time()
+        with self._lock:
+            cached = self._kline_5m_cache.get(cache_key)
+            if cached and (now_ts - cached[0]) < 120.0:
+                return cached[1].copy()
+
+        records = []
+        # 通道 1: 新浪 5 分钟历史 K 线
+        try:
+            sina_url = (
+                f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                f"CN_MarketData.getKLineData?symbol={sym}&scale=5&ma=no&datalen={int(count)}"
+            )
+            resp = self.session.get(sina_url, timeout=5)
+            if resp.status_code == 200:
+                raw_items = resp.json()
+                if isinstance(raw_items, list) and len(raw_items) > 0:
+                    for item in raw_items:
+                        dt_str = str(item.get("day", "")).strip()
+                        if len(dt_str) < 16:
+                            continue
+                        records.append({
+                            "datetime": dt_str,
+                            "date_str": dt_str[:10],
+                            "time_str": dt_str[11:16],
+                            "open": float(item["open"]),
+                            "high": float(item["high"]),
+                            "low": float(item["low"]),
+                            "close": float(item["close"]),
+                            "volume": float(item.get("volume", 0.0)),  # 股
+                        })
+        except Exception:
+            records = []
+
+        # 通道 2: 腾讯 mkline 5 分钟备选
+        if not records:
+            try:
+                qq_len = min(max(100, int(count)), 320)
+                qq_url = f"https://ifzq.gtimg.cn/appstock/app/kline/mkline?param={sym},m5,,{qq_len}"
+                resp = self.session.get(qq_url, timeout=5)
+                if resp.status_code == 200:
+                    arr = resp.json().get("data", {}).get(sym, {}).get("m5", [])
+                    for row in arr:
+                        ts = str(row[0])
+                        if len(ts) < 12:
+                            continue
+                        date_s = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]}"
+                        time_s = f"{ts[8:10]}:{ts[10:12]}"
+                        records.append({
+                            "datetime": f"{date_s} {time_s}:00",
+                            "date_str": date_s,
+                            "time_str": time_s,
+                            "open": float(row[1]),
+                            "close": float(row[2]),
+                            "high": float(row[3]),
+                            "low": float(row[4]),
+                            "volume": float(row[5]) * 100.0,  # 手转股
+                        })
+            except Exception:
+                records = []
+
+        if not records:
             return None
+
+        df = pd.DataFrame(records)
+        df = df.sort_values("datetime").reset_index(drop=True)
+        # 按交易日分日因果计算盘中累计 VWAP (typical price * volume)
+        tp = (df["high"] + df["low"] + df["close"]) / 3.0
+        pv = tp * df["volume"]
+        df["_pv"] = pv
+        cum_pv = df.groupby("date_str")["_pv"].cumsum()
+        cum_vol = df.groupby("date_str")["volume"].cumsum()
+        df["vwap"] = np.where(cum_vol > 0, np.round(cum_pv / cum_vol, 3), df["close"])
+        df = df.drop(columns=["_pv"])
+
+        with self._lock:
+            self._kline_5m_cache[cache_key] = (now_ts, df)
+        return df.copy()
+
+    def get_trading_dates(self, count: int = 90) -> List[str]:
+        """基于上证指数历史日K返回权威A股已开市交易日列表（升序 YYYY-MM-DD）"""
+        now_ts = time.time()
+        with self._lock:
+            if (now_ts - self._trading_dates_cache[0]) < 300.0 and len(self._trading_dates_cache[1]) >= min(20, count):
+                return list(self._trading_dates_cache[1][-count:])
+
+        df = self.get_daily_kline("sh000001", count=max(count, 120))
+        if df is not None and len(df) > 0 and "date" in df.columns:
+            dates = sorted({str(d)[:10] for d in df["date"].tolist() if str(d)})
+            with self._lock:
+                self._trading_dates_cache = (now_ts, dates)
+            return dates[-count:]
+        return []
+
+    def get_stock_plates(self, symbol: str) -> Dict[str, Any]:
+        """
+        获取个股所属概念与行业板块信息及同板块涨停效应（腾讯 plate 接口 + 12小时本地缓存）
+        """
+        sym = self.format_symbol(symbol)
+        now_ts = time.time()
+        GENERIC_TAGS = {
+            "融资融券", "转融券标的", "深股通", "沪股通", "富时罗素", "标普道琼斯",
+            "MSCI中国", "百元股", "昨日涨停", "昨日连板", "昨日触板", "高股息精选",
+            "标准普尔", "HS300_", "上证180_", "深成500", "中证500"
+        }
+
+        with self._lock:
+            cached = self._plates_cache.get(sym)
+            if cached and (now_ts - float(cached.get("ts", 0.0))) < 43200.0:
+                return cached
+
+        concepts: List[str] = []
+        industries: List[str] = []
+        hot_concepts: List[str] = []
+        max_sector_zt = 0
+
+        try:
+            url = f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/stockinfo/plate?code={sym}"
+            resp = self.session.get(url, timeout=3.5)
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                for p in data.get("plate", []) or []:
+                    pname = str(p.get("name", "")).strip()
+                    if pname:
+                        industries.append(pname)
+                for c in data.get("concept", []) or []:
+                    cname = str(c.get("name", "")).strip()
+                    tag = str(c.get("tag", "")).strip()
+                    if not cname or any(g in cname for g in GENERIC_TAGS):
+                        continue
+                    concepts.append(cname)
+                    if "涨停" in tag:
+                        m = re.search(r"涨停(\d+)", tag)
+                        if m:
+                            zt_num = int(m.group(1))
+                            max_sector_zt = max(max_sector_zt, zt_num)
+                            hot_concepts.append(f"{cname}({tag})")
+        except Exception:
+            pass
+
+        result = {
+            "symbol": sym,
+            "industries": industries,
+            "concepts": concepts[:8],
+            "hot_concepts": hot_concepts[:4],
+            "max_sector_zt": max_sector_zt,
+            "primary_sector": industries[-1] if industries else (concepts[0] if concepts else "主板"),
+            "ts": now_ts
+        }
+        with self._lock:
+            self._plates_cache[sym] = result
+            if len(self._plates_cache) > 1500:
+                # 裁剪较旧记录
+                items = sorted(self._plates_cache.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:1000]
+                self._plates_cache = dict(items)
+            if len(self._plates_cache) % 20 == 1:
+                atomic_write_json(PLATES_CACHE_FILE, self._plates_cache)
+        return result
 
     def get_market_breadth(self) -> Dict[str, Any]:
         """
@@ -401,13 +636,25 @@ class DataEngine:
         if not force_refresh and STOCK_LIST_CACHE.exists():
             try:
                 mtime = STOCK_LIST_CACHE.stat().st_mtime
-                cache_day = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
-                today = datetime.now().strftime("%Y-%m-%d")
-                # turnover 是当日行情字段，跨日即失效，需每日刷新一次
+                cache_dt = datetime.fromtimestamp(mtime)
+                cache_day = cache_dt.strftime("%Y-%m-%d")
+                now_dt = datetime.now()
+                today = now_dt.strftime("%Y-%m-%d")
+                cur_hm = now_dt.strftime("%H:%M")
+                is_live_session = (now_dt.weekday() < 5) and ("09:25" <= cur_hm <= "15:05")
+                # 盘中交易时段仅允许 90 秒短时缓存（避免早盘快照锁死全天涨跌幅）；盘后要求缓存落在 15:02 收盘定格之后
+                cache_fresh = False
                 if cache_day == today:
+                    if is_live_session:
+                        cache_fresh = (time.time() - mtime) < 90.0
+                    elif cur_hm > "15:05":
+                        cache_fresh = cache_dt.strftime("%H:%M") >= "15:02"
+                    else:
+                        cache_fresh = True
+                if cache_fresh:
                     with open(STOCK_LIST_CACHE, "r", encoding="utf-8") as f:
                         cached_stocks = json.load(f)
-                        if len(cached_stocks) > 500:
+                        if len(cached_stocks) > 500 and "open" in cached_stocks[0]:
                             # Legacy caches may contain ETFs because the older
                             # generic board predicate also accepted fund codes.
                             return [
@@ -447,8 +694,14 @@ class DataEngine:
                             "name": name,
                             "symbol": self.format_symbol(code),
                             "price": float(it.get('trade', 0.0) or 0.0),
+                            "open": float(it.get('open', 0.0) or 0.0),
+                            "prev_close": float(it.get('settlement', 0.0) or 0.0),
+                            "high": float(it.get('high', 0.0) or 0.0),
+                            "low": float(it.get('low', 0.0) or 0.0),
                             "change_pct": float(it.get('changepercent', 0.0) or 0.0),
-                            "turnover": float(it.get('amount', 0.0) or 0.0)
+                            "turnover": float(it.get('amount', 0.0) or 0.0),
+                            "turnover_rate": float(it.get('turnoverratio', 0.0) or 0.0),
+                            "float_mkt_cap": round(float(it.get('nmc', 0.0) or 0.0) / 10000.0, 2)
                         })
                     if len(items) < 100:
                         break
@@ -467,7 +720,7 @@ class DataEngine:
                         "https://push2.eastmoney.com/api/qt/clist/get"
                         f"?pn={p}&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281"
                         "&fltt=2&invt=2&fid=f3&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-                        "&fields=f12,f14,f2,f3,f6"
+                        "&fields=f12,f14,f2,f3,f6,f17,f18,f15,f16,f8"
                     )
                     resp = self.session.get(url, headers=em_headers, timeout=4)
                     if resp.status_code != 200:
@@ -489,8 +742,13 @@ class DataEngine:
                             "name": name,
                             "symbol": symbol,
                             "price": item.get("f2", 0),
+                            "open": item.get("f17", 0),
+                            "prev_close": item.get("f18", 0),
+                            "high": item.get("f15", 0),
+                            "low": item.get("f16", 0),
                             "change_pct": item.get("f3", 0),
-                            "turnover": item.get("f6", 0)
+                            "turnover": item.get("f6", 0),
+                            "turnover_rate": item.get("f8", 0)
                         })
                     if len(diff) < 100:
                         break
@@ -514,11 +772,7 @@ class DataEngine:
 
         # 仅当获取到大于 500 只有效主板标的时才刷新写入本地磁盘缓存，防毒缓存污染
         if len(stocks) >= 500:
-            try:
-                with open(STOCK_LIST_CACHE, "w", encoding="utf-8") as f:
-                    json.dump(stocks, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
+            atomic_write_json(STOCK_LIST_CACHE, stocks)
 
         return stocks
 
